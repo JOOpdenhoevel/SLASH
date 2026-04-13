@@ -239,7 +239,7 @@ class LinkerConfiguration(CommandConfiguration):
         ap.add_argument("--pre-synth-tcls", type=Path, nargs="*", default=[],
                         help="Paths to TCL scripts to run before synthesis (applies to hardware builds only).")
         ap.add_argument("--clock-hz", required=False,
-                        type=Optional[int], default=None, help="Target clock frequency in MHz.")
+                        type=int, default=None, help="Target clock frequency in MHz.")
 
     def __init__(self, args: argparse.Namespace):
         super().__init__(args)
@@ -405,7 +405,7 @@ class InstallerConfiguration(CommandConfiguration):
         super().populate_argument_parser(ap)
         ap.description = "Build and install base images for hardware builds."
         ap.epilog = INSTALL_HELP_EPILOG
-        ap.add_argument("--build-dir", required=False, type=Optional[Path], default=Path(
+        ap.add_argument("--build-dir", required=False, type=Path, default=Path(
             "./install.prj"), help="The build directory for the installer. Default: ./install_build")
 
     def __init__(self, args: argparse.Namespace):

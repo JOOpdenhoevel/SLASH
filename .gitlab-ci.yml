@@ -10,7 +10,7 @@ default:
     CI_JOB_JWT:
       aud: https://git.uni-paderborn.de
   before_script:
-    - ml fpga lang Python3 xilinx/vivado/2025.1
+    - ml fpga lang Python xilinx/vivado/25.1
     - python3 -m venv .venv
     - source .venv/bin/activate
     - pip install --upgrade pip

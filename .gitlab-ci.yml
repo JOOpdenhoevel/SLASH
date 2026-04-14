@@ -17,6 +17,8 @@ default:
     - pip install --upgrade pip
     - pip install -r requirements.txt
     - glab auth login --job-token $CI_JOB_TOKEN --hostname $CI_SERVER_FQDN --api-protocol $CI_SERVER_PROTOCOL
+  artifacts:
+    access: 'developer'
 
 build_abstract_shell:
   tags:

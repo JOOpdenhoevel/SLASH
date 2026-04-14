@@ -10,19 +10,13 @@ default:
     CI_JOB_JWT:
       aud: https://git.uni-paderborn.de
   before_script:
-    - ml fpga lang Python xilinx/vivado/25.1
+    - module reset
+    - ml fpga lang tools Python xilinx/vivado/25.1 UnZip
     - python3 -m venv .venv
     - source .venv/bin/activate
     - pip install --upgrade pip
     - pip install -r requirements.txt
-
-hello_world:
-  tags:
-    - otus
-  variables:
-    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 16 --mem 16G -t 00:05:00"
-  script:
-    - echo "Hello World from $(hostname)! My name is $(whoami) and I have $(nproc) cores!"
+    - glab auth login --job-token $CI_JOB_TOKEN --hostname $CI_SERVER_FQDN --api-protocol $CI_SERVER_PROTOCOL
 
 build_abstract_shell:
   tags:
@@ -31,8 +25,15 @@ build_abstract_shell:
     SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 16 --mem 128G -t 12:00:00"
   script:
     - cd linker
+    # Unzipping the SMBus IP
+    - glab -R $CI_PROJECT_PATH "smbus_v1_1-20240328.zip" download --all --output-dir="."
+    - unzip smbus_v1_1-20240328.zip
+    - mv smbus_v1_1-20240328 resources/base/iprepo/smbus_v1_1
+    # Building the HBM Bandwidth IP
     - make -C resources/base/iprepo/hbm_bandwidth/ -j16
+    # Building the Traffic Producer IP
     - make -C resources/base/iprepo/traffic_producer/ -j16
+    # Building the abstract shell
     - python3 ./src/main.py install --jobs 16
   artifacts:
     name: abstract_shell
@@ -41,6 +42,7 @@ build_abstract_shell:
     paths:
       - linker/resources/base/iprepo/hbm_bandwidth/ip/
       - linker/resources/base/iprepo/traffic_producer/ip/
+      - linker/resources/base/iprepo/smbus_v1_1/
       - linker/resources/abstract_shell
       - linker/resources/install.prj/vivado.log
     

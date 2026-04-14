@@ -28,7 +28,7 @@ build_abstract_shell:
   script:
     - cd linker
     # Unzipping the SMBus IP
-    - glab -R $CI_PROJECT_PATH securefile download "smbus_v1_1-20240328.zip" --output-dir="."
+    - glab -R $CI_PROJECT_PATH securefile download --name "smbus_v1_1-20240328.zip"
     - unzip smbus_v1_1-20240328.zip
     - mv smbus_v1_1-20240328 resources/base/iprepo/smbus_v1_1
     # Building the HBM Bandwidth IP

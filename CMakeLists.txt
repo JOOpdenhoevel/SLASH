@@ -44,8 +44,8 @@ if(ENABLE_SANITIZERS)
 endif()
 
 # Components, in dependency order
-add_subdirectory(cmake)    # SlashTools CMake modules
-add_subdirectory(libslash) # slash::slash library
-add_subdirectory(vrtd)     # vrtd daemon + libvrtd + libvrtdpp
-add_subdirectory(vrt)      # vrt::vrt library
-add_subdirectory(smi)      # v80-smi executable
+add_subdirectory(cmake)           # SlashTools CMake modules
+add_subdirectory(driver/libslash) # slash::slash library
+add_subdirectory(vrt)             # vrt::vrt library
+add_subdirectory(vrt/vrtd)        # vrtd daemon + libvrtd + libvrtdpp
+add_subdirectory(smi)             # v80-smi executable

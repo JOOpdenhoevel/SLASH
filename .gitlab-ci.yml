@@ -4,6 +4,7 @@ workflow:
 
 variables:
   SLURM_ACCOUNT: hpc-prf-cifi
+  GIT_SUBMODULE_STRATEGY: recursive
 
 default:
   id_tokens:

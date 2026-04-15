@@ -11,7 +11,7 @@ default:
       aud: https://git.uni-paderborn.de
   before_script:
     - module reset
-    - ml fpga lang tools Python xilinx/vivado/25.1 UnZip
+    - ml fpga lang tools Python xilinx/vivado/25.1 UnZip gitlab-cli
     - python3 -m venv .venv
     - source .venv/bin/activate
     - pip install --upgrade pip
@@ -46,5 +46,5 @@ build_abstract_shell:
       - linker/resources/base/iprepo/traffic_producer/ip/
       - linker/resources/base/iprepo/smbus_v1_1/
       - linker/resources/abstract_shell
-      - linker/resources/install.prj/vivado.log
+      - linker/install.prj/vivado.log
     

@@ -83,7 +83,7 @@ def _ensure_boot_device_pcie_in_bif(bif_path: Path) -> None:
     raise ValueError(f"Could not find 'id = 0x2' in BIF file: {bif_path}")
 
 
-def _generate_top_wrapper_pdi_with_bootgen(impl_dir: Path) -> Path:
+def _generate_top_wrapper_pdi_with_bootgen(impl_dir: Path, verbose: bool) -> Path:
     bif_path = impl_dir / "top_wrapper.bif"
     output_pdi = impl_dir / "top_wrapper.pdi"
 
@@ -103,6 +103,7 @@ def _generate_top_wrapper_pdi_with_bootgen(impl_dir: Path) -> Path:
         ],
         cwd=str(impl_dir),
         check=True,
+        stdout=None if verbose else subprocess.DEVNULL
     )
 
     if not output_pdi.exists():
@@ -137,7 +138,7 @@ def generate_base_pdi_with_aved(config: CommandConfiguration) -> Path:
     aved_build_dir.mkdir(parents=True, exist_ok=True)
 
     regenerated_top_wrapper_pdi = _generate_top_wrapper_pdi_with_bootgen(
-        static_impl_dir)
+        static_impl_dir, config.verbose)
     _copy_checked(regenerated_top_wrapper_pdi,
                   aved_build_dir / "top_wrapper.pdi")
     _copy_checked(aved_build_script, aved_hw_dir / "build_all.sh")
@@ -146,7 +147,8 @@ def generate_base_pdi_with_aved(config: CommandConfiguration) -> Path:
     _copy_checked(xsa_src, aved_build_dir / f"{AVED_DESIGN_NAME}.xsa")
 
     logger.info("Running AVED build script in %s", aved_hw_dir)
-    subprocess.run(["bash", "build_all.sh"], cwd=str(aved_hw_dir), check=True)
+    subprocess.run(["bash", "build_all.sh"], cwd=str(aved_hw_dir), check=True,
+                   stdout=None if config.verbose else subprocess.DEVNULL)
 
     aved_pdi = aved_hw_dir / f"{AVED_DESIGN_NAME}.pdi"
     if not aved_pdi.exists():
@@ -181,7 +183,14 @@ def create_build_project(
     if action:
         cmd.append(action)
 
-    subprocess.run(cmd, cwd=str(config.build_dir), check=True)
+    if config.verbose:
+        stdout_target = None
+    else:
+        stdout_target = subprocess.DEVNULL
+        print(
+            f"Running Vivado, this may take a very long time. Check {log_path} for details.")
+    subprocess.run(cmd, cwd=str(config.build_dir),
+                   check=True, stdout=stdout_target)
 
 
 class RM_KIND(Enum):
@@ -248,7 +257,14 @@ def _run_rm_build(config: LinkerConfiguration, rm_kind: RM_KIND) -> None:
         for path in config.pre_synth_tcls:
             cmd.extend(["--pre-synth-tcl", str(path)])
 
-    subprocess.run(cmd, cwd=str(config.build_dir), check=True)
+    if config.verbose:
+        stdout_target = None
+    else:
+        stdout_target = subprocess.DEVNULL
+        print(
+            f"Running Vivado, this may take a very long time. Check {log_path} for details.")
+    subprocess.run(cmd, cwd=str(config.build_dir),
+                   check=True, stdout=stdout_target)
 
     if rm_kind == RM_KIND.SLASH_PROJECT:
         pdi_out_path = image_out_dir / \

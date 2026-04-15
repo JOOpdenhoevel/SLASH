@@ -68,6 +68,8 @@ class CommandConfiguration(object):
         ap.formatter_class = argparse.RawTextHelpFormatter
         ap.add_argument("--vivado", required=False, type=Path, default=None,
                         help="Vivado binary to use for linking. If not given, it will be derived from PATH.")
+        ap.add_argument("-v", "--verbose", action="store_true",
+                        help="Emit verbose progress information to stdout, including full Vivado outputs.")
         ap.add_argument("--jobs", required=False, type=int, default=8,
                         help="Number of parallel jobs for Vivado runs.")
 
@@ -115,6 +117,8 @@ class CommandConfiguration(object):
         if not self._vivado_bin.is_file():
             raise FileNotFoundError(self._vivado_bin)
 
+        self._verbose = args.verbose
+
         # Misc. arguments
         self._n_jobs: int = args.jobs
 
@@ -145,6 +149,10 @@ class CommandConfiguration(object):
     @property
     def vivado_bin(self) -> Path:
         return self._vivado_bin
+
+    @property
+    def verbose(self) -> bool:
+        return self._verbose
 
     @property
     def n_jobs(self) -> int:

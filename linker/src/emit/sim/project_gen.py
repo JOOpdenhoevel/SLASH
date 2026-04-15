@@ -67,7 +67,8 @@ def create_sim_project(config: LinkerConfiguration) -> None:
         "-source",
         str(tcl),
     ]
-    subprocess.run(cmd, cwd=str(config.build_dir), check=True)
+    subprocess.run(cmd, cwd=str(config.build_dir), check=True,
+                   stdout=None if config.verbose else subprocess.DEVNULL)
 
 
 def build_sim_project(config: LinkerConfiguration) -> None:
@@ -76,8 +77,12 @@ def build_sim_project(config: LinkerConfiguration) -> None:
     if not xsim_dir.exists():
         raise FileNotFoundError(f"XSIM dir not found: {xsim_dir}")
 
-    subprocess.run(["./compile.sh"], cwd=str(xsim_dir), check=True)
-    subprocess.run(["./elaborate.sh"], cwd=str(xsim_dir), check=True)
+    stdout_target = None if config.verbose else subprocess.DEVNULL
+
+    subprocess.run(["./compile.sh"], cwd=str(xsim_dir),
+                   check=True, stdout=stdout_target)
+    subprocess.run(["./elaborate.sh"], cwd=str(xsim_dir),
+                   check=True, stdout=stdout_target)
 
     build_dir = config.build_dir / "build"
 
@@ -89,9 +94,11 @@ def build_sim_project(config: LinkerConfiguration) -> None:
 
     sim_src_dir = config.resources_dir / "sim"
 
-    subprocess.run(["cmake", str(sim_src_dir)], cwd=str(build_dir), check=True)
+    subprocess.run(["cmake", str(sim_src_dir)], cwd=str(
+        build_dir), check=True, stdout=stdout_target)
     jobs = str(os.cpu_count() or 8)
-    subprocess.run(["make", "-j", jobs], cwd=str(build_dir), check=True)
+    subprocess.run(["make", "-j", jobs], cwd=str(build_dir),
+                   check=True, stdout=stdout_target)
 
     vpp_sim_path = build_dir / "vpp_sim"
     if not vpp_sim_path.exists():

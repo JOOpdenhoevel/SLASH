@@ -1,6 +1,6 @@
 # ##################################################################################################
 #  The MIT License (MIT)
-#  Copyright (c) 2025 Advanced Micro Devices, Inc. All rights reserved.
+#  Copyright (c) 2025-2026 Advanced Micro Devices, Inc. All rights reserved.
 # 
 #  Permission is hereby granted, free of charge, to any person obtaining a copy of this software
 #  and associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -18,31 +18,33 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 # ##################################################################################################
 
-# Library sources (list explicitly; avoid GLOB for reproducible builds)
-add_library(slash
-  ${CMAKE_CURRENT_SOURCE_DIR}/ctldev.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/ctldev_mock.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/hotplug.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/qdma.c
+add_library(
+    libvrtdpp
+
+    ${CMAKE_CURRENT_SOURCE_DIR}/buffer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/bar_file.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/bar.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/qdma_qpair.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/device.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/error.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/session.cpp
 )
 
-# Provide an alias target with namespace (nice for internal use too)
-add_library(slash::slash ALIAS slash)
+target_include_directories(libvrtdpp PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>)
 
-# C standard / properties
-set_target_properties(slash PROPERTIES
-  C_STANDARD 90
-  C_STANDARD_REQUIRED YES
-  C_EXTENSIONS NO
+# CMake prepends lib for libraries so libvrtdpp would be output as liblibvrtdpp otherwise
+set_target_properties(libvrtdpp PROPERTIES
+  OUTPUT_NAME vrtdpp 
   VERSION ${PROJECT_VERSION}
   SOVERSION ${PROJECT_VERSION_MAJOR}
 )
 
-# Public include dir (for consumers) and private include dir (for .c / private headers)
-target_include_directories(slash
-  PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
-    $<INSTALL_INTERFACE:include>
-  PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
+set_target_properties(libvrtdpp PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED YES
+  CXX_EXTENSIONS YES
 )
+
+target_link_libraries(libvrtdpp PUBLIC libvrtd)
+
+add_library(vrtd::libvrtdpp ALIAS libvrtdpp)

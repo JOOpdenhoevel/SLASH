@@ -18,42 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 # ##################################################################################################
 
-cmake_minimum_required(VERSION 3.10)
-
-# Read version from packaging/version
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/version" VRT_VERSION)
-string(STRIP "${VRT_VERSION}" VRT_VERSION)
-
-# Parse into components
-string(REPLACE "." ";" VERSION_LIST "${VRT_VERSION}")
-list(GET VERSION_LIST 0 VRT_VERSION_MAJOR)
-list(GET VERSION_LIST 1 VRT_VERSION_MINOR)
-list(GET VERSION_LIST 2 VRT_VERSION_PATCH)
-
-message(STATUS "VRT version: ${VRT_VERSION} (${VRT_VERSION_MAJOR}.${VRT_VERSION_MINOR}.${VRT_VERSION_PATCH})")
-
-project(
-  vrt
-
-  VERSION ${VRT_VERSION}
-  LANGUAGES C CXX
-)
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-option(VRT_INCLUDE_VRTD "Include vrtd subdirectory instead of building from system" OFF)
-
-include(GNUInstallDirs)
-include(CMakePackageConfigHelpers)
+set(VRT_VERSION       ${PROJECT_VERSION})
+set(VRT_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
+set(VRT_VERSION_MINOR ${PROJECT_VERSION_MINOR})
+set(VRT_VERSION_PATCH ${PROJECT_VERSION_PATCH})
 
 add_compile_options("-Wunused-result")
-
-option(ENABLE_SANITIZERS "Build with AddressSanitizer and UBSan" OFF)
-if(ENABLE_SANITIZERS)
-  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
-  add_link_options(-fsanitize=address,undefined)
-endif()
 
 # Generate the header
 configure_file(
@@ -86,10 +56,6 @@ target_include_directories(
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>
-    $<INSTALL_INTERFACE:include>
-    
-  PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/
 )
 
 set_target_properties(vrt PROPERTIES
@@ -99,17 +65,6 @@ set_target_properties(vrt PROPERTIES
 )
 
 
-if(VRT_INCLUDE_VRTD)
-  add_subdirectory(vrtd vrtd)
-else()
-  find_package(vrtd REQUIRED CONFIG)
-endif()
-
-if(NOT TARGET vrtd::libvrtdpp)
-    message(FATAL_ERROR
-        "vrtd package is missing target vrtd::libvrtdpp. "
-        "Build and install vrtd first (cmake --install), then configure vrt again.")
-endif()
 
 find_package(ZLIB REQUIRED)
 find_package(LibXml2 REQUIRED)
@@ -162,7 +117,7 @@ write_basic_package_version_file(
 
 # Configure the main package config from template
 configure_package_config_file(
-  "${PROJECT_SOURCE_DIR}/cmake/vrtConfig.cmake.in"
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vrtConfig.cmake.in"
   "${CMAKE_CURRENT_BINARY_DIR}/vrtConfig.cmake"
   INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/vrt"
 )

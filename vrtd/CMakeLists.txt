@@ -18,39 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 # ##################################################################################################
 
-cmake_minimum_required(VERSION 3.16)
-
-# Read version from packaging/version
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../../packaging/version" VRTD_VERSION)
-string(STRIP "${VRTD_VERSION}" VRTD_VERSION)
-
-# Parse into components
-string(REPLACE "." ";" VERSION_LIST "${VRTD_VERSION}")
-list(GET VERSION_LIST 0 VRTD_VERSION_MAJOR)
-list(GET VERSION_LIST 1 VRTD_VERSION_MINOR)
-list(GET VERSION_LIST 2 VRTD_VERSION_PATCH)
-
-message(STATUS "VRTD version: ${VRTD_VERSION} (${VRTD_VERSION_MAJOR}.${VRTD_VERSION_MINOR}.${VRTD_VERSION_PATCH})")
-
-project(vrtd
-  VERSION ${VRTD_VERSION}
-  LANGUAGES C CXX
-)
-
 # Optionally build examples
 option(VRTD_BUILD_EXAMPLES "Build example executables" OFF)
-option(VRTD_INCLUDE_LIBSLASH "Include libslash subdirectory instead of building from system" OFF)
-option(BUILD_SHARED_LIBS "Build shared libraries" ON)
-
-
-include(GNUInstallDirs)
-include(CMakePackageConfigHelpers)
-
-if(VRTD_INCLUDE_LIBSLASH)
-  add_subdirectory(../../driver/libslash libslash)
-else()
-  find_package(slash REQUIRED)
-endif()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ami.cmake)
 
@@ -75,17 +44,17 @@ add_subdirectory(libvrtdpp)
 # -------- Installation: headers and library --------
 # Public headers are under include/  (layout: include/vrtd/*.h)
 install(
-  DIRECTORY "${PROJECT_SOURCE_DIR}/include/"
+  DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
 )
 
 install(
-  DIRECTORY "${PROJECT_SOURCE_DIR}/libvrtd/include/"
+  DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/libvrtd/include/"
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
 )
 
 install(
-  DIRECTORY "${PROJECT_SOURCE_DIR}/libvrtdpp/include/"
+  DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/libvrtdpp/include/"
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
 )
 
@@ -112,7 +81,7 @@ write_basic_package_version_file(
 
 # Configure the main package config from template
 configure_package_config_file(
-  "${PROJECT_SOURCE_DIR}/cmake/vrtdConfig.cmake.in"
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vrtdConfig.cmake.in"
   "${CMAKE_CURRENT_BINARY_DIR}/vrtdConfig.cmake"
   INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/vrtd"
 )

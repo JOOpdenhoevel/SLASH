@@ -52,7 +52,7 @@ PYTHON=$(find_python)
 rm -rf linker/src/vendor/jinja2 linker/src/vendor/markupsafe
 "$PYTHON" -m pip install jinja2 markupsafe --target=linker/src/vendor/ --no-deps
 
-cmake --build pbuild/smi
+cmake --build pbuild
 
 if [[ -z "${SLASH_PKG_SKIP_ROOT_DESIGN_BUILD:-}" ]]; then
     bash scripts/root-design-build.sh

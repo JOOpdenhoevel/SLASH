@@ -18,28 +18,46 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 # ##################################################################################################
 
-add_library(
-    libvrtd
-
-    ${CMAKE_CURRENT_SOURCE_DIR}/buffer.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/requests.c
+# Library sources (list explicitly; avoid GLOB for reproducible builds)
+add_executable(vrtd
+  ${CMAKE_CURRENT_SOURCE_DIR}/accept.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/allocator.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/auth.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/buffer.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/clock.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/config.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/design_writer.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/device.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/hotplug.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/main.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/reset.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/serve.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/signals.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/utils.c
 )
 
-target_include_directories(libvrtd
-  PUBLIC
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/libvrtd/include>
-    $<INSTALL_INTERFACE:include>
+# C standard / properties
+set_target_properties(vrtd PROPERTIES
+  C_STANDARD 11
+  C_STANDARD_REQUIRED YES
+  C_EXTENSIONS YES
+  VERSION ${PROJECT_VERSION}
+  SOVERSION ${PROJECT_VERSION_MAJOR}
+)
+
+# Public include dir (for consumers)
+target_include_directories(vrtd PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>)
+
+target_link_libraries(
+  vrtd
+  
   PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
-# CMake prepends lib for libraries so libvrtd would be output as liblibvrtd otherwise
-set_target_properties(libvrtd PROPERTIES OUTPUT_NAME vrtd VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
-
-target_link_libraries(libvrtd
-  PUBLIC
+    ami::ami
     slash::slash
+
+    PkgConfig::SYSTEMD
+    PkgConfig::INIH
+    Threads::Threads
 )
 
-add_library(vrtd::libvrtd ALIAS libvrtd)
+add_executable(vrtd::vrtd ALIAS vrtd)

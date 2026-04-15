@@ -30,8 +30,8 @@ if [[ $# -ne 2 ]]; then
     exit 1
 fi
 
-# Install smi, vrt, vrtd, libvrt*, libslash
-DESTDIR="$1" cmake --build pbuild/smi --target install
+# Install smi, vrt, vrtd, libvrt*, libslash, and CMake toolchain modules
+DESTDIR="$1" cmake --build pbuild --target install
 
 # Install the linker (src only)
 mkdir -p "$1$2/v80++"
@@ -68,6 +68,3 @@ rsync --delete -a \
     --exclude='submodules' \
     --exclude='aved' \
     linker/resources/ "$1/usr/share/v80++/"
-
-# Install CMake toolchain modules (SlashTools)
-DESTDIR="$1" cmake --build pbuild/cmake-tools --target install

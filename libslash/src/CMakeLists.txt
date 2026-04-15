@@ -1,6 +1,6 @@
 # ##################################################################################################
 #  The MIT License (MIT)
-#  Copyright (c) 2025-2026 Advanced Micro Devices, Inc. All rights reserved.
+#  Copyright (c) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # 
 #  Permission is hereby granted, free of charge, to any person obtaining a copy of this software
 #  and associated documentation files (the "Software"), to deal in the Software without restriction,
@@ -19,51 +19,27 @@
 # ##################################################################################################
 
 # Library sources (list explicitly; avoid GLOB for reproducible builds)
-add_executable(vrtd
-  ${CMAKE_CURRENT_SOURCE_DIR}/accept.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/allocator.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/auth.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/buffer.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/clock.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/config.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/design_writer.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/device.c
+add_library(slash
+  ${CMAKE_CURRENT_SOURCE_DIR}/ctldev.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/ctldev_mock.c
   ${CMAKE_CURRENT_SOURCE_DIR}/hotplug.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/main.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/reset.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/serve.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/signals.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/utils.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/qdma.c
 )
 
+# Provide an alias target with namespace (nice for internal use too)
+add_library(slash::slash ALIAS slash)
+
 # C standard / properties
-set_target_properties(vrtd PROPERTIES
-  C_STANDARD 11
+set_target_properties(slash PROPERTIES
+  C_STANDARD 90
   C_STANDARD_REQUIRED YES
-  C_EXTENSIONS YES
+  C_EXTENSIONS NO
   VERSION ${PROJECT_VERSION}
   SOVERSION ${PROJECT_VERSION_MAJOR}
 )
 
-# Public include dir (for consumers) and private include dir (for .c / private headers)
-target_include_directories(vrtd
+# Public include dir (for consumers)
+target_include_directories(slash
   PUBLIC
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
-  PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
 )
-
-target_link_libraries(
-  vrtd
-  
-  PRIVATE
-    ami::ami
-    slash::slash
-
-    PkgConfig::SYSTEMD
-    PkgConfig::INIH
-    Threads::Threads
-)
-
-add_executable(vrtd::vrtd ALIAS vrtd)

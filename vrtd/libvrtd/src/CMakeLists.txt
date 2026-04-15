@@ -19,40 +19,24 @@
 # ##################################################################################################
 
 add_library(
-    libvrtdpp
+    libvrtd
 
-    ${CMAKE_CURRENT_SOURCE_DIR}/buffer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/bar_file.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/bar.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/qdma_qpair.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/device.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/error.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/session.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/buffer.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/requests.c
 )
 
-target_include_directories(libvrtdpp
+target_include_directories(libvrtd
   PUBLIC
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/libvrtd/include>
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/libvrtdpp/include>
-    $<INSTALL_INTERFACE:include>
-  PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
 )
 
-# CMake prepends lib for libraries so libvrtdpp would be output as liblibvrtdpp otherwise
-set_target_properties(libvrtdpp PROPERTIES
-  OUTPUT_NAME vrtdpp 
-  VERSION ${PROJECT_VERSION}
-  SOVERSION ${PROJECT_VERSION_MAJOR}
+# CMake prepends lib for libraries so libvrtd would be output as liblibvrtd otherwise
+set_target_properties(libvrtd PROPERTIES OUTPUT_NAME vrtd VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
+
+target_link_libraries(libvrtd
+  PUBLIC
+    slash::slash
 )
 
-set_target_properties(libvrtdpp PROPERTIES
-  CXX_STANDARD 20
-  CXX_STANDARD_REQUIRED YES
-  CXX_EXTENSIONS YES
-)
-
-target_link_libraries(libvrtdpp PUBLIC libvrtd)
-
-add_library(vrtd::libvrtdpp ALIAS libvrtdpp)
+add_library(vrtd::libvrtd ALIAS libvrtd)

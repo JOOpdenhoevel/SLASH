@@ -188,7 +188,7 @@ def create_build_project(
     else:
         stdout_target = subprocess.DEVNULL
         print(
-            f"Running Vivado, this may take a very long time. Check {log_path} for details.")
+            f"Running Vivado, this may take a very long time. Check {log_path} for details.", flush=True)
     subprocess.run(cmd, cwd=str(config.build_dir),
                    check=True, stdout=stdout_target)
 
@@ -262,7 +262,7 @@ def _run_rm_build(config: LinkerConfiguration, rm_kind: RM_KIND) -> None:
     else:
         stdout_target = subprocess.DEVNULL
         print(
-            f"Running Vivado, this may take a very long time. Check {log_path} for details.")
+            f"Running Vivado, this may take a very long time. Check {log_path} for details.", flush=True)
     subprocess.run(cmd, cwd=str(config.build_dir),
                    check=True, stdout=stdout_target)
 

@@ -168,11 +168,6 @@ Resource Directory:
 
 
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s:%(funcName)s: %(message)s",
-    )
-
     ap = argparse.ArgumentParser(description="Utility to link VRT binaries (VBINs) from user IP cores.", conflict_handler="resolve", epilog=MAIN_HELP_EPILOG,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub_parsers = ap.add_subparsers(required=True)
@@ -189,6 +184,12 @@ def main():
     args = ap.parse_args()
 
     config = args.config_class(args)
+    
+    logging.basicConfig(
+        level=logging.INFO if config.verbose else logging.WARN,
+        format="%(asctime)s %(levelname)s %(name)s:%(funcName)s: %(message)s",
+    )
+
     args.operation(config)
 
 

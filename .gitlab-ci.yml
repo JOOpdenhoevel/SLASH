@@ -12,7 +12,7 @@ default:
       aud: https://git.uni-paderborn.de
   before_script:
     - module reset
-    - ml fpga lang tools Python xilinx/vivado/25.1 UnZip gitlab-cli
+    - ml fpga lang tools devel Python xilinx/vivado/25.1 UnZip gitlab-cli CMake
     - python3 -m venv .venv
     - source .venv/bin/activate
     - pip install --upgrade pip

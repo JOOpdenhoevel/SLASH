@@ -21,31 +21,31 @@ default:
   artifacts:
     access: 'developer'
 
-build_abstract_shell:
-  tags:
-    - otus
-  variables:
-    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 16 --mem 128G -t 12:00:00"
-  script:
-    - cd linker
-    # Unzipping the SMBus IP
-    - glab -R $CI_PROJECT_PATH securefile download --name "smbus_v1_1-20240328.zip"
-    - unzip smbus_v1_1-20240328.zip
-    - mv smbus_v1_1-20240328 resources/base/iprepo/smbus_v1_1
-    # Building the HBM Bandwidth IP
-    - make -C resources/base/iprepo/hbm_bandwidth/ -j16
-    # Building the Traffic Producer IP
-    - make -C resources/base/iprepo/traffic_producer/ -j16
-    # Building the abstract shell
-    - python3 ./src/main.py install --jobs 16
-  artifacts:
-    name: abstract_shell
-    public: false
-    when: always
-    paths:
-      - linker/resources/base/iprepo/hbm_bandwidth/ip/
-      - linker/resources/base/iprepo/traffic_producer/ip/
-      - linker/resources/base/iprepo/smbus_v1_1/
-      - linker/resources/abstract_shell
-      - linker/install.prj/vivado.log
+#build_static_region:
+#  tags:
+#    - otus
+#  variables:
+#    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 16 --mem 128G -t 12:00:00"
+#  script:
+#    - cd linker
+#    # Unzipping the SMBus IP
+#    - glab -R $CI_PROJECT_PATH securefile download --name "smbus_v1_1-20240328.zip"
+#    - unzip smbus_v1_1-20240328.zip
+#    - mv smbus_v1_1-20240328 resources/base/iprepo/smbus_v1_1
+#    # Building the HBM Bandwidth IP
+#    - make -C resources/base/iprepo/hbm_bandwidth/ -j16
+#    # Building the Traffic Producer IP
+#    - make -C resources/base/iprepo/traffic_producer/ -j16
+#    # Building the abstract shell
+#    - python3 ./src/main.py install --jobs 16
+#  artifacts:
+#    name: static_region
+#    public: false
+#    when: always
+#    paths:
+#      - linker/resources/base/iprepo/hbm_bandwidth/ip/
+#      - linker/resources/base/iprepo/traffic_producer/ip/
+#      - linker/resources/base/iprepo/smbus_v1_1/
+#      - linker/resources/abstract_shell
+#      - linker/install.prj/vivado.log
     

@@ -10,14 +10,6 @@ default:
   id_tokens:
     CI_JOB_JWT:
       aud: https://git.uni-paderborn.de
-  before_script:
-    - module reset
-    - ml fpga lang tools devel Python xilinx/vivado/25.1 UnZip gitlab-cli CMake
-    - python3 -m venv .venv
-    - source .venv/bin/activate
-    - pip install --upgrade pip
-    - pip install -r requirements.txt
-    - glab auth login --job-token $CI_JOB_TOKEN --hostname $CI_SERVER_FQDN --api-protocol $CI_SERVER_PROTOCOL
   artifacts:
     access: 'developer'
 
@@ -26,6 +18,14 @@ default:
 #    - otus
 #  variables:
 #    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 16 --mem 128G -t 12:00:00"
+#  before_script:
+#    - module reset
+#    - ml fpga lang tools devel Python xilinx/vivado/25.1 UnZip gitlab-cli CMake
+#    - python3 -m venv .venv
+#    - source .venv/bin/activate
+#    - pip install --upgrade pip
+#    - pip install -r requirements.txt
+#    - glab auth login --job-token $CI_JOB_TOKEN --hostname $CI_SERVER_FQDN --api-protocol $CI_SERVER_PROTOCOL
 #  script:
 #    - cd linker
 #    # Unzipping the SMBus IP
@@ -49,3 +49,17 @@ default:
 #      - linker/resources/abstract_shell
 #      - linker/install.prj/vivado.log
     
+build_ubuntu_packages:
+  tags:
+    - otus
+  variables:
+    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 2 --mem 16G -t 00:15:00"
+  script:
+    - ml tools Apptainer
+    - apptainer build scripts/package-ubuntu.sif scripts/package-ubuntu.recipe
+    - apptainer run scripts/package-ubuntu.sif
+  artifacts:
+    name: ubuntu_packages
+    public: false
+    paths:
+      - deb/*.deb

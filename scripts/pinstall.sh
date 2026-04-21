@@ -35,7 +35,7 @@ DESTDIR="$1" cmake --build pbuild --target install
 
 # Install the linker (src only)
 mkdir -p "$1$2/v80++"
-rsync --delete -r --exclude='__pycache__' --exclude='*.pyc' --exclude='install.prj' linker/src/ "$1$2/v80++/"
+rsync --delete -a --exclude='__pycache__' --exclude='*.pyc' --exclude='install.prj' linker/src/ "$1$2/v80++/"
 cat <<EOF >"$1/usr/bin/v80++"
 #!/bin/sh
 
@@ -64,7 +64,7 @@ chmod 0755 "$1/usr/bin/v80++"
 
 # Install linker resources
 mkdir -p "$1/usr/share/v80++"
-rsync --delete -r \
+rsync --delete -a \
     --exclude='submodules' \
     --exclude='aved' \
     linker/resources/ "$1/usr/share/v80++/"

@@ -80,6 +80,3 @@ __pycache__/
 
 # Python test coverage
 .coverage
-
-# Apptainer/singularity containers
-*.sif

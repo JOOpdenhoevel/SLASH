@@ -18,13 +18,37 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 # ##################################################################################################
 
+cmake_minimum_required(VERSION 3.16)
+
+# Read version from packaging/version
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../../packaging/version" LIBSLASH_VERSION)
+string(STRIP "${LIBSLASH_VERSION}" LIBSLASH_VERSION)
+
+# Parse into components
+string(REPLACE "." ";" VERSION_LIST "${LIBSLASH_VERSION}")
+list(GET VERSION_LIST 0 LIBSLASH_VERSION_MAJOR)
+list(GET VERSION_LIST 1 LIBSLASH_VERSION_MINOR)
+list(GET VERSION_LIST 2 LIBSLASH_VERSION_PATCH)
+
+message(STATUS "LIBSLASH version: ${LIBSLASH_VERSION} (${LIBSLASH_VERSION_MAJOR}.${LIBSLASH_VERSION_MINOR}.${LIBSLASH_VERSION_PATCH})")
+
+project(libslash
+  VERSION ${LIBSLASH_VERSION}
+  LANGUAGES C
+)
+
+# Allow user to choose shared vs static (standard CMake variable)
+option(BUILD_SHARED_LIBS "Build shared libraries" ON)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 add_subdirectory(src)
 
 # -------- Installation: headers and library --------
 # Public headers are under include/  (layout: include/slash/*.h)
 install(
-  DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"
+  DIRECTORY "${PROJECT_SOURCE_DIR}/include/"
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
 )
 
@@ -47,7 +71,7 @@ write_basic_package_version_file(
 
 # Configure the main package config from template
 configure_package_config_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/slashConfig.cmake.in"
+  "${PROJECT_SOURCE_DIR}/cmake/slashConfig.cmake.in"
   "${CMAKE_CURRENT_BINARY_DIR}/slashConfig.cmake"
   INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/slash"
 )

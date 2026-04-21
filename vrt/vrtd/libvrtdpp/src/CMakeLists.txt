@@ -30,7 +30,15 @@ add_library(
     ${CMAKE_CURRENT_SOURCE_DIR}/session.cpp
 )
 
-target_include_directories(libvrtdpp PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>)
+target_include_directories(libvrtdpp
+  PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/libvrtd/include>
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/libvrtdpp/include>
+    $<INSTALL_INTERFACE:include>
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
 # CMake prepends lib for libraries so libvrtdpp would be output as liblibvrtdpp otherwise
 set_target_properties(libvrtdpp PROPERTIES

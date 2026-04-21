@@ -18,10 +18,42 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 # ##################################################################################################
 
-set(SMI_VERSION       ${PROJECT_VERSION})
-set(SMI_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
-set(SMI_VERSION_MINOR ${PROJECT_VERSION_MINOR})
-set(SMI_VERSION_PATCH ${PROJECT_VERSION_PATCH})
+cmake_minimum_required(VERSION 3.10)
+
+# Read version from packaging/version
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/version" SMI_VERSION)
+string(STRIP "${SMI_VERSION}" SMI_VERSION)
+
+# Parse into components
+string(REPLACE "." ";" VERSION_LIST "${SMI_VERSION}")
+list(GET VERSION_LIST 0 SMI_VERSION_MAJOR)
+list(GET VERSION_LIST 1 SMI_VERSION_MINOR)
+list(GET VERSION_LIST 2 SMI_VERSION_PATCH)
+
+message(STATUS "SMI version: ${SMI_VERSION} (${SMI_VERSION_MAJOR}.${SMI_VERSION_MINOR}.${SMI_VERSION_PATCH})")
+
+project(
+    v80-smi
+    
+    VERSION ${SMI_VERSION}
+    LANGUAGES C CXX
+)
+
+option(SMI_INCLUDE_VRT "Include vrtd as subdirectory instead of building from system" OFF)
+
+include(GNUInstallDirs)
+
+if (SMI_INCLUDE_VRT)
+  add_subdirectory(../vrt vrt)
+else()
+  find_package(vrt REQUIRED CONFIG)
+endif()
+
+if(NOT TARGET vrt::vrt)
+  message(FATAL_ERROR
+    "vrt package is missing target vrt::vrt. "
+    "Build and install vrt first (cmake --install), then configure smi again.")
+endif()
 
 find_package(CLI11 CONFIG REQUIRED)
 

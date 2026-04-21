@@ -34,8 +34,14 @@ add_executable(
 
 target_compile_features(v80-smi PRIVATE cxx_std_20)
 
-# For version.hpp
-target_include_directories(v80-smi PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/../generated)
+target_include_directories(
+    v80-smi
+
+    PRIVATE
+
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}/../generated # For version.hpp
+)
 
 target_link_libraries(
     v80-smi

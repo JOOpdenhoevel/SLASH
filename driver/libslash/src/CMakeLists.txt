@@ -38,8 +38,11 @@ set_target_properties(slash PROPERTIES
   SOVERSION ${PROJECT_VERSION_MAJOR}
 )
 
-# Public include dir (for consumers)
+# Public include dir (for consumers) and private include dir (for .c / private headers)
 target_include_directories(slash
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+    $<INSTALL_INTERFACE:include>
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )

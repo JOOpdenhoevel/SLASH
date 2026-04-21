@@ -45,8 +45,14 @@ set_target_properties(vrtd PROPERTIES
   SOVERSION ${PROJECT_VERSION_MAJOR}
 )
 
-# Public include dir (for consumers)
-target_include_directories(vrtd PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>)
+# Public include dir (for consumers) and private include dir (for .c / private headers)
+target_include_directories(vrtd
+  PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
 target_link_libraries(
   vrtd

@@ -27,6 +27,7 @@ manual_job:
   image: ubuntu:22.04
   variables:
     SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 2G -t 00:15:00"
+  before_script: []
   script:
     - echo ${{ job.inputs.build_base_design }}
   inputs:

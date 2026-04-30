@@ -31,11 +31,11 @@ build_v80pp:
     # Unzipping the SMBus IP
     - glab -R $CI_PROJECT_PATH securefile download --name "smbus_v1_1-20240328.zip"
     - unzip smbus_v1_1-20240328.zip
-    - mv smbus_v1_1-20240328 resources/base/iprepo/
+    - mv smbus_v1_1-20240328 v80pp/resources/base/iprepo/
     # Building the other IP cores
-    - make -C linker/v80pp/resources/base/iprepo -j16
+    - make -C v80pp/resources/base/iprepo -j16
     # Building the abstract shell
-    #- python3 ./src/main.py install --jobs 16
+    #- python3 -m v80pp install --jobs 16
     # Packaging v80pp
     - pip wheel --no-deps .
   artifacts:

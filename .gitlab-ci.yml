@@ -21,6 +21,20 @@ default:
   artifacts:
     access: 'developer'
 
+manual_job:
+  tags:
+    - otus
+  variables:
+    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 2G -t 00:15:00"
+  script:
+    - echo $build_base_design
+  inputs:
+    build_base_design:
+      default: no
+      description: Build the base design from scratch?
+      options: [yes, no]
+  when: manual
+
 build_v80pp:
   tags:
     - otus
@@ -34,7 +48,7 @@ build_v80pp:
     - mv smbus_v1_1-20240328 v80pp/resources/base/iprepo/
     # Building the other IP cores
     - make -C v80pp/resources/base/iprepo -j16
-    # Building the abstract shell
+    # Building the base design
     #- python3 -m v80pp install --jobs 16
     # Packaging v80pp
     - pip wheel --no-deps .

@@ -43,4 +43,4 @@ build_v80pp:
     when: always
     paths:
       - linker/install.prj/
-      - linker/v80pp_*.whl
+      - linker/v80pp*.whl

@@ -23,7 +23,8 @@ default:
 
 manual_job:
   tags:
-    - otus
+    - zim-no-sla
+  image: ubuntu:22.04
   variables:
     SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 2G -t 00:15:00"
   script:

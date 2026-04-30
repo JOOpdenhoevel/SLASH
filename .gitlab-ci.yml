@@ -30,9 +30,9 @@ manual_job:
     - echo $build_base_design
   inputs:
     build_base_design:
-      default: no
+      default: false
       description: Build the base design from scratch?
-      options: [yes, no]
+      type: boolean
   when: manual
 
 build_v80pp:

@@ -1,0 +1,46 @@
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && ( $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH == "feature/ci_with_new_linker" || $CI_COMMIT_BRANCH =~ /^pr\// )
+
+variables:
+  SLURM_ACCOUNT: hpc-prf-cifi
+  GIT_SUBMODULE_STRATEGY: recursive
+
+default:
+  id_tokens:
+    CI_JOB_JWT:
+      aud: https://git.uni-paderborn.de
+  before_script:
+    - module reset
+    - ml fpga lang tools devel Python xilinx/vivado/25.1 UnZip gitlab-cli CMake
+    - python3 -m venv .venv
+    - source .venv/bin/activate
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+    - glab auth login --job-token $CI_JOB_TOKEN --hostname $CI_SERVER_FQDN --api-protocol $CI_SERVER_PROTOCOL
+  artifacts:
+    access: 'developer'
+
+build_v80pp:
+  tags:
+    - otus
+  variables:
+    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 16 --mem 128G -t 12:00:00"
+  script:
+    - cd linker
+    # Unzipping the SMBus IP
+    - glab -R $CI_PROJECT_PATH securefile download --name "smbus_v1_1-20240328.zip"
+    - unzip smbus_v1_1-20240328.zip
+    - mv smbus_v1_1-20240328 resources/base/iprepo/
+    # Building the other IP cores
+    - make -C linker/v80pp/resources/base/iprepo -j16
+    # Building the abstract shell
+    #- python3 ./src/main.py install --jobs 16
+    # Packaging v80pp
+    - pip wheel --no-deps .
+  artifacts:
+    public: false
+    when: always
+    paths:
+      - linker/install.prj/
+      - linker/v80pp_*.whl

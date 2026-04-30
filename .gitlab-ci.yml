@@ -27,12 +27,13 @@ manual_job:
   variables:
     SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 2G -t 00:15:00"
   script:
-    - echo ${{ job.inputs.build_base_design }}
+    - echo $build_base_design
   inputs:
     build_base_design:
       default: false
       description: Build the base design from scratch?
       type: boolean
+  when: manual
 
 build_v80pp:
   tags:

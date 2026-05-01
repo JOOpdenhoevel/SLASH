@@ -123,7 +123,14 @@ endif()
 
 find_package(ZLIB REQUIRED)
 find_package(LibXml2 REQUIRED)
-find_package(jsoncpp CONFIG REQUIRED)
+
+include(FetchContent)
+FetchContent_Declare(
+  jsoncpp
+  GIT_REPOSITORY https://github.com/open-source-parsers/jsoncpp
+  GIT_TAG        1.9.7
+)
+FetchContent_MakeAvailable(jsoncpp)
 
 if(NOT TARGET JsonCpp::JsonCpp AND TARGET jsoncpp_lib)
   add_library(JsonCpp::JsonCpp ALIAS jsoncpp_lib)
@@ -161,7 +168,7 @@ install(
 )
 
 install(
-  TARGETS vrt
+  TARGETS vrt jsoncpp_lib
   EXPORT  vrtTargets
   ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
   LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"

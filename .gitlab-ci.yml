@@ -13,6 +13,7 @@ default:
   before_script:
     - module reset
     - ml fpga lang tools devel Python xilinx/vivado/25.1 UnZip gitlab-cli CMake
+    - export LD_LIBRARY_PATH=$XILINX_VIVADO/lib/lnx64.o/:$LD_LIBRARY_PATH # Set the LD_LIBRARY_PATH for simulation
     - python3 -m venv .venv
     - source .venv/bin/activate
     - pip install --upgrade pip
@@ -59,14 +60,37 @@ package_linker:
       - linker/v80pp/resources/abstract_shell
       - linker/v80pp*.whl
 
-run_linker:
+test_examples:
   tags:
     - otus
   needs: 
     - job: package_linker
       artifacts: true
   variables:
-    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 16G -t 00:15:00"
+    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 8 --mem 16G -t 00:15:00"
   script:
+    # Install the linker into the virtualenv
     - pip install linker/v80pp*.whl
-    - v80++ link -h
+    - mkdir -p build/vrt build/cmake
+    # Build and install VRT, VRTD, and libslash
+    - cd build/vrt
+    - cmake -DVRT_INCLUDE_VRTD=1 -DVRTD_INCLUDE_LIBSLASH=1 -DCMAKE_INSTALL_PREFIX=$(realpath ../../.venv/) -DCMAKE_INSTALL_LIBDIR=lib ../../vrt/
+    - make install -j8
+    # Install the cmake tools
+    - cd ../install
+    - cmake -DCMAKE_INSTALL_PREFIX=$(realpath ../../.venv/) -DCMAKE_INSTALL_LIBDIR=lib ../../cmake/
+    - make install -j8
+    - cd ../..
+    # Set all environment variables to point to the venv
+    - export C_INCLUDE_PATH=$(realpath ./.venv/include):$C_INCLUDE_PATH
+    - export CPLUS_INCLUDE_PATH=$(realpath ./.venv/include):$CPLUS_INCLUDE_PATH
+    - export LD_LIBRARY_PATH=$(realpath ./.venv/lib):$LD_LIBRARY_PATH
+    - export LIBRARY_PATH=$(realpath ./.venv/lib):$LIBRARY_PATH
+    - export CMAKE_MODULE_PATH=$(realpath ./.venv/lib/cmake):$CMAKE_MODULE_PATH
+    # Build and run the 00_axilite example
+    - cd examples/00_axilite
+    - mkdir build
+    - cd build
+    - cmake ..
+    - make 00_axilite axilite_emu axilite_sim -j8
+    - ./00_axilite NULL axilite_emu.vbin

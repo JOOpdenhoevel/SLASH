@@ -77,7 +77,7 @@ test_examples:
     - cmake -DVRT_INCLUDE_VRTD=1 -DVRTD_INCLUDE_LIBSLASH=1 -DCMAKE_INSTALL_PREFIX=$(realpath ../../.venv/) -DCMAKE_INSTALL_LIBDIR=lib ../../vrt/
     - make install -j8
     # Install the cmake tools
-    - cd ../install
+    - cd ../cmake
     - cmake -DCMAKE_INSTALL_PREFIX=$(realpath ../../.venv/) -DCMAKE_INSTALL_LIBDIR=lib ../../cmake/
     - make install -j8
     - cd ../..

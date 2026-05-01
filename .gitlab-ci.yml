@@ -58,3 +58,13 @@ package_linker:
       - linker/install.prj/
       - linker/v80pp/resources/abstract_shell
       - linker/v80pp*.whl
+
+run_linker:
+  tags:
+    - outs
+  needs: package_linker
+  variables:
+    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 16G -t 00:15:00"
+  script:
+    - pip install linker/v80pp*.whl
+    - v80++ link -h

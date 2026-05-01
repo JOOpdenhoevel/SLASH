@@ -21,25 +21,17 @@ default:
   artifacts:
     access: 'developer'
 
-manual_job:
+package_linker:
   tags:
     - otus
-  variables:
-    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 2G -t 00:15:00"
-  script:
-    - echo ${{ job.inputs.build_base_design }}
+  when: manual
   inputs:
     build_base_design:
       default: false
       description: Build the base design from scratch?
       type: boolean
-  when: manual
-
-build_v80pp:
-  tags:
-    - otus
   variables:
-    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 16 --mem 128G -t 12:00:00"
+    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 2G -t 00:15:00"
   script:
     - cd linker
     # Unzipping the SMBus IP
@@ -47,14 +39,14 @@ build_v80pp:
     - unzip smbus_v1_1-20240328.zip
     - mv smbus_v1_1-20240328 v80pp/resources/base/iprepo/
     # Building the other IP cores
-    - make -C v80pp/resources/base/iprepo -j16
-    # Building the base design
-    #- python3 -m v80pp install --jobs 16
-    # Packaging v80pp
-    - pip wheel --no-deps .
+    - if [ ${{ job.inputs.build_base_design }} = "true" ]; then make -C v80pp/resources/base/iprepo -j16; fi
+    # Creating the wheel
+    - python3 -m v80pp install --jobs 16
   artifacts:
     public: false
     when: always
     paths:
       - linker/install.prj/
+      - linker/v80pp/resources/base/iprepo
+      - linker/v80pp/resources/abstract_shell
       - linker/v80pp*.whl

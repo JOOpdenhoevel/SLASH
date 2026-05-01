@@ -62,7 +62,9 @@ package_linker:
 run_linker:
   tags:
     - outs
-  needs: package_linker
+  needs: 
+    - job: package_linker
+      artifacts: true
   variables:
     SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 16G -t 00:15:00"
   script:

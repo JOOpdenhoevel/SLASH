@@ -40,7 +40,7 @@ package_linker:
   #    ref: ${{ job.inputs.base_design_ref }}
   #    artifacts: true
   variables:
-    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 2G -t 00:15:00"
+    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 16G -t 00:15:00"
   script:
     - cd linker
     # Unzipping the SMBus IP

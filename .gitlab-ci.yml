@@ -48,6 +48,7 @@ package_linker:
     # Building the other IP cores
     - if [ ${{ job.inputs.build_base_design }} = "true" ]; then make -C v80pp/resources/base/iprepo -j16; fi
     # Building the base design
+    - if [ ${{ job.inputs.build_base_design }} = "true" ]; then rm -r v80pp/resources/abstract_shell; fi
     - if [ ${{ job.inputs.build_base_design }} = "true" ]; then python3 -m v80pp install --jobs 16 --out-dir v80pp/resources; fi
     # Packaging the linker
     - pip wheel --no-deps .

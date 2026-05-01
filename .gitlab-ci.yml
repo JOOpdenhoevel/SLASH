@@ -34,11 +34,11 @@ package_linker:
       default: feature/ci_with_new_linker
       description: From which git ref should the previous base design be pulled?
       type: string
-  #needs:
-  #  - project: $CI_PROJECT_PATH
-  #    job: package_linker
-  #    ref: ${{ job.inputs.base_design_ref }}
-  #    artifacts: true
+  needs:
+    - project: $CI_PROJECT_PATH
+      job: package_linker
+      ref: ${{ job.inputs.base_design_ref }}
+      artifacts: true
   variables:
     SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 16G -t 00:15:00"
   script:

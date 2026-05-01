@@ -61,7 +61,7 @@ package_linker:
 
 run_linker:
   tags:
-    - outs
+    - otus
   needs: 
     - job: package_linker
       artifacts: true

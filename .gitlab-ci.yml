@@ -1,3 +1,11 @@
+spec:
+  inputs:
+    base_design_ref:
+      default: feature/ci_with_new_linker
+      description: From which git ref should the previous base design be pulled?
+      type: string
+---
+
 workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "push" && ( $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH == "feature/ci_with_new_linker" || $CI_COMMIT_BRANCH =~ /^pr\// )
@@ -5,14 +13,6 @@ workflow:
 variables:
   SLURM_ACCOUNT: hpc-prf-cifi
   GIT_SUBMODULE_STRATEGY: recursive
-
-spec:
-  inputs:
-    base_design_ref:
-      default: feature/ci_with_new_linker
-      description: From which git ref should the previous base design be pulled?
-      type: string
-
 
 default:
   id_tokens:

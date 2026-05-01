@@ -1,11 +1,3 @@
-spec:
-  inputs:
-    base_design_ref:
-      default: feature/ci_with_new_linker
-      description: From which git ref should the previous base design be pulled?
-      type: string
----
-
 workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "push" && ( $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH == "feature/ci_with_new_linker" || $CI_COMMIT_BRANCH =~ /^pr\// )
@@ -38,13 +30,14 @@ package_linker:
       default: false
       description: Build the base design from scratch?
       type: boolean
+  variables:
+    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 16G -t 00:15:00"
+    BASE_DESIGN_REF: feature/ci_with_new_linker
   needs:
     - project: $CI_PROJECT_PATH
       job: package_linker
-      ref: $[[ inputs.base_design_ref ]]
+      ref: $BASE_DESIGN_REF
       artifacts: true
-  variables:
-    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 16G -t 00:15:00"
   script:
     - cd linker
     # Unzipping the SMBus IP

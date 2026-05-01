@@ -30,6 +30,15 @@ package_linker:
       default: false
       description: Build the base design from scratch?
       type: boolean
+    base_design-ref:
+      default: feature/ci_with_new_linker
+      description: From which git ref should the previous base design be pulled?
+      type: string
+  needs:
+    - project: $CI_PROJECT_PATH
+      job: package_linker
+      ref: ${{ job.inputs.base_design_ref }}
+      artifacts: true
   variables:
     SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 2G -t 00:15:00"
   script:
@@ -40,13 +49,15 @@ package_linker:
     - mv smbus_v1_1-20240328 v80pp/resources/base/iprepo/
     # Building the other IP cores
     - if [ ${{ job.inputs.build_base_design }} = "true" ]; then make -C v80pp/resources/base/iprepo -j16; fi
-    # Creating the wheel
-    - python3 -m v80pp install --jobs 16
+    # Building the base design
+    #- python3 -m v80pp install --jobs 16
+    - if [ ${{ job.inputs.build_base_design }} = "true" ]; then echo "Hello World" > v80pp/resources/abstract_shell; fi
+    # Packaging the linker
+    - pip wheel --no-deps .
   artifacts:
     public: false
     when: always
     paths:
       - linker/install.prj/
-      - linker/v80pp/resources/base/iprepo
       - linker/v80pp/resources/abstract_shell
       - linker/v80pp*.whl

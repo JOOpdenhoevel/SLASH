@@ -32,7 +32,7 @@ package_linker:
       description: Build the base design from scratch?
       type: boolean
   variables:
-    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 16G -t 00:15:00"
+    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -q fpgasynthesis -p normal -c 16 --mem 120G -t 12:00:00"
     BASE_DESIGN_REF: feature/ci_with_new_linker
   needs:
     - project: $CI_PROJECT_PATH
@@ -48,8 +48,7 @@ package_linker:
     # Building the other IP cores
     - if [ ${{ job.inputs.build_base_design }} = "true" ]; then make -C v80pp/resources/base/iprepo -j16; fi
     # Building the base design
-    #- python3 -m v80pp install --jobs 16
-    - if [ ${{ job.inputs.build_base_design }} = "true" ]; then echo "Hello World" > v80pp/resources/abstract_shell; fi
+    - if [ ${{ job.inputs.build_base_design }} = "true" ]; then python3 -m v80pp install --jobs 16 --out-dir v80pp/resources; fi
     # Packaging the linker
     - pip wheel --no-deps .
   artifacts:
@@ -67,7 +66,7 @@ test_examples:
     - job: package_linker
       artifacts: true
   variables:
-    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 8 --mem 16G -t 00:15:00"
+    SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 8 --mem 80G -t 02:00:00"
   script:
     # Install the linker into the virtualenv
     - pip install linker/v80pp*.whl
@@ -92,5 +91,13 @@ test_examples:
     - mkdir build
     - cd build
     - cmake ..
-    - make 00_axilite axilite_emu axilite_sim -j8
+    - make 00_axilite axilite_emu axilite_sim -j16
     - ./00_axilite NULL axilite_emu.vbin
+    # - ./00_axilite NULL axilite_sim.vbin
+    - make axilite_hw
+  artifacts:
+    public: false
+    when: always
+    paths:
+      - examples/00_axilite/build/*.prj/
+      - examples/00_axilite/build/*.vbin/

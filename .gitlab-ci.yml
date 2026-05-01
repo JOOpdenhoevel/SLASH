@@ -37,7 +37,7 @@ package_linker:
   needs:
     - project: $CI_PROJECT_PATH
       job: package_linker
-      ref: ${{ job.inputs.base_design_ref }}
+      ref: feature/ci_with_new_linker
       artifacts: true
   variables:
     SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 16G -t 00:15:00"

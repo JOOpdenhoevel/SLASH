@@ -6,6 +6,14 @@ variables:
   SLURM_ACCOUNT: hpc-prf-cifi
   GIT_SUBMODULE_STRATEGY: recursive
 
+spec:
+  inputs:
+    base_design_ref:
+      default: feature/ci_with_new_linker
+      description: From which git ref should the previous base design be pulled?
+      type: string
+
+
 default:
   id_tokens:
     CI_JOB_JWT:
@@ -30,14 +38,10 @@ package_linker:
       default: false
       description: Build the base design from scratch?
       type: boolean
-    base_design-ref:
-      default: feature/ci_with_new_linker
-      description: From which git ref should the previous base design be pulled?
-      type: string
   needs:
     - project: $CI_PROJECT_PATH
       job: package_linker
-      ref: feature/ci_with_new_linker
+      ref: $[[ inputs.base_design_ref ]]
       artifacts: true
   variables:
     SCHEDULER_PARAMETERS: "-A $SLURM_ACCOUNT -p normal -c 1 --mem 16G -t 00:15:00"

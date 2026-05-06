@@ -50,7 +50,7 @@ package_linker:
     - make -C slashkit/resources/base/iprepo -j16
     # Building the base design
     - if [ ${{ job.inputs.build_base_design }} = "true" -a -e slashkit/resources/static_shell ]; then rm -r slashkit/resources/static_shell; fi
-    - if [ ${{ job.inputs.build_base_design }} = "true" ]; then python3 -m slashkit install --jobs 16 --out-dir linker/slashkit/resources/ > install.out.log 2> install.err.log; fi
+    - if [ ${{ job.inputs.build_base_design }} = "true" ]; then python3 -m slashkit install --jobs 16 --out-dir slashkit/resources/ > install.out.log 2> install.err.log; fi
     # Packaging the linker
     - pip wheel --no-deps .
   artifacts:

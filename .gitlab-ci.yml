@@ -44,21 +44,21 @@ package_linker:
     # Unzipping the SMBus IP
     - glab -R $CI_PROJECT_PATH securefile download --name "smbus_v1_1-20240328.zip"
     - unzip smbus_v1_1-20240328.zip
-    - mv smbus_v1_1-20240328 v80pp/resources/base/iprepo/
+    - mv smbus_v1_1-20240328 slashkit/resources/base/iprepo/
     # Building the other IP cores
-    - if [ ${{ job.inputs.build_base_design }} = "true" ]; then make -C v80pp/resources/base/iprepo -j16; fi
+    - make -C slashkit/resources/base/iprepo -j16
     # Building the base design
-    - if [ ${{ job.inputs.build_base_design }} = "true" ]; then rm -r v80pp/resources/abstract_shell; fi
-    - if [ ${{ job.inputs.build_base_design }} = "true" ]; then python3 -m v80pp install --jobs 16 --out-dir v80pp/resources; fi
+    - if [ ${{ job.inputs.build_base_design }} = "true" ]; then rm -r slashkit/resources/static_shell; fi
+    - if [ ${{ job.inputs.build_base_design }} = "true" ]; then python3 -m slashkit install --jobs 16 --out-dir slashkit/resources; fi
     # Packaging the linker
     - pip wheel --no-deps .
   artifacts:
     public: false
     when: always
     paths:
-      - linker/install.prj/
-      - linker/v80pp/resources/abstract_shell
-      - linker/v80pp*.whl
+      - linker/install.prj/vivado.log
+      - linker/slashkit/resources/static_shell
+      - linker/slashkit*.whl
 
 test_examples:
   tags:

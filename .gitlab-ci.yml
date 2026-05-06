@@ -49,14 +49,15 @@ package_linker:
     - make -C slashkit/resources/base/iprepo -j16
     # Building the base design
     - if [ ${{ job.inputs.build_base_design }} = "true" ]; then rm -r slashkit/resources/static_shell; fi
-    - if [ ${{ job.inputs.build_base_design }} = "true" ]; then python3 -m slashkit install --jobs 16 --out-dir slashkit/resources; fi
+    - if [ ${{ job.inputs.build_base_design }} = "true" ]; then python3 -m slashkit install --jobs 16 > install.log 2> install.err; fi
     # Packaging the linker
     - pip wheel --no-deps .
   artifacts:
     public: false
     when: always
     paths:
-      - linker/install.prj/vivado.log
+      - linker/install.log
+      - linker/install.err
       - linker/slashkit/resources/static_shell
       - linker/slashkit*.whl
 

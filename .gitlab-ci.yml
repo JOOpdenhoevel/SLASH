@@ -26,6 +26,7 @@ package_linker:
   tags:
     - otus
   when: manual
+  allow_failure: false
   inputs:
     build_base_design:
       default: false

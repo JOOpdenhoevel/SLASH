@@ -66,6 +66,9 @@ target_link_libraries(vrtd PRIVATE vrtd_core)
 set_target_properties(vrtd PROPERTIES
   VERSION ${PROJECT_VERSION}
   SOVERSION ${PROJECT_VERSION_MAJOR}
+  C_STANDARD 11
+  C_STANDARD_REQUIRED YES
+  C_EXTENSIONS YES
 )
 
 add_executable(vrtd::vrtd ALIAS vrtd)

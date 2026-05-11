@@ -93,7 +93,7 @@ test 00_axilite:
     - ./scripts/test-examples.sh emu
     - ./scripts/test-examples.sh sim
     # Build the 00_axilite example in hardware
-    - make axilite_hw > axilite_hw.out.log 2> axilite_hw.err.log
+    - cd examples/00_axilite/build && make axilite_hw > axilite_hw.out.log 2> axilite_hw.err.log
   artifacts:
     public: false
     when: always

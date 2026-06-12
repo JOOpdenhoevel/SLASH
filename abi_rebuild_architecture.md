@@ -8,20 +8,51 @@ Note: This introduces a new concept "system emulation", independent of the exist
 
 ## File endpoints
 
+### Information file
+
+* Path `/dev/slash/<BDF>/info`
+* Read-only, returns binary information struct
+* Encodes all information that can't be expressed as file metadata
+* Uses the previous `size`-based versioning:
+  * New fields are only appended to the field
+  * Old readers only read the fields they understand
+* Current state of the information struct:
+
+```C
+#define SLASH_PCI_BDF_LEN 32
+
+struct slash_info {
+    __u32 size;                   /* [in/out] ABI version */
+    __u32 acc_type;               /* [out] Bitflags describing the accelerator type. Currently: 0x1: System-Emulated */
+    char  bdf[SLASH_PCI_BDF_LEN]; /* [out] PCI BDF string without function, NUL-terminated, e.g. "0000:61:00" */
+    __u16 vendor_id;              /* [out] PCI vendor ID (0x10EE for AMD/Xilinx) */
+    __u16 device_id;              /* [out] PCI device ID (0x50B6 for PF2) */
+    __u16 subsystem_vendor_id;    /* [out] PCI subsystem vendor ID */
+    __u16 subsystem_device_id;    /* [out] PCI subsystem device ID */
+    __u32 qdma_qsets_max;         /* [out] Max queue sets (currently always 0) */
+    __u32 qdma_msix_qvecs;        /* [out] MSI-X vectors for queues (currently always 0) */
+    __u32 qdma_vf_max;            /* [out] Max VFs (currently always 0) */
+    __u32 qdma_caps;              /* [out] Capability bitmask (currently always 0) */
+};
+```
+
 ### QDMA
 
 * `/dev/slash/<BDF>/qdma/`
   * Directory
-  * GET_INFO IOCTL like before (excluding info expressed by file presence)
   * "QPAIR_ADD" IOCTL
     * Inputs: Mode, directions, H2C/C2H/CMPT ring sizes
-    * Output: Path to the newly created `/dev/slash/<BDF>/qdma/qpair<Q>` file
+    * Output: QID, allocated by kernel/daemon
+      * Used to construct the queue pair path `/dev/slash/<BDF>/qdma/qpair<Q>`
+      * Then opened separately
     * Also starts the queue
 * `/dev/slash/<BDF>/qdma/qpair<Q>`
   * llseek, read, write
     * Memory transfers, as done previously
-  * removal stops the underlying qpair and removes it
-  * Effectively, a qpair file acts as a file representing the accelerator memory
+  * TODO: Resolve lifetime
+* Memory ranges (HBM banks, DDR, reconfiguration target)
+  * Part of UAPI header in libslash
+  * Both offsets and lengths
 
 ### BAR Access - traditional with one file for the entire BAR
 
@@ -29,14 +60,22 @@ Note: This introduces a new concept "system emulation", independent of the exist
   * Directory
   * GET_INFO IOCTL like before (excluding info expressed by file presence)
 * `/dev/slash/<BDF>/bars/bar<M>`
-  * "INFO" IOCTL
-    * Only returns "start_address"
-    * Usability encoded in file presence
-    * Length encoded in file length
-  * read and write with offset
+  * File, only pread and pwrite
     * Reads and writes the BAR
     * Verifies read/write widths
-    * Explicitly no Mmap'ing to enable kernel-side checks and easier emulation
+    * Only meant for register access
+  * `pread`/`pwrite` only, no buffering, width == transfer size, reject misaligned/odd widths
+  * Explicitly no Mmap'ing to enable kernel-side checks and easier emulation
+  * Size of the BAR encoded as the size of the file
+* Available BARs:
+  * BAR 0: User region
+    * Size: 128 MB
+  * BAR 2: Service Layer
+    * Size: 128 MB
+  * BAR 4: Clock wizard
+    * Size: 512 KB
+  * Codified in the UAPI header
+* Side note: The start address attribute has been dropped and is not reported anymore
 
 ### Hotpluging/Resets
 
@@ -71,31 +110,31 @@ Note: This introduces a new concept "system emulation", independent of the exist
     * Dynamic char devices:
       * Flat /dev, no subtrees
       * Nodes appear asynchronously, an open() right after a creation ioctl may fail
+  * Ship .mount systemd unit to automatically mount /dev/slash/
 
 ## Reconfiguration
 
+* In both cases, the user writes their payload to the "reconfiguration region"
 * On hardware: QDMA of the DCP to AVED, just as before
 * In system emulation:
   * Especially FPGA simulation needs many other files from the VBIN
   * Therefore: User has to transfer entire VBIN to emulation daemon via "QDMA"
   * System emulation daemon unpacks VBIN somewhere
-  * MVP (step 1): runs the model directly under the privileged daemon, unsandboxed
-  * Step 5: runs either vpp_emu or vpp_sim in a systemd transient unit (daemon must be privileged, model is not)
-    * Identity: `DynamicUser=yes` (per-session throwaway uid), `RemoveIPC=yes`, `PrivateTmp=yes` → cross-tenant isolation for free
-    * Scratch (unpacked VBIN) via `RuntimeDirectory=`/`BindPaths=`; rest read-only/hidden (`ProtectSystem=strict`, `ProtectHome=yes`, `ReadWritePaths=<scratch>`)
-    * Harden: `NoNewPrivileges`, `PrivateDevices`, `RestrictSUIDSGID`, `ProtectKernel*`, `RestrictNamespaces`, `LockPersonality`
-    * DoS bounds: `MemoryMax`, `TasksMax`, `CPUQuota`, `RuntimeMaxSec`
+  * Runs either vpp_emu or vpp_sim in a hardened systemd transient unit (daemon must be privileged, model is not)
+    * To note: Emu is self-contained, but sim needs Vivado and potentially network egress to check licenses
     * Data plane: model talks to daemon over unix socket in scratch (replace tcp://localhost:5555), never sees the FUSE mount
-    * emu: self-contained → `PrivateNetwork=yes`, tight `SystemCallFilter=@system-service`
-    * sim (xsim): needs license egress + Vivado tree → can't fully sandbox
-      * `IPAddressDeny=any` + `IPAddressAllow=localhost <license-server>`, `BindReadOnlyPaths=<vivado>`, looser syscall/Tasks limits
-      * Residual: license-egress widens surface; kernel sandbox-escape is the ultimate threat (require current kernel)
+  * MVP (step 1): runs the model directly under the privileged daemon, unsandboxed
 
-## Features of the emulation daemon
+## Emulation daemon configuration & deployment
 
-* Manages emulated accelerators
-  * Each of them persistent, defined in a configuration file
-* Exposed via a FUSE filesystem, using the kernel ABI
+* Accelerators are persistent (persist beyond the lifetime of a user process)
+* Accelerator configuration covers:
+  * Accelerator BDF
+  * Space in the schema for network configuration (to be done in the future)
+* Everything else currently hard-wired
+* Command line arguments:
+  * Path to config, Path to mount path
+* Ship with systemd units to tie the daemon in
 
 ## Testing
 
@@ -106,17 +145,27 @@ Note: This introduces a new concept "system emulation", independent of the exist
   * Same suite runs against BOTH the FUSE daemon AND the kernel module → guarantees they don't drift
 * Every implementation step below ships its tests as part of that step
 
+## Filesystem discovery by VRTD
+
+* VRTD config contains an ordered list of mount paths where to look for a SLASH endpoint
+  * Default configuration shipped with VRTD lists `/dev/slash` and `/run/slash_emu`
+  * But, in theory an arbitrary number of endpoints allowed, even excluding the hardware endpoint
+* No endpoint listed is an error
+* If multiple accelerators with same BDF from different endpoints exist, earlier endpoints take precedence
+
 ## Implementation steps
 
 1. Build a minimum viable version of the emulation daemon
   * Includes "reconfiguration" (swapping the vpp_emu/vpp_sim model)
-  * But unsandboxed: model runs directly under the privileged daemon; sandboxing is deferred to step 5
+    * But unsandboxed: model runs directly under the privileged daemon; sandboxing is deferred to step 5
+  * Kernel ABI description written to UAPI header in libslash
 2. Update/rewrite libslash for the new kernel ABI
   * Using the emulation daemon for testing
 3. Update VRTD to use the new libslash
   * Again, using the emulation daemon for testing
 4. Update libvrtd and VRT
-  * Including reconfiguration, although it doesn't change anything yet
+  * Add the "system emulated" field, so that VRT uses libvrtd to talk to system-emulated accelerators
+  * But: Keep branching on hardware or system-emulation minimal
 5. Add sandboxing to the system-emulated "reconfiguration" (built unsandboxed in step 1)
   * Wrap vpp_emu/vpp_sim in the hardened systemd transient unit (see "Reconfiguration" above)
   * Can now be tested through the entire stack
@@ -124,27 +173,15 @@ Note: This introduces a new concept "system emulation", independent of the exist
 
 ## Open TODOs (resolve before/while implementing)
 
-### Blocks step 1 (MVP daemon)
-
-* [ ] 1. Source of an emulated accelerator's shape (BAR count/sizes/start_address, qdma info, memory targets)
-  * From dummy VBIN's `system_map.xml`, separate daemon config, or hardcoded? Define config-vs-system_map.xml split
-* [X] 2. Define the step-1 test client (libslash not ready, VRT still on ZeroMQ) — throwaway ioctl/`dd` tool? Becomes ABI conformance harness
-* [ ] 3. Mount-root discovery: how libslash/VRTD pick `/dev/slash` vs `/run/slash_emu` (env var / config / presence detection)
-
 ### Settle the ABI surface
 
-* [ ] 4. One shared ABI header (ioctl numbers + POD structs) as single source of truth for kernel module AND daemon — prevents drift
-* [ ] 5. Concrete GET_INFO/INFO struct contents ("excluding file-presence info" is too vague); define fake BAR start_address (stable? consistent with VRT's fake phys addrs)
-* [ ] 6. ioctl-over-FUSE rule: all ioctls fixed-size `_IOR/_IOW/_IOWR` POD (no unrestricted retries); QPAIR_ADD path return needs fixed max-length buffer
-* [ ] 7. qpair lifecycle: who allocates `Q` (stable?); make user→VRTD→QPAIR_ADD→VRTD-opens-path→SCM_RIGHTS flow explicit; "removal" = unlink / last-close / ioctl?
-* [X] 8. BDF directory naming: per-device (aggregate PF1 qdma + PF2 ctl under one dir) vs per-PF-BDF; fix the `0000:61:00` vs `…:00.0` example
-* [ ] 9. BAR access-width contract: `pread`/`pwrite` only, no buffering, width == transfer size, reject misaligned/odd widths (also a libslash constraint)
+* [ ] qpair lifecycle: who allocates `Q` (stable?); make user→VRTD→QPAIR_ADD→VRTD-opens-path→SCM_RIGHTS flow explicit; "removal" = unlink / last-close / ioctl?
 
 ### Defer but reserve now
 
-* [ ] 10. Reconfiguration endpoint undefined in "File endpoints"; reserve dedicated control file (e.g. `<BDF>/reconfig`) instead of overloading qpair write; how does daemon tell VBIN upload from memory transfer?
-* [ ] 11. Hotplug semantics under system emulation (reset = restart model process?); global privileged file
+* [ ] Reconfiguration endpoint undefined in "File endpoints"; reserve dedicated control file (e.g. `<BDF>/reconfig`) instead of overloading qpair write; how does daemon tell VBIN upload from memory transfer?
+* [ ] Hotplug semantics under system emulation (reset = restart model process?); global privileged file
 
 ### Minor
 
-* [ ] 12. Reword "permissions for free": UNIX perms only gate who may open (VRTD); real policy is VRTD/`vrtd.conf`. Confirm FUSE node ownership + whether `default_permissions` is used (data-plane caller ≠ opener)
+* [ ] Reword "permissions for free": UNIX perms only gate who may open (VRTD); real policy is VRTD/`vrtd.conf`. Confirm FUSE node ownership + whether `default_permissions` is used (data-plane caller ≠ opener)

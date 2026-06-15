@@ -4,14 +4,20 @@ Idea: Kernel driver exposes a custom "SLASH" filesystem that is mounted in `/dev
 
 With these restrictions on the operations available for the ABI, it is possible and relatively straight-forward to emulate the kernel ABI with a FUSE filesystem, using a dedicated system emulation daemon. Such an daemon would expose a file system in `/run/slash_emu/` with the same structure as `/dev/slash`, but instead exposing ways to manipulate a system-emulated accelerator.
 
-Note: This introduces a new concept "system emulation", independent of the existing "FPGA emulation" and "FPGA simulation" concepts. "System emulation" is the emulation of the entire accelerator in the host system, i.e. how it is handled by the user application, VRT, and VRTD. Contrarily, "FPGA emulation" and "FPGA simulation" describe ways to predict the behavior of a group of kernels on the FPGA in software. How the actual FPGA's behavior is predicted doesn't matter much for the system emulation that we want to introduce, and system emulation can be combined with FPGA emulation or FPGA simulation.
+## General notes
+
+This introduces a new concept "system emulation", independent of the existing "FPGA emulation" and "FPGA simulation" concepts. "System emulation" is the emulation of the entire accelerator in the host system, i.e. how it is handled by the user application, VRT, and VRTD. Contrarily, "FPGA emulation" and "FPGA simulation" describe ways to predict the behavior of a group of kernels on the FPGA in software. How the actual FPGA's behavior is predicted doesn't matter much for the system emulation that we want to introduce, and system emulation can be combined with FPGA emulation or FPGA simulation.
+
+This refactor does not cover the board management via the primary function 0. This is handled by the ami driver.
+
+What can be implemented thread-safe should be implemented thread-safe.
 
 ## File endpoints
 
 ### Per-device folders
 
 * One folder in `/dev/slash` for each accelerator
-* named after the *device* part of their bus-device-function (BDF) identifier
+* named after the board BDF identifier, i.e. everything from the BDF except for the function
 * Example: Accelerator with physical functions `0000:61:00.1` and `0000:61:00.2`
   * Represented with the folder `/dev/slash/0000:61:00`
 * Driver uses all physical functions to implement one folder of endpoints
@@ -22,7 +28,7 @@ Note: This introduces a new concept "system emulation", independent of the exist
 * Read-only, returns binary information struct
 * Encodes all information that can't be expressed as file metadata
 * Uses the previous `size`-based versioning:
-  * New fields added in the future are always appended to the field
+  * New fields added in the future are always appended to the struct
   * Old readers only read the fields they understand
 * Current state of the information struct:
 
@@ -71,6 +77,8 @@ struct slash_info {
   * Effect: Maintains "delete-on-last-close" AND automatic resource freeing
   * Because the qpair is unlinked while open, it is nameless for its whole life
   * Live qpairs thus cannot be found by walking `qdma/`; they must be tracked in a per-device registry (see above)
+* VRTD prunes QDMA pairs that it finds during startup
+  * Thus frees artifacts from a previous crash
 * Memory ranges (HBM banks, DDR, reconfiguration target)
   * Part of UAPI header in libslash
   * HBM: 0x0000004000000000ULL to 0x0000004800000000ULL
@@ -78,23 +86,11 @@ struct slash_info {
   * DDR: 0x0000060000000000ULL to 0x0000060800000000ULL
     * Split into four banks with 8GiB each
   * reconfiguration region: 0x0000000102100000ULL to 0x0000000142100000ULL
+  * Accesses beyond these regions are undefined
 
 ### BAR Access - traditional with one file for the entire BAR
 
-* `/dev/slash/<BDF>/bars/`
-  * Directory
-* `/dev/slash/<BDF>/bars/bar<M>`
-  * File, only pread and pwrite
-    * Reads and writes the BAR
-    * Verifies read/write widths
-      * TODO: Which widths, which alignments?
-    * Only meant for register access
-  * `pread`/`pwrite` only, no buffering, width == transfer size, reject misaligned/odd widths
-  * Explicitly no Mmap'ing to enable kernel-side checks and easier emulation
-    * Also keeps revocation cheap: every access is a file op, so removal needs only a liveness check, no PTE zapping
-  * Like qpairs, BAR fds survive device removal as orphans returning `-ENODEV` until closed (see Hotplugging/Resets)
-  * Size of the BAR encoded as the size of the file
-* Available BARs:
+* Exposes the BARs of the accelerator's PF 2:
   * Codified in the UAPI header, static during the lifetime of the accelerator
   * BAR 0: User region
     * Size: 128 MB
@@ -102,6 +98,20 @@ struct slash_info {
     * Size: 128 MB
   * BAR 4: Clock wizard
     * Size: 512 KB
+* `/dev/slash/<BDF>/bars/`
+  * Directory
+* `/dev/slash/<BDF>/bars/bar<M>`
+  * File, only pread and pwrite
+    * Reads and writes the BAR M of the physical function 2
+    * Verifies read/write widths
+      * TODO: Which widths, which alignments?
+    * Only meant for register access
+  * `pread`/`pwrite` only, no buffering, width == transfer size, reject misaligned/odd widths
+  * Explicitly no Mmap'ing to enable kernel-side checks and easier emulation
+    * Also keeps revocation cheap: every access is a file op, so removal needs only a liveness check, no PTE zapping
+    * Note: The higher latency of one system call per BAR access is a cost we're willing to take
+  * Like qpairs, BAR fds survive device removal as orphans returning `-ENODEV` until closed (see Hotplugging/Resets)
+  * Size of the BAR encoded as the size of the file
 * Side note: The start address attribute has been dropped and is not reported anymore
 
 ### Hotpluging/Resets
@@ -112,7 +122,8 @@ struct slash_info {
     * Behavior for system emulation adapted accordingly
   * `#define SLASH_HOTPLUG_IOCTL_RESCAN _IO('w', 0x30)`
     * On hardware: Rescans all PCI root buses to discover new or reconfigured devices. Typically called after REMOVE or TOGGLE_SBR to rediscover a device.
-    * On system-emulation: Reloads configuration and sets up a system-emulated accelerator *if no other system-emulated accelerator already exists with the same BDF*
+    * On system-emulation: Reloads configuration and sets up all system-emulated accelerators
+      * Skips accelerators who's BDF collides with another running accelerator
   * `#define SLASH_HOTPLUG_IOCTL_REMOVE _IOW('w', 0x31, struct slash_hotplug_device_request)`
     * The corresponding `/dev/slash/<BDF>/bars` or `/dev/slash/<BDF>/qdma` directory disappears/is removed
       * Function 1 corresponds to QDMA, Function 2 corresponds to the control register BARs
@@ -182,6 +193,7 @@ struct slash_hotplug_device_request {
   * Then creates/opens files for them
   * Passes the FD via SCM_RIGHTS
 * Thus, permission checking for data plane operations is done by the kernel
+  * Either a process *is* VRTD, or has received an FD from VRTD to run a data plane operation
   * No need to handroll this performance and security critical component
 
 ## Implementation of the file system
@@ -194,7 +206,7 @@ struct slash_hotplug_device_request {
   * Example: drivers/android/binderfs.c
   * Framework: fs/libfs.c
     * Register a new filesystem type, which is then mounted by userspace
-    * Implement all operations there
+    * Implement all operations based on this structure
   * Alternatives:
     * kernfs (the engine behind sysfs/cgroupfs)
       * handles dynamic node trees beautifully, but its file ops are attribute-oriented
@@ -220,6 +232,28 @@ struct slash_hotplug_device_request {
     * To note: Emu is self-contained, but sim needs Vivado and potentially network egress to check licenses
     * Data plane: model talks to daemon over unix socket in scratch (replace tcp://localhost:5555), never sees the FUSE mount
   * MVP (step 1): runs the model directly under the privileged daemon, unsandboxed
+
+## Local FPGA emulation/simulation in VRT, necessary branches on system-emulation in VRT/libVRTD
+
+* Local emulation/simulation in VRT must remain
+  * Needed for setups where the user isn't authorized to use the centrally system-emulated accelerators
+  * Also for setups where the daemons aren't even running
+    * For example CI
+  * Apart from that, it's just very valuable in many instances
+* New pattern how to decide how to execute:
+  * If given BDF is "local" (case-insensitive)
+    * If VBIN platform is emulation or simulation, run in local emulation/simulation
+    * If VBIN platform is hardware, throw an appropriate exception
+  * Otherwise, query VRTD with the given BDF
+    * Of course, throw an appropriate exception if the accelerator doesn't exist
+    * Accept if:
+      * VBIN platform is emulation or simulation, and accelerator is system-emulated
+      * VBIN platform is hardware and accelerator is hardware
+* Identifying whether an accelerator is usable with the given VBIN is the only instance where VRT should branch on system-emulation or hardware
+  * If this is not possible, there is a design error in this architecture
+* The branch between writing a PDI or the entire VBIN is done in libvrtd
+  * Again, only instance where this branch is necessary
+  * Everything else is a design error
 
 ## Emulation daemon configuration & deployment
 
@@ -267,3 +301,17 @@ struct slash_hotplug_device_request {
   * Wrap vpp_emu/vpp_sim in the hardened systemd transient unit (see "Reconfiguration" above)
   * Can now be tested through the entire stack
 6. Implement the kernel module, relying on the now built stack.
+
+## TODOs
+
+### 4. slash_info drops fields current consumers depend on.
+The new struct (lines 32-40) keeps bdf + QDMA caps + acc_type but drops vendor_id/device_id/subsystem_* that exist today (kernel-abi/index.rst:301-308) and that v80-smi uses to verify
+boards (pcie-topology.rst:80-83), plus Bar::getStartAddress() is removed (line 105) — an API break in libvrtd++ (client-flow.rst:160). Confirm these removals are intentional and note
+the downstream breaks.
+
+### 7. "One write operation" for reconfiguration conflicts with partial-transfer semantics.
+
+Lines 212-213 require the config in a single write so start/end are identifiable, but the I/O
+path explicitly allows partial transfers today (kernel-abi/index.rst:406-408). A single pwrite() can return short. You need a commit protocol (length-prefixed, or an explicit "reconfig commit" signal), not "one write."
+
+### 12. The width/alignment TODO (line 90) must be resolved before handoff.

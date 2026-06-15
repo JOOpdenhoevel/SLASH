@@ -2,11 +2,19 @@
 
 Idea: Kernel driver exposes a custom "SLASH" filesystem that is mounted in `/dev/slash`. Each accelerator receives its own directory named by device ID, e.g. `/dev/slash/0000:61:00/`. Each accelerator directory contains sub-folders and files to control the accelerator. All file operations are either `read`, `write` (both potentially with an offset), or `ioctl`. All written and returned data is plain-old-data. In particular, syscalls must not return file descriptors or other references that are only valid in the context of the calling process.
 
-With these restrictions on the operations available for the ABI, it is possible and relatively straight-forward to emulate the kernel ABI with a FUSE filesystem, using a dedicated system emulation daemon. Such an daemon would expose a file system in `/run/slash_emu/` with the same structure as `/dev/slash`, but instead exposing ways to manipulate an emulated accelerator.
+With these restrictions on the operations available for the ABI, it is possible and relatively straight-forward to emulate the kernel ABI with a FUSE filesystem, using a dedicated system emulation daemon. Such an daemon would expose a file system in `/run/slash_emu/` with the same structure as `/dev/slash`, but instead exposing ways to manipulate a system-emulated accelerator.
 
-Note: This introduces a new concept "system emulation", independent of the existing "FPGA emulation" and "FPGA simulation" concepts. "System emulation" is the emulation of the entire accelerator in the host system, i.e. how it is handled by VRT and VRTD. "FPGA emulation" and "FPGA simulation" describe ways to predict the behavior of a group of kernels on the FPGA. How the actual FPGA's behavior is predicted doesn't matter much for the system emulation that we want to introduce.
+Note: This introduces a new concept "system emulation", independent of the existing "FPGA emulation" and "FPGA simulation" concepts. "System emulation" is the emulation of the entire accelerator in the host system, i.e. how it is handled by the user application, VRT, and VRTD. Contrarily, "FPGA emulation" and "FPGA simulation" describe ways to predict the behavior of a group of kernels on the FPGA in software. How the actual FPGA's behavior is predicted doesn't matter much for the system emulation that we want to introduce, and system emulation can be combined with FPGA emulation or FPGA simulation.
 
 ## File endpoints
+
+### Per-device folders
+
+* One folder in `/dev/slash` for each accelerator
+* named after the *device* part of their bus-device-function (BDF) identifier
+* Example: Accelerator with physical functions `0000:61:00.1` and `0000:61:00.2`
+  * Represented with the folder `/dev/slash/0000:61:00`
+* Driver uses all physical functions to implement one folder of endpoints
 
 ### Information file
 
@@ -14,7 +22,7 @@ Note: This introduces a new concept "system emulation", independent of the exist
 * Read-only, returns binary information struct
 * Encodes all information that can't be expressed as file metadata
 * Uses the previous `size`-based versioning:
-  * New fields are only appended to the field
+  * New fields added in the future are always appended to the field
   * Old readers only read the fields they understand
 * Current state of the information struct:
 
@@ -25,10 +33,6 @@ struct slash_info {
     __u32 size;                   /* [in/out] ABI version */
     __u32 acc_type;               /* [out] Bitflags describing the accelerator type. Currently: 0x1: System-Emulated */
     char  bdf[SLASH_PCI_BDF_LEN]; /* [out] PCI BDF string without function, NUL-terminated, e.g. "0000:61:00" */
-    __u16 vendor_id;              /* [out] PCI vendor ID (0x10EE for AMD/Xilinx) */
-    __u16 device_id;              /* [out] PCI device ID (0x50B6 for PF2) */
-    __u16 subsystem_vendor_id;    /* [out] PCI subsystem vendor ID */
-    __u16 subsystem_device_id;    /* [out] PCI subsystem device ID */
     __u32 qdma_qsets_max;         /* [out] Max queue sets (currently always 0) */
     __u32 qdma_msix_qvecs;        /* [out] MSI-X vectors for queues (currently always 0) */
     __u32 qdma_vf_max;            /* [out] Max VFs (currently always 0) */
@@ -42,9 +46,11 @@ struct slash_info {
   * Directory
   * "QPAIR_ADD" IOCTL
     * Inputs: Mode, directions, H2C/C2H/CMPT ring sizes
-    * Output: QID, allocated by kernel/daemon
+      * Same as current `SLASH_QDMA_IOCTL_QPAIR_ADD` IOCTL
+    * Output: QID
+      * Allocated by kernel/daemon
       * Used to construct the queue pair path `/dev/slash/<BDF>/qdma/qpair<Q>`
-      * Then opened separately
+      * Then opened separately by VRTD
     * Also starts the queue
 * `/dev/slash/<BDF>/qdma/qpair<Q>`
   * llseek, read, write
@@ -52,29 +58,33 @@ struct slash_info {
   * TODO: Resolve lifetime
 * Memory ranges (HBM banks, DDR, reconfiguration target)
   * Part of UAPI header in libslash
-  * Both offsets and lengths
+  * HBM: 0x0000004000000000ULL to 0x0000004800000000ULL
+    * Split in 64 banks with 512MiB each
+  * DDR: 0x0000060000000000ULL to 0x0000060800000000ULL
+    * Split into four banks with 8GiB each
+  * reconfiguration region: 0x0000000102100000ULL to 0x0000000142100000ULL
 
 ### BAR Access - traditional with one file for the entire BAR
 
 * `/dev/slash/<BDF>/bars/`
   * Directory
-  * GET_INFO IOCTL like before (excluding info expressed by file presence)
 * `/dev/slash/<BDF>/bars/bar<M>`
   * File, only pread and pwrite
     * Reads and writes the BAR
     * Verifies read/write widths
+      * TODO: Which widths, which alignments?
     * Only meant for register access
   * `pread`/`pwrite` only, no buffering, width == transfer size, reject misaligned/odd widths
   * Explicitly no Mmap'ing to enable kernel-side checks and easier emulation
   * Size of the BAR encoded as the size of the file
 * Available BARs:
+  * Codified in the UAPI header, static during the lifetime of the accelerator
   * BAR 0: User region
     * Size: 128 MB
   * BAR 2: Service Layer
     * Size: 128 MB
   * BAR 4: Clock wizard
     * Size: 512 KB
-  * Codified in the UAPI header
 * Side note: The start address attribute has been dropped and is not reported anymore
 
 ### Hotpluging/Resets
@@ -83,12 +93,12 @@ struct slash_info {
 
 ## Authorization of user processes
 
-* Only VRTD can open files, checked using normal UNIX permissions
+* Only VRTD can open files, checked using normal UNIX file permissions
 * VRTD checks permissions of users (according to configuration)
   * Then creates/opens files for them
   * Passes the FD via SCM_RIGHTS
-* We thus get permission handling done by the kernel for free, even for system emulation
-* Also, all data plane operations (accessing BAR, starting DMA transfers) are going directly from the user to the kernel/system emulation daemon.
+* Thus, permission checking for data plane operations is done by the kernel
+  * No need to handroll this performance and security critical component
 
 ## Implementation of the file system
 
@@ -115,6 +125,8 @@ struct slash_info {
 ## Reconfiguration
 
 * In both cases, the user writes their payload to the "reconfiguration region"
+  * New configuration must be written in one "write" operation
+  * Otherwise, start and end of reconfiguration writing impossible to identify
 * On hardware: QDMA of the DCP to AVED, just as before
 * In system emulation:
   * Especially FPGA simulation needs many other files from the VBIN
@@ -179,9 +191,4 @@ struct slash_info {
 
 ### Defer but reserve now
 
-* [ ] Reconfiguration endpoint undefined in "File endpoints"; reserve dedicated control file (e.g. `<BDF>/reconfig`) instead of overloading qpair write; how does daemon tell VBIN upload from memory transfer?
 * [ ] Hotplug semantics under system emulation (reset = restart model process?); global privileged file
-
-### Minor
-
-* [ ] Reword "permissions for free": UNIX perms only gate who may open (VRTD); real policy is VRTD/`vrtd.conf`. Confirm FUSE node ownership + whether `default_permissions` is used (data-plane caller ≠ opener)

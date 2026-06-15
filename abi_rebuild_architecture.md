@@ -89,7 +89,66 @@ struct slash_info {
 
 ### Hotpluging/Resets
 
-* `/dev/slash/hotplug`, with the same behavior as before.
+* `/dev/slash/hotplug`
+  * File, only allowing IOCTLs
+    * Generally the same behavior for hardware as before
+    * Behavior for system emulation adapted accordingly
+  * `#define SLASH_HOTPLUG_IOCTL_RESCAN _IO('w', 0x30)`
+    * On hardware: Rescans all PCI root buses to discover new or reconfigured devices. Typically called after REMOVE or TOGGLE_SBR to rediscover a device.
+    * On system-emulation: Reloads configuration and sets up a system-emulated accelerator *if no other system-emulated accelerator already exists with the same BDF*
+  * `#define SLASH_HOTPLUG_IOCTL_REMOVE _IOW('w', 0x31, struct slash_hotplug_device_request)`
+    * The corresponding `/dev/slash/<BDF>/bars` or `/dev/slash/<BDF>/qdma` directory disappears.
+      * Function 1 corresponds to QDMA, Function 2 corresponds to the control register BARs
+    * On hardware: Removes a PCI device identified by BDF from the PCI hierarchy, triggering the driver’s .remove callback.
+      * Postconditions:
+        * Bus mastering is disabled on the device (pci_clear_master()).
+        * The device is removed from the PCI hierarchy (pci_stop_and_remove_bus_device()).
+        * The driver’s .remove callback is invoked; associated device nodes disappear.
+    * On system-emulation: Removes the endpoint folders and closes the communication resources (e.g. QDMA queue pairs)
+      * Effectively removes the means to communicate while leaving the vpp_emu/vpp_sim in the background running
+      * Shut down vpp_emu/vpp_sim only once both Function 1 and 2 are removed
+  * `#define SLASH_HOTPLUG_IOCTL_TOGGLE_SBR _IOW('w', 0x32, struct slash_hotplug_device_request)`
+    * Asserts a secondary bus reset (SBR) on the upstream PCIe bridge for the bus specified by BDF, performing a full hardware reset of all endpoints on that bus. The ioctl blocks for approximately 1000 ms internally for PCIe link retraining; userspace should wait an additional 5–10 seconds after the call returns before rescanning.
+    * bdf must be a valid DDDD:BB:DD.F string; only the domain and bus number are used to locate the upstream bridge
+    * On hardware:
+      * Preconditions:
+        * The endpoint device may have been removed before calling; the kernel resolves the bridge via the bus number, which persists after endpoint removal
+      * Postconditions:
+        * Bridge config space is saved, PCI_BRIDGE_CTL_BUS_RESET is asserted for at least 2 ms, deasserted, and config space is restored.
+        * The ioctl sleeps 1000 ms for PCIe link retraining before returning.
+        * The PCIe link is retrained; the FPGA may still be initializing after return.
+    * On system-emulation:
+      * Fully remove the referenced system-emulated accelerator
+      * Reload the configuration
+      * Re-initialize all configured accelerators who's BDF is currently available
+      * Emulate the 1s sleep
+  * `#define SLASH_HOTPLUG_IOCTL_HOTPLUG _IOW('w', 0x33, struct slash_hotplug_device_request)`
+    * Atomically removes and rescans a single PCI device under the PCI lock.
+    * This is equivalent to REMOVE followed immediately by RESCAN on the same parent bus, without releasing the lock between operations.
+    * Does not include an SBR; use TOGGLE_SBR separately if a hardware reset is needed.
+    * On hardware:
+      * Preconditions:
+        * The device and its parent bus must exist in the PCI subsystem
+      * Postconditions:
+        * The device is removed (pci_clear_master() + pci_stop_and_remove_bus_device()).
+        * The parent bus is rescanned (pci_rescan_bus()); the device reappears if hardware is present.
+        * Both operations complete atomically under pci_lock_rescan_remove().
+    * On system-emulation:
+      * Fully remove a system-emulated accelerator
+      * Reload the configuration
+      * Re-initialize all configured accelerators who's BDF is currently available
+
+
+#### Type definitions:
+
+``` C
+#define SLASH_HOTPLUG_BDF_LEN 32
+
+struct slash_hotplug_device_request {
+    __u32 size;                        /* ABI version: set to sizeof(struct) */
+    char  bdf[SLASH_HOTPLUG_BDF_LEN]; /* NUL-terminated PCI BDF, *including function*, e.g. "0000:03:00.0" */
+};
+```
 
 ## Authorization of user processes
 
@@ -188,7 +247,3 @@ struct slash_info {
 ### Settle the ABI surface
 
 * [ ] qpair lifecycle: who allocates `Q` (stable?); make user→VRTD→QPAIR_ADD→VRTD-opens-path→SCM_RIGHTS flow explicit; "removal" = unlink / last-close / ioctl?
-
-### Defer but reserve now
-
-* [ ] Hotplug semantics under system emulation (reset = restart model process?); global privileged file

@@ -263,7 +263,7 @@ struct slash_hotplug_device_request {
   * Path to config, Path to mount path
 * Ship with systemd units to tie the daemon in
 
-## Testing
+## Testing and Code quality
 
 * Principle: unit AND integration tests on everything — every component, every layer
 * Unit tests: component-internal logic (GTest for C++, equivalent for C); ship with the component, not later
@@ -272,6 +272,7 @@ struct slash_hotplug_device_request {
   * Same suite runs against BOTH the FUSE daemon AND the kernel module → guarantees they don't drift
   * Must cover revocation: removal with fds still open, then `-ENODEV` on ops, `-ENOENT` on reopen, and clean `close`
 * Every implementation step below ships its tests as part of that step
+* Also, the system emulation daemon must follow the code style of VRTD as described in `vrt/vrtd/STYLE.md`.
 
 ## Filesystem discovery by VRTD
 

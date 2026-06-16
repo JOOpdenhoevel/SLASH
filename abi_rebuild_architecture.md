@@ -39,10 +39,6 @@ struct slash_info {
     __u32 size;                   /* [in/out] ABI version */
     __u32 acc_type;               /* [out] Bitflags describing the accelerator type. Currently: 0x1: System-Emulated */
     char  bdf[SLASH_PCI_BDF_LEN]; /* [out] PCI BDF string without function, NUL-terminated, e.g. "0000:61:00" */
-    __u32 qdma_qsets_max;         /* [out] Max queue sets (currently always 0) */
-    __u32 qdma_msix_qvecs;        /* [out] MSI-X vectors for queues (currently always 0) */
-    __u32 qdma_vf_max;            /* [out] Max VFs (currently always 0) */
-    __u32 qdma_caps;              /* [out] Capability bitmask (currently always 0) */
 };
 ```
 
@@ -103,10 +99,11 @@ struct slash_info {
 * `/dev/slash/<BDF>/bars/bar<M>`
   * File, only pread and pwrite
     * Reads and writes the BAR M of the physical function 2
-    * Verifies read/write widths
-      * TODO: Which widths, which alignments?
     * Only meant for register access
-  * `pread`/`pwrite` only, no buffering, width == transfer size, reject misaligned/odd widths
+    * `pread`/`pwrite` only
+    * no buffering
+    * width == transfer size
+    * reject operations with size not in {1, 2, 4, 8} or incorrect alignment
   * Explicitly no Mmap'ing to enable kernel-side checks and easier emulation
     * Also keeps revocation cheap: every access is a file op, so removal needs only a liveness check, no PTE zapping
     * Note: The higher latency of one system call per BAR access is a cost we're willing to take
@@ -301,17 +298,3 @@ struct slash_hotplug_device_request {
   * Wrap vpp_emu/vpp_sim in the hardened systemd transient unit (see "Reconfiguration" above)
   * Can now be tested through the entire stack
 6. Implement the kernel module, relying on the now built stack.
-
-## TODOs
-
-### 4. slash_info drops fields current consumers depend on.
-The new struct (lines 32-40) keeps bdf + QDMA caps + acc_type but drops vendor_id/device_id/subsystem_* that exist today (kernel-abi/index.rst:301-308) and that v80-smi uses to verify
-boards (pcie-topology.rst:80-83), plus Bar::getStartAddress() is removed (line 105) — an API break in libvrtd++ (client-flow.rst:160). Confirm these removals are intentional and note
-the downstream breaks.
-
-### 7. "One write operation" for reconfiguration conflicts with partial-transfer semantics.
-
-Lines 212-213 require the config in a single write so start/end are identifiable, but the I/O
-path explicitly allows partial transfers today (kernel-abi/index.rst:406-408). A single pwrite() can return short. You need a commit protocol (length-prefixed, or an explicit "reconfig commit" signal), not "one write."
-
-### 12. The width/alignment TODO (line 90) must be resolved before handoff.

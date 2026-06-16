@@ -84,3 +84,4 @@ driver/kcompat/.scratch/
 
 # Python test coverage
 .coverage
+.tmp

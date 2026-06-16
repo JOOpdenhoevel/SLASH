@@ -62,6 +62,7 @@ include(CMakePackageConfigHelpers)
 add_subdirectory(src)
 
 if(LIBSLASH_BUILD_TESTS)
+  enable_testing()
   add_subdirectory(tests)
 endif()
 

@@ -27,6 +27,7 @@ set(SLASH_EMU_WARNING_FLAGS -Wall -Wextra -Werror)
 # Static library with all daemon logic except main(), so tests can link against
 # it directly (mirrors vrtd's vrtd_core split).
 add_library(slash_emu_core STATIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/bars.c
   ${CMAKE_CURRENT_SOURCE_DIR}/config.c
   ${CMAKE_CURRENT_SOURCE_DIR}/fs.c
   ${CMAKE_CURRENT_SOURCE_DIR}/info.c

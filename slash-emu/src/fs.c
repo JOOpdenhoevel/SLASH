@@ -43,6 +43,7 @@
 
 #include <systemd/sd-event.h>
 
+#include "bars.h"
 #include "config.h"
 #include "info.h"
 #include "node.h"
@@ -260,12 +261,69 @@ static void emu_op_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
     (void) fuse_reply_buf(req, buf, (size_t) n);
 }
 
+/*
+ * Serve a positioned write by dispatching to the target node's ops->write hook
+ * via emu_node_pwrite (the write counterpart of emu_op_read, with the same
+ * liveness gate: a revoked endpoint returns -ENODEV on an already-open fd).
+ * The node layer enforces the endpoint's range/width policy -- for bar<M> a
+ * register poke is width == transfer size, {1,2,4,8}, aligned, in-range, else
+ * -EINVAL -- and reports the byte count consumed.  A file without a write hook
+ * (e.g. the read-only info file) yields -EIO.
+ */
+static void emu_op_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
+                         size_t size, off_t off, struct fuse_file_info *fi)
+{
+    (void) fi;
+
+    ssize_t n = emu_node_pwrite(fs_of(req)->tree, ino, buf, size, off);
+    if (n < 0) {
+        (void) fuse_reply_err(req, (int) -n);
+        return;
+    }
+
+    (void) fuse_reply_write(req, (size_t) n);
+}
+
+/*
+ * Honour a node's direct-I/O request at open time.  Register endpoints
+ * (bar<M>, later qpair<Q>) require unbuffered access -- the architecture
+ * mandates "no buffering, width == transfer size" -- so the kernel must pass
+ * each read/write through with the caller's exact size and offset rather than
+ * servicing page-sized, page-cached transfers that the width validation would
+ * reject.  Files that do not ask for it (e.g. info) open with the default
+ * cached path.  We never keep per-fd state, so no fh is set.
+ *
+ * direct_io also delivers the "no mmap" guarantee, in two parts:
+ *   - MAP_SHARED is rejected at mmap() time by the kernel (it cannot provide
+ *     shared-mapping coherency for a FOPEN_DIRECT_IO file): -ENODEV.  There is
+ *     thus no coherent register window to keep in sync or zap on revocation.
+ *   - MAP_PRIVATE cannot be vetoed at mmap() time from a low-level FUSE daemon
+ *     (the kernel routes it through generic_file_mmap; libfuse exposes no .mmap
+ *     hook, and FOPEN_NONSEEKABLE/STREAM would break pread/pwrite).  The daemon
+ *     instead guarantees it never HANGS: the first page-fault issues a
+ *     page-sized FUSE_READ, which emu_op_read ALWAYS answers (here, with the
+ *     BAR width-validation's -EINVAL), so the fault resolves to a prompt SIGBUS
+ *     rather than blocking.  The "answer every read" invariant in emu_op_read
+ *     is what makes this hold; see BarsMount.MmapPrivateDerefFaultsPromptly...
+ */
+static void emu_op_open(fuse_req_t req, fuse_ino_t ino,
+                        struct fuse_file_info *fi)
+{
+    if (emu_node_wants_direct_io(fs_of(req)->tree, ino)) {
+        fi->direct_io = 1;
+    }
+
+    (void) fuse_reply_open(req, fi);
+}
+
 static const struct fuse_lowlevel_ops emu_fs_ops = {
     .lookup = emu_op_lookup,
     .forget = emu_op_forget,
     .getattr = emu_op_getattr,
     .readdir = emu_op_readdir,
+    .open = emu_op_open,
     .read = emu_op_read,
+    .write = emu_op_write,
 };
 
 /*
@@ -376,6 +434,12 @@ static int emu_fs_materialize(struct emu_fs *fs)
          */
         if (emu_info_attach(dev) == -1) {
             LOG(LOG_ERR, "Failed to attach info endpoint for '%s'", acc->bdf);
+            emu_accelerator_ref_array_free(&selected);
+            return -1;
+        }
+
+        if (emu_bars_attach(dev) == -1) {
+            LOG(LOG_ERR, "Failed to attach bars endpoint for '%s'", acc->bdf);
             emu_accelerator_ref_array_free(&selected);
             return -1;
         }

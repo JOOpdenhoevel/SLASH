@@ -183,6 +183,32 @@ struct emu_node_ops {
                     size_t size, off_t off);
 
     /**
+     * @brief Serve a positioned write against a file node (optional).
+     *
+     * Implements @c pwrite(2) semantics for the endpoint: copy up to @p size
+     * bytes from @p buf into the backing starting at byte offset @p off and
+     * return the number of bytes consumed.  The exact range/width policy is the
+     * endpoint's: the BAR endpoint (T7) treats a write as a fixed-width register
+     * poke -- width @c == transfer size, @c {1,2,4,8} only, naturally aligned,
+     * wholly within the BAR -- and rejects anything else with @c -EINVAL rather
+     * than performing a partial (clamped) write.
+     *
+     * Invoked by @ref emu_node_pwrite with the tree lock @em held and only after
+     * the liveness gate has passed, so a handler never races a revocation.  The
+     * read hook's one-directional size-versioning note does not apply: a write
+     * carries the caller's byte count directly.
+     *
+     * @param node    The node being written.
+     * @param backing The node's @c backing pointer.
+     * @param buf     Source buffer (at least @p size bytes).
+     * @param size    Number of bytes the caller offered.
+     * @param off     Starting byte offset (>= 0).
+     * @return Number of bytes consumed, or a negative errno.
+     */
+    ssize_t (*write)(const struct emu_node *node, void *backing,
+                     const char *buf, size_t size, off_t off);
+
+    /**
      * @brief Release the node's @c backing when the node is destroyed (optional).
      *
      * Called while the tree lock is @em held, exactly once, when the node is
@@ -247,6 +273,18 @@ struct emu_node {
 
     /** @brief True once unlinked from its parent (name no longer resolvable). */
     bool unlinked;
+
+    /**
+     * @brief Require unbuffered (direct) I/O for this file (set by the endpoint).
+     *
+     * When true the FUSE layer opens the file with @c direct_io so the kernel
+     * passes every @c read / @c write straight through with the caller's exact
+     * size and offset, bypassing the page cache.  Register endpoints
+     * (@c bar<M>, later @c qpair<Q>) need this: the architecture mandates "no
+     * buffering, width == transfer size", and page-cache readahead would
+     * otherwise issue page-sized reads the width validation rejects.
+     */
+    bool direct_io;
 };
 
 /**
@@ -526,6 +564,29 @@ int emu_node_create_child(struct emu_node_tree *tree, struct emu_node *parent,
  */
 void emu_node_unlink(struct emu_node_tree *tree, struct emu_node *node);
 
+/**
+ * @brief Mark a file node as requiring unbuffered (direct) I/O.
+ *
+ * Sets @ref emu_node::direct_io so the FUSE layer opens the file with
+ * @c direct_io.  Endpoints whose ops enforce exact transfer width/offset
+ * (@c bar<M>, @c qpair<Q>) call this on each file they attach.
+ *
+ * @param tree The tree (for locking).
+ * @param node The file node to mark (must belong to @p tree).
+ */
+void emu_node_set_direct_io(struct emu_node_tree *tree, struct emu_node *node);
+
+/**
+ * @brief Query whether a file node requested unbuffered (direct) I/O.
+ *
+ * Called from the FUSE @c open op to decide @c fi->direct_io.
+ *
+ * @param tree The tree.
+ * @param ino  Inode being opened.
+ * @return true if the node exists and requested direct I/O; false otherwise.
+ */
+bool emu_node_wants_direct_io(struct emu_node_tree *tree, emu_ino_t ino);
+
 /* ------------------------------------------------------------------ */
 /* FUSE op support (called from fs.c with inode numbers)              */
 /* ------------------------------------------------------------------ */
@@ -640,6 +701,29 @@ int emu_node_is_live(struct emu_node_tree *tree, emu_ino_t ino);
  */
 ssize_t emu_node_pread(struct emu_node_tree *tree, emu_ino_t ino, char *buf,
                        size_t size, off_t off);
+
+/**
+ * @brief Dispatch a positioned write to a file node's @c ops->write hook.
+ *
+ * The write counterpart of @ref emu_node_pread, and the single entry point the
+ * FUSE @c write op calls.  Under the tree lock it resolves @p ino, enforces the
+ * liveness gate (a revoked endpoint yields @c -ENODEV even on an already-open
+ * fd), and forwards to the node's @c ops->write.  Performing the liveness check
+ * and the dispatch under one lock acquisition makes them atomic with respect to
+ * @ref emu_device_revoke.
+ *
+ * @param tree    The tree.
+ * @param ino     Inode the write targets.
+ * @param buf     Source buffer (at least @p size bytes).
+ * @param size    Number of bytes the caller offered.
+ * @param off     Starting byte offset (>= 0).
+ * @return Bytes consumed on success; @c -ENOENT if the inode does not exist;
+ *         @c -ENODEV if it has been revoked; @c -EINVAL on a bad argument or an
+ *         offset below zero; @c -EIO if the node has no write hook (a read-only
+ *         endpoint); or any negative errno the hook returns.
+ */
+ssize_t emu_node_pwrite(struct emu_node_tree *tree, emu_ino_t ino,
+                        const char *buf, size_t size, off_t off);
 
 /* ------------------------------------------------------------------ */
 /* Per-device registry + refcounted resources (qpair lifetime, T8)    */

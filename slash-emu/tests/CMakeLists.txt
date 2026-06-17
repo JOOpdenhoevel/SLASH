@@ -94,3 +94,29 @@ target_link_libraries(info_test PRIVATE slash_emu_core)
 # ownership / failure paths.
 slash_emu_add_test(info_adversarial_test info_adversarial_test.cpp)
 target_link_libraries(info_adversarial_test PRIVATE slash_emu_core)
+
+# bars endpoint (T7): unit (the emu_bar_check_access validation matrix + register
+# round-trip / geometry / revocation through the spine, against slash_emu_core)
+# and integration (pread/pwrite bar0/2/4 over the real FUSE mount, alignment /
+# width / beyond-BAR rejection, and the assertion that mmap is not offered).
+slash_emu_add_test(bars_test bars_test.cpp)
+target_link_libraries(bars_test PRIVATE slash_emu_core)
+
+# Adversarial T7 conformance suite: the destructive counterpart of bars_test.
+# Exhaustive validation matrix (pure kernel + spine dispatch), integer-overflow
+# offset rejection, width==size byte exactness / neighbour integrity, the spine
+# write-path revoke gate (-ENODEV both directions, no TOCTOU) + no-write-hook
+# (-EIO) + read-only-node confirmation, lazy-shadow no-eager-128MiB (RSS witness)
+# + destroy-once (ASan), exactly-three-BARs + isolation, and the no-mmap /
+# unbuffered-direct_io guarantees over the real mount.
+slash_emu_add_test(bars_adversarial_test bars_adversarial_test.cpp)
+target_link_libraries(bars_adversarial_test PRIVATE slash_emu_core)
+
+# OOM-injection coverage for the BAR shadow allocation (T7 defect-1): a
+# link-time --wrap=calloc interposer makes bar_write's first-write shadow calloc
+# fail on demand so the -ENOMEM path is exercised deterministically.  The wrap
+# applies to THIS executable only (slash_emu_core's bars.c is linked in), so no
+# other test's allocations are affected.
+slash_emu_add_test(bars_oom_test bars_oom_test.cpp)
+target_link_libraries(bars_oom_test PRIVATE slash_emu_core)
+target_link_options(bars_oom_test PRIVATE -Wl,--wrap=calloc)

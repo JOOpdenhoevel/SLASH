@@ -93,6 +93,7 @@ void counting_destroy(struct emu_node *node, void *backing)
 const struct emu_node_ops kCountingOps = {
     /* .size    = */ nullptr,
     /* .read    = */ nullptr,
+    /* .write   = */ nullptr,
     /* .destroy = */ counting_destroy,
 };
 
@@ -280,6 +281,7 @@ off_t noop_size(const struct emu_node *, void *) { return 0; }
 const struct emu_node_ops kSizeOnlyOps = {
     /* .size    = */ noop_size,
     /* .read    = */ nullptr,
+    /* .write   = */ nullptr,
     /* .destroy = */ nullptr,
 };
 TEST(SpineDestroyHook, NullDestroyHookSkippedAtShutdown)
@@ -321,6 +323,7 @@ ssize_t probe_read(const struct emu_node *node, void *backing, char *buf,
 const struct emu_node_ops kReadProbeOps = {
     /* .size    = */ nullptr,
     /* .read    = */ probe_read,
+    /* .write   = */ nullptr,
     /* .destroy = */ nullptr,
 };
 

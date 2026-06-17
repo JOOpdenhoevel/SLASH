@@ -467,6 +467,31 @@ int emu_node_create_child(struct emu_node_tree *tree, struct emu_node *parent,
     return 0;
 }
 
+void emu_node_set_direct_io(struct emu_node_tree *tree, struct emu_node *node)
+{
+    if (tree == NULL || node == NULL) {
+        return;
+    }
+
+    tree_lock(tree);
+    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
+
+    node->direct_io = true;
+}
+
+bool emu_node_wants_direct_io(struct emu_node_tree *tree, emu_ino_t ino)
+{
+    if (tree == NULL) {
+        return false;
+    }
+
+    tree_lock(tree);
+    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
+
+    struct emu_node *node = find_ino_locked(tree, ino);
+    return node != NULL && node->direct_io;
+}
+
 /* ================================================================== */
 /* Resource refcounting + teardown                                    */
 /* ================================================================== */
@@ -898,6 +923,33 @@ ssize_t emu_node_pread(struct emu_node_tree *tree, emu_ino_t ino, char *buf,
     }
 
     return node->ops->read(node, node->backing, buf, size, off);
+}
+
+ssize_t emu_node_pwrite(struct emu_node_tree *tree, emu_ino_t ino,
+                        const char *buf, size_t size, off_t off)
+{
+    if (tree == NULL || buf == NULL || off < 0) {
+        return -EINVAL;
+    }
+
+    tree_lock(tree);
+    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
+
+    struct emu_node *node = find_ino_locked(tree, ino);
+    if (node == NULL) {
+        return -ENOENT;
+    }
+
+    /* Liveness gate: a revoked endpoint returns -ENODEV on an open fd. */
+    if (!node->live) {
+        return -ENODEV;
+    }
+
+    if (node->ops == NULL || node->ops->write == NULL) {
+        return -EIO;
+    }
+
+    return node->ops->write(node, node->backing, buf, size, off);
 }
 
 /* ================================================================== */

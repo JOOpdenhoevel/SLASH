@@ -42,6 +42,8 @@ target_link_libraries(slash_emu_core
   PUBLIC
     PkgConfig::FUSE3
     PkgConfig::SYSTEMD
+  PRIVATE
+    PkgConfig::INIH
 )
 
 # Daemon executable.

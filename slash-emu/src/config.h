@@ -43,6 +43,22 @@
  *   net-port = 4791
  * @endcode
  *
+ * @warning Each @c [accelerator:<bdf>] section MUST carry at least one key.
+ *          slash-emu uses the distro libinih (as vrtd does), whose handler is
+ *          invoked only per key/value pair -- a section header with no keys
+ *          produces no callback and is therefore @em silently ignored (it cannot
+ *          be detected without a key).  A section that has keys but only invalid
+ *          ones is still rejected.  Add a reserved @c net-* key (or, once more
+ *          schema exists, any valid key) to every accelerator so it is never
+ *          dropped; the shipped sample config does exactly this.
+ *
+ * @note Duplicate-BDF rejection covers BDFs that differ in spelling but
+ *       normalize to the same address (e.g. @c "61:00" vs @c "0000:61:00", or
+ *       case differences).  Two @em byte-identical section headers are coalesced
+ *       by libinih into one section before slash-emu sees them, so they merge
+ *       into a single accelerator (union of keys) rather than being flagged --
+ *       a benign outcome, since the BDF is identical.
+ *
  * @section model Persistent accelerator model
  *
  * Accelerators are persistent: they outlive any individual user process.  The
@@ -124,8 +140,28 @@ struct emu_accelerator {
  */
 void cleanup_accelerator(struct emu_accelerator *acc);
 
+/**
+ * @brief Cleanup helper for use with @c __attribute__((cleanup)).
+ * @param accp Address of a @c struct @c emu_accelerator pointer.
+ */
+static inline
+void cleanup_acceleratorp(struct emu_accelerator **accp)
+{
+    if (accp == NULL) {
+        return;
+    }
+
+    cleanup_accelerator(*accp);
+
+    *accp = NULL;
+}
+
 /** @brief Owning array of accelerator pointers (frees accelerators on cleanup). */
 DECLARE_OWNING_PTR_ARRAY(emu_accelerator_ptr_array, struct emu_accelerator *, cleanup_accelerator)
+
+/** @brief Non-owning array of accelerator pointers (borrowed references; frees
+ *         only its own storage, never the referenced accelerators). */
+DECLARE_ARRAY(emu_accelerator_ref_array, struct emu_accelerator *)
 
 /**
  * @brief Top-level slash-emu configuration container.
@@ -146,9 +182,14 @@ struct emu_config {
  * @brief Load and parse the slash-emu configuration from @p path.
  *
  * Parses the INI file at @p path, validating every accelerator BDF and rejecting
- * malformed, empty, or duplicate-BDF configurations.  A NULL @p path yields an
- * empty (zero-accelerator) configuration without touching the filesystem, which
- * is the built-in default used when @c --config is not supplied.
+ * malformed-BDF, duplicate-BDF, and unknown-section/key configurations.  A NULL
+ * @p path yields an empty (zero-accelerator) configuration without touching the
+ * filesystem, which is the built-in default used when @c --config is not
+ * supplied; an empty file likewise yields an empty configuration.
+ *
+ * @warning Keyless @c [accelerator:<bdf>] sections are silently ignored (see the
+ *          file-level warning).  A section must carry at least one key to be
+ *          parsed at all.
  *
  * @param path        Path to the configuration file, or NULL for the built-in
  *                    empty default.
@@ -279,8 +320,8 @@ void emu_running_set_remove(struct emu_running_set *set, const char *bdf);
  * BDF is @em not already in @p running is selected for instantiation; BDFs that
  * collide with an already-running accelerator are skipped.  The returned array
  * holds @em borrowed pointers into @p config (it does not own the accelerators);
- * free it with @c emu_accelerator_ptr_array_free, which does not touch the
- * referenced accelerators because the array is non-owning here -- see the note.
+ * free its storage with @c emu_accelerator_ref_array_free, which leaves the
+ * referenced accelerators (owned by @p config) untouched.
  *
  * @param      config The freshly loaded configuration.
  * @param      running The set of already-running BDFs (NULL is treated as empty).

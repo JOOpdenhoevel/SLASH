@@ -53,3 +53,12 @@ slash_emu_add_test(smoke_test smoke_test.cpp)
 # Adversarial lifecycle / robustness suite (codified T3 audit): CLI error
 # paths, mount-failure cleanup, no-leak idempotency, mount/unmount de-race.
 slash_emu_add_test(daemon_lifecycle_test daemon_lifecycle_test.cpp)
+
+# Config parser + accelerator model unit tests.  Links the daemon core directly
+# (it calls the C config API), and is handed the path to the shipped sample
+# config so it can assert that what we ship actually parses.
+slash_emu_add_test(config_test config_test.cpp)
+target_link_libraries(config_test PRIVATE slash_emu_core)
+target_compile_definitions(config_test PRIVATE
+  SLASH_EMU_SAMPLE_CONF="${CMAKE_SOURCE_DIR}/conf/slash-emu.conf"
+)

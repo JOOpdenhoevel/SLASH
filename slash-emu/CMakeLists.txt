@@ -45,6 +45,14 @@ pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
 # libsystemd: sd-event loop, sd-journal logging, sd_notify readiness.
 pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
 
+# libinih: INI config parser, taken from the distro package exactly as vrtd's
+# config layer does (pkg_check_modules + PkgConfig::INIH).  Stock libinih ships
+# INI_CALL_HANDLER_ON_NEW_SECTION OFF, so a section fires no callback until it
+# carries at least one key; the accelerator schema accounts for this -- each
+# [accelerator:<bdf>] section must carry >=1 key, and a keyless section is
+# silently ignored (see config.h and conf/slash-emu.conf).
+pkg_check_modules(INIH REQUIRED IMPORTED_TARGET inih)
+
 # enable_testing() at the top level so ctest discovers tests from the
 # top-level build dir (slash-emu/build).
 enable_testing()

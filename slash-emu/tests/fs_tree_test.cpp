@@ -157,11 +157,13 @@ TEST(SlashEmuFsTree, MaterializesConfiguredAccelerators)
         FAIL() << "Daemon did not mount within timeout at " << mountpoint;
     }
 
-    // Root lists exactly the two configured BDF directories.
+    // Root lists the two configured BDF directories plus the global hotplug
+    // control file (a sibling of the per-device dirs).
     auto root = list_dir(mountpoint);
-    EXPECT_EQ(root.size(), 2u);
+    EXPECT_EQ(root.size(), 3u);
     EXPECT_EQ(root.count("0000:61:00"), 1u);
     EXPECT_EQ(root.count("0000:62:00"), 1u);
+    EXPECT_EQ(root.count("hotplug"), 1u);
 
     // Each <BDF>/ stats as a dir and contains bars/ + qdma/.
     for (const std::string &bdf : {"0000:61:00", "0000:62:00"}) {

@@ -159,3 +159,47 @@ target_compile_definitions(qdma_adversarial_test PRIVATE
 # any reasonable CI wall-clock; the in-test Watchdog (setitimer) is the faster
 # inner guard.
 gtest_discover_tests(qdma_adversarial_test PROPERTIES TIMEOUT 60)
+
+# hotplug endpoint (T9): unit (BDF-with-function parsing, per-function REMOVE,
+# the revocation matrix for a removed function, the both-functions-removed
+# model-shutdown seam, RESCAN/SBR/HOTPLUG reload sequencing via a stub reload,
+# the ioctl buffer/versioning matrix, the materialize re-invocation seed
+# primitives, and the injectable SBR sleep, against slash_emu_core) and
+# integration (the /hotplug file at root, REMOVE makes a function's subtree
+# vanish while the sibling survives, -ENODEV on an open handle of a removed
+# endpoint + -ENOENT on reopen, HOTPLUG re-inits a removed device, and RESCAN
+# collision-skip over the real FUSE mount).  Per-test ctest TIMEOUT so a mount
+# hang or a misconfigured SBR sleep FAILS rather than blocks the suite.
+add_executable(hotplug_test hotplug_test.cpp)
+target_link_libraries(hotplug_test PRIVATE GTest::gtest_main slash_emu_core)
+set_target_properties(hotplug_test PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED YES
+)
+target_compile_definitions(hotplug_test PRIVATE
+  SLASH_EMUD_PATH="$<TARGET_FILE:slash-emud>"
+  SLASH_EMU_TMP_DIR="${SLASH_EMU_TMP_DIR}"
+)
+gtest_discover_tests(hotplug_test PROPERTIES TIMEOUT 60)
+
+# Adversarial T9 conformance suite: the destructive counterpart of hotplug_test.
+# Hammers the highest-risk spine/locking pieces -- ioctl_unlocked SAFETY (only
+# hotplug is unlocked, the unlocked hook re-enters the self-locking spine without
+# deadlock, and the "never unlinked" invariant the dropped-lock pointer relies on
+# is PROBED for the FUSE-unlink path that can destroy/free the node), per-function
+# REVOKE in both orders with the surviving function asserted fully usable + device
+# not marked dead, model-shutdown EXACTLY-ONCE incl. the REMOVE-both-then-SBR
+# double-fire guard, NO double-attach across repeated materialize seeds, and the
+# BDF-with-function + ioctl buffer adversarial edges.  Per-test ctest TIMEOUT so a
+# reentrancy deadlock FAILS rather than blocks the suite.
+add_executable(hotplug_adversarial_test hotplug_adversarial_test.cpp)
+target_link_libraries(hotplug_adversarial_test PRIVATE GTest::gtest_main slash_emu_core)
+set_target_properties(hotplug_adversarial_test PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED YES
+)
+target_compile_definitions(hotplug_adversarial_test PRIVATE
+  SLASH_EMUD_PATH="$<TARGET_FILE:slash-emud>"
+  SLASH_EMU_TMP_DIR="${SLASH_EMU_TMP_DIR}"
+)
+gtest_discover_tests(hotplug_adversarial_test PROPERTIES TIMEOUT 60)

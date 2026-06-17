@@ -43,8 +43,10 @@
 
 #include <systemd/sd-event.h>
 
+#include "array.h"
 #include "bars.h"
 #include "config.h"
+#include "hotplug.h"
 #include "info.h"
 #include "node.h"
 #include "qdma.h"
@@ -72,8 +74,18 @@ struct emu_fs {
     /** @brief Mountpoint path (heap-allocated, owning). */
     char *mountpoint; /* owning */
 
-    /** @brief Daemon configuration (non-owning; borrowed). */
-    const struct emu_config *config; /* non-owning */
+    /**
+     * @brief Active daemon configuration.
+     *
+     * Initially the config borrowed from @c main (@c owned_config NULL).  A
+     * RESCAN/SBR/HOTPLUG reload loads a fresh config from the same source path
+     * into @c owned_config and repoints this at it; the previous owned config (if
+     * any) is freed.  Materialize always reads through this pointer.
+     */
+    const struct emu_config *config; /* non-owning (see owned_config) */
+
+    /** @brief Config reloaded from disk (owning), or NULL before any reload. */
+    struct emu_config *owned_config; /* owning */
 
     /** @brief sd-event source watching the session fd (owning ref). */
     sd_event_source *source; /* owning */
@@ -491,10 +503,74 @@ static void emu_fs_notify_delete(void *ctx, emu_ino_t parent, emu_ino_t child,
 }
 
 /*
+ * Default per-device model-shutdown seam (T10 replaces this with the real
+ * vpp_emu/vpp_sim teardown).  The spine fires it, with the tree lock held,
+ * exactly once both functions of the device have been removed.  Kept minimal and
+ * non-reentrant (it must not call back into the spine's public API under the
+ * lock): it only logs, so the both-functions-gone transition is observable.
+ */
+static void emu_fs_model_shutdown(struct emu_device *dev, void *ctx)
+{
+    (void) ctx;
+    LOG(LOG_INFO, "Model shutdown for '%s' (both functions removed)",
+        dev != NULL ? dev->bdf : "(null)");
+}
+
+/* Forward declaration: the reload callback re-runs materialize. */
+static int emu_fs_materialize(struct emu_fs *fs);
+
+/*
+ * Reload callback wired into the hotplug endpoint.  Reloads the daemon
+ * configuration from its source path and re-runs the (idempotent) materialize
+ * path so RESCAN/SBR/HOTPLUG bring up any newly-configured / re-available
+ * accelerator without double-attaching a surviving one.
+ *
+ * A NULL source path (the built-in empty default, e.g. when --config was not
+ * given) reloads an empty config: there is nothing to bring up, which is the
+ * correct RESCAN result for a daemon with no config file.  Called with the tree
+ * lock NOT held (the hotplug ioctl hook runs unlocked); materialize takes the
+ * lock itself.
+ */
+static int emu_fs_reload(void *ctx)
+{
+    struct emu_fs *fs = ctx;
+
+    const char *path = fs->config != NULL ? fs->config->source_path : NULL;
+
+    struct emu_config *fresh = NULL;
+    if (emu_config_load(path, &fresh) == -1) {
+        LOG(LOG_ERR, "Reload: failed to load configuration");
+        return -1;
+    }
+
+    /* Swap the active config to the freshly-loaded one, freeing the previous
+     * reloaded config (never the borrowed startup config, which fs does not
+     * own). */
+    fs->config = fresh;
+    cleanup_config(fs->owned_config);
+    fs->owned_config = fresh;
+
+    if (emu_fs_materialize(fs) == -1) {
+        LOG(LOG_ERR, "Reload: failed to materialize updated device tree");
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
  * Materialize the per-device subtree for every configured accelerator that is
- * not already running.  Reuses the config running-set computation so RESCAN (T9)
- * drives the same path.  The endpoint files (info/bar<M>/qpair<Q>) are attached
- * by later tasks; here we only stand up the <BDF>/, bars/, and qdma/ dirs.
+ * not already running.  Reuses the config running-set computation so RESCAN/SBR/
+ * HOTPLUG (T9) drive the same path.  The endpoint files (info/bar<M>/qpair<Q>,
+ * and the per-device model-shutdown seam) are attached here.
+ *
+ * Safely RE-INVOCABLE: the running-set is seeded from the devices already live
+ * in the tree (not a fresh empty set), so a re-invocation only selects newly-
+ * configured / re-available BDFs and never reselects an already-running
+ * accelerator.  emu_node_tree_add_device is idempotent at the BDF level, but the
+ * endpoint attach helpers (emu_info_attach / emu_bars_attach / emu_qdma_attach)
+ * are NOT -- re-attaching onto an already-attached subtree double-attaches ops --
+ * so seeding the running-set is what keeps RESCAN from double-attaching.
  */
 static int emu_fs_materialize(struct emu_fs *fs)
 {
@@ -507,6 +583,26 @@ static int emu_fs_materialize(struct emu_fs *fs)
     if (emu_running_set_new(&running) == -1) {
         return -1;
     }
+
+    /*
+     * Seed the running-set from the live devices already in the tree.  On the
+     * first (startup) materialize the tree has no devices, so this is empty and
+     * every configured accelerator is selected; on a RESCAN/SBR/HOTPLUG
+     * re-invocation it carries the surviving devices so they are skipped (the
+     * collision-skip the ABI mandates, and the no-double-attach guarantee).
+     */
+    struct str_array live = str_array_init();
+    if (emu_node_tree_collect_live_bdfs(fs->tree, &live) == -1) {
+        str_array_free(&live);
+        return -1;
+    }
+    for (size_t i = 0; i < live.len; i++) {
+        if (emu_running_set_add(running, live.d[i]) == -1) {
+            str_array_free(&live);
+            return -1;
+        }
+    }
+    str_array_free(&live);
 
     struct emu_accelerator_ref_array selected = emu_accelerator_ref_array_init();
     int ret = emu_config_select_new(fs->config, running, &selected);
@@ -547,6 +643,16 @@ static int emu_fs_materialize(struct emu_fs *fs)
             return -1;
         }
 
+        /*
+         * Wire the per-device model-shutdown seam.  The spine fires it once both
+         * functions of the device have been removed (REMOVE fn1 + fn2, or a
+         * whole-device revoke).  T10 replaces this default with the real
+         * vpp_emu/vpp_sim teardown; for now it is observable via the journal so
+         * the both-functions-gone transition is testable end-to-end.
+         */
+        (void) emu_device_set_model_shutdown(fs->tree, acc->bdf,
+                                             emu_fs_model_shutdown, fs);
+
         LOG(LOG_INFO, "Materialized accelerator '%s'", acc->bdf);
     }
 
@@ -583,6 +689,16 @@ int emu_fs_create(struct emu_fs **fsp, const char *mountpoint,
 
     if (emu_fs_materialize(fs) == -1) {
         LOG(LOG_ERR, "Failed to materialize device tree");
+        return -1;
+    }
+
+    /*
+     * Attach the single global /hotplug file at the mount root (a sibling of the
+     * per-device <BDF>/ dirs), once -- not per device.  Its reload seam re-runs
+     * the materialize path for RESCAN/SBR/HOTPLUG.
+     */
+    if (emu_hotplug_attach(fs->tree, emu_fs_reload, fs) == -1) {
+        LOG(LOG_ERR, "Failed to attach hotplug endpoint");
         return -1;
     }
 
@@ -671,6 +787,11 @@ void cleanup_fs(struct emu_fs *fs)
      */
     cleanup_node_tree(fs->tree);
     fs->tree = NULL;
+
+    /* The reloaded config (if any) is ours to free; the startup config is
+     * borrowed from main and is NOT freed here. */
+    cleanup_config(fs->owned_config);
+    fs->owned_config = NULL;
 
     /* libfuse allocates recv_buf.mem lazily inside fuse_session_receive_buf. */
     free(fs->recv_buf.mem);

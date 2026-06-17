@@ -589,6 +589,11 @@ static int create_qpair(struct emu_qdma_dir_backing *d, uint32_t qid)
      * synthesizing page-sized, page-cached transfers. */
     emu_node_set_direct_io_locked(tree, node);
 
+    /* qpair<Q> files are user-unlinkable: the VRTD delete-on-last-close pattern
+     * (ADD -> open -> unlink while open) rides the FUSE unlink op, which is now
+     * opt-in.  info / bar<M> / hotplug are left non-unlinkable. */
+    emu_node_set_unlinkable_locked(tree, node);
+
     return 0;
 }
 

@@ -503,6 +503,41 @@ void emu_node_set_direct_io(struct emu_node_tree *tree, struct emu_node *node)
     node->direct_io = true;
 }
 
+void emu_node_set_unlinkable_locked(struct emu_node_tree *tree,
+                                    struct emu_node *node)
+{
+    (void) tree;
+    if (node == NULL) {
+        return;
+    }
+    node->unlinkable = true;
+}
+
+void emu_node_set_unlinkable(struct emu_node_tree *tree, struct emu_node *node)
+{
+    if (tree == NULL || node == NULL) {
+        return;
+    }
+
+    tree_lock(tree);
+    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
+
+    node->unlinkable = true;
+}
+
+void emu_node_set_ioctl_unlocked(struct emu_node_tree *tree,
+                                 struct emu_node *node)
+{
+    if (tree == NULL || node == NULL) {
+        return;
+    }
+
+    tree_lock(tree);
+    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
+
+    node->ioctl_unlocked = true;
+}
+
 int emu_node_set_ops(struct emu_node_tree *tree, struct emu_node *node,
                      const struct emu_node_ops *ops, void *backing)
 {
@@ -859,10 +894,17 @@ int emu_node_unlink_child(struct emu_node_tree *tree, emu_ino_t parent,
         return -ENOENT;
     }
 
-    /* Only files are unlinkable via this path (the qpair<Q> case); the endpoint
-     * directories are removed via revocation, not user unlink. */
+    /* The endpoint directories are removed via revocation, not user unlink. */
     if (child->type != EMU_NODE_FILE) {
         return -EISDIR;
+    }
+
+    /* Unlinkability is opt-in: only the qpair<Q> files are user-removable (the
+     * VRTD delete-on-last-close pattern).  info / bar<M> / the global hotplug
+     * control file are NOT, so a stray unlink cannot free the control surface or
+     * an endpoint out from under the model. */
+    if (!child->unlinkable) {
+        return -EPERM;
     }
 
     emu_node_unlink_locked(tree, child);
@@ -1094,30 +1136,54 @@ int emu_node_ioctl(struct emu_node_tree *tree, emu_ino_t ino, unsigned int cmd,
     }
 
     tree_lock(tree);
-    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
 
     struct emu_node *node = find_ino_locked(tree, ino);
     if (node == NULL) {
+        tree_unlock(tree);
         return -ENOENT;
     }
 
     /* Liveness gate: a revoked endpoint returns -ENODEV on an open fd. */
     if (!node->live) {
+        tree_unlock(tree);
         return -ENODEV;
     }
 
     if (node->ops == NULL || node->ops->ioctl == NULL) {
         /* No command vtable: the canonical "inappropriate ioctl" errno. */
+        tree_unlock(tree);
         return -ENOTTY;
     }
 
-    return node->ops->ioctl(node, node->backing, cmd, in, in_size, out,
-                            out_size);
+    /*
+     * The hotplug file's command IS the self-locking revoke/reload machinery, so
+     * its hook must run with the lock dropped (it would otherwise deadlock the
+     * non-recursive mutex).  Resolving + gating the node under the lock and only
+     * then dropping it is safe because such a node (the global hotplug file) is
+     * never unlinked, so its pointer + backing outlive the unlocked call.
+     */
+    if (node->ioctl_unlocked) {
+        struct emu_node *n = node;
+        void *backing = node->backing;
+        const struct emu_node_ops *ops = node->ops;
+        tree_unlock(tree);
+        return ops->ioctl(n, backing, cmd, in, in_size, out, out_size);
+    }
+
+    int rc = node->ops->ioctl(node, node->backing, cmd, in, in_size, out,
+                              out_size);
+    tree_unlock(tree);
+    return rc;
 }
 
 /* ================================================================== */
 /* Revocation (forced removal)                                        */
 /* ================================================================== */
+
+/* Mark a function removed and fire the model-shutdown seam once both are gone
+ * (defined below; used by both whole-device and per-function revoke). */
+static void device_mark_function_removed_locked(struct emu_device *dev,
+                                                enum emu_device_function func);
 
 /*
  * A name to invalidate after the lock is dropped: parent inode, child inode, and
@@ -1281,6 +1347,15 @@ int emu_device_revoke(struct emu_node_tree *tree, const char *bdf)
     dev->bars = NULL;
     dev->qdma = NULL;
 
+    /*
+     * 3. A whole-device revoke removes both functions at once; mark them removed
+     *    and fire the model-shutdown seam exactly once (TOGGLE_SBR / HOTPLUG /
+     *    full teardown all funnel through here, so the model is torn down even if
+     *    no per-function REMOVE preceded the whole-device revoke).
+     */
+    device_mark_function_removed_locked(dev, EMU_DEVICE_FUNCTION_QDMA);
+    device_mark_function_removed_locked(dev, EMU_DEVICE_FUNCTION_BARS);
+
     tree_unlock(tree);
 
     /*
@@ -1296,6 +1371,167 @@ int emu_device_revoke(struct emu_node_tree *tree, const char *bdf)
     }
 
     pending_inval_array_free(&pending);
+
+    return 0;
+}
+
+/*
+ * Mark @p func as removed on @p dev and, if that completes the set (both
+ * functions gone), fire the model-shutdown seam exactly once.  Assumes the lock
+ * held; the seam runs under the lock per its contract (node.h).
+ */
+static void device_mark_function_removed_locked(struct emu_device *dev,
+                                                enum emu_device_function func)
+{
+    dev->removed_functions |= emu_device_function_mask(func);
+
+    if ((dev->removed_functions & EMU_DEVICE_FUNCTIONS_ALL) !=
+        EMU_DEVICE_FUNCTIONS_ALL) {
+        return;
+    }
+
+    if (dev->model_shutdown_fired) {
+        return;
+    }
+    dev->model_shutdown_fired = true;
+
+    if (dev->model_shutdown != NULL) {
+        dev->model_shutdown(dev, dev->model_shutdown_ctx);
+    }
+}
+
+int emu_device_revoke_function(struct emu_node_tree *tree, const char *bdf,
+                               enum emu_device_function func)
+{
+    if (tree == NULL || bdf == NULL) {
+        return -1;
+    }
+    if (func != EMU_DEVICE_FUNCTION_QDMA && func != EMU_DEVICE_FUNCTION_BARS) {
+        return -1;
+    }
+
+    struct pending_inval_array pending = pending_inval_array_init();
+
+    tree_lock(tree);
+
+    struct emu_device *dev = find_device_locked(tree, bdf);
+    if (dev == NULL) {
+        /* Idempotent: absent or already fully revoked. */
+        tree_unlock(tree);
+        return 0;
+    }
+
+    /* Idempotent: this function is already removed. */
+    if (dev->removed_functions & emu_device_function_mask(func)) {
+        tree_unlock(tree);
+        return 0;
+    }
+
+    /* The subtree node for this function (may already be NULL on a torn-down
+     * device, in which case there is nothing left to revoke). */
+    struct emu_node *subtree =
+        func == EMU_DEVICE_FUNCTION_QDMA ? dev->qdma : dev->bars;
+
+    /*
+     * QDMA owns the registered resources (the qpairs); tear them down on a
+     * function-1 removal and leave them untouched on a function-2 removal.
+     * Iterate from the end because resource_unregister_locked compacts in place.
+     */
+    if (func == EMU_DEVICE_FUNCTION_QDMA) {
+        while (dev->registry.len > 0) {
+            struct emu_resource *res = dev->registry.d[dev->registry.len - 1];
+            resource_teardown_locked(res);
+            resource_unregister_locked(res);
+        }
+    }
+
+    /*
+     * Revoke just this function's subtree: mark every node dead + unlinked, sever
+     * the links, reap nodes the kernel has already forgotten, and gather the
+     * names to invalidate.  Best-effort on allocation failure (the dead/unlinked
+     * flags, not the kernel notification, are what enforce -ENODEV/-ENOENT).
+     */
+    if (subtree != NULL) {
+        if (revoke_subtree_locked(tree, subtree, &pending) == -1) {
+            LOG(LOG_WARNING,
+                "Revoke of '%s' function %d: name-invalidation list incomplete",
+                bdf, (int) func);
+        }
+    }
+
+    /* Clear the device's now-stale pointer to the revoked subtree (it may have
+     * been freed by revoke_subtree_locked). */
+    if (func == EMU_DEVICE_FUNCTION_QDMA) {
+        dev->qdma = NULL;
+    } else {
+        dev->bars = NULL;
+    }
+
+    /* Record the removal and (if both gone) fire the model-shutdown seam. */
+    device_mark_function_removed_locked(dev, func);
+
+    tree_unlock(tree);
+
+    if (tree->notifier.notify_delete != NULL) {
+        for (size_t i = 0; i < pending.len; i++) {
+            struct pending_invalidation *p = pending.d[i];
+            tree->notifier.notify_delete(tree->notifier.ctx, p->parent,
+                                         p->child, p->name);
+        }
+    }
+
+    pending_inval_array_free(&pending);
+
+    return 0;
+}
+
+int emu_device_set_model_shutdown(struct emu_node_tree *tree, const char *bdf,
+                                  emu_model_shutdown_fn fn, void *ctx)
+{
+    if (tree == NULL || bdf == NULL) {
+        return -1;
+    }
+
+    tree_lock(tree);
+    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
+
+    struct emu_device *dev = find_device_locked(tree, bdf);
+    if (dev == NULL) {
+        return -1;
+    }
+
+    dev->model_shutdown = fn;
+    dev->model_shutdown_ctx = ctx;
+
+    return 0;
+}
+
+int emu_node_tree_collect_live_bdfs(struct emu_node_tree *tree,
+                                    struct str_array *out)
+{
+    if (tree == NULL || out == NULL) {
+        return -1;
+    }
+
+    tree_lock(tree);
+    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
+
+    for (size_t i = 0; i < tree->devices.len; i++) {
+        struct emu_device *dev = tree->devices.d[i];
+        if (!dev->live) {
+            continue;
+        }
+
+        _cleanup_(cleanup_free)
+        char *copy = strdup(dev->bdf);
+        PROPAGATE_ERROR_NULL_LOG(copy, LOG_ERR,
+                                 "Failed to copy live BDF '%s'", dev->bdf);
+
+        if (str_array_push_move(out, &copy) == -1) {
+            LOG(LOG_ERR, "Failed to collect live BDF '%s'", dev->bdf);
+            return -1;
+        }
+    }
 
     return 0;
 }

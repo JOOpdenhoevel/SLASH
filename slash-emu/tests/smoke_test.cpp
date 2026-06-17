@@ -137,7 +137,9 @@ TEST(SlashEmuSmoke, MountBrowseAndUnmount)
         << "stat root failed: " << std::strerror(errno);
     EXPECT_TRUE(S_ISDIR(st.st_mode));
 
-    // readdir must succeed and yield only "." and ".." (empty root).
+    // readdir must succeed.  With no --config there are no per-device <BDF>/
+    // dirs, but the global "hotplug" control file is always present at root (a
+    // sibling of the per-device dirs), so the only entries are it plus "."/"..".
     DIR *dir = ::opendir(mountpoint.c_str());
     ASSERT_NE(dir, nullptr) << "opendir failed: " << std::strerror(errno);
 
@@ -150,12 +152,14 @@ TEST(SlashEmuSmoke, MountBrowseAndUnmount)
     EXPECT_EQ(errno, 0) << "readdir failed: " << std::strerror(errno);
     ::closedir(dir);
 
-    // "." and ".." may or may not be surfaced by libc/kernel for FUSE; what
-    // matters is that there are no spurious entries.
+    // "." and ".." may or may not be surfaced by libc/kernel for FUSE; the only
+    // non-dot entry permitted in a config-less root is the global hotplug file.
     for (const auto &name : entries) {
-        EXPECT_TRUE(name == "." || name == "..")
+        EXPECT_TRUE(name == "." || name == ".." || name == "hotplug")
             << "unexpected entry in empty root: " << name;
     }
+    EXPECT_EQ(entries.count("hotplug"), 1u)
+        << "the global hotplug file must be present at the mount root";
 
     // Looking up a nonexistent name must fail with ENOENT (lookup is wired).
     std::string ghost = mountpoint + "/does_not_exist";

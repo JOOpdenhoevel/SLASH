@@ -30,6 +30,7 @@ add_library(slash_emu_core STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/bars.c
   ${CMAKE_CURRENT_SOURCE_DIR}/config.c
   ${CMAKE_CURRENT_SOURCE_DIR}/fs.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/hotplug.c
   ${CMAKE_CURRENT_SOURCE_DIR}/info.c
   ${CMAKE_CURRENT_SOURCE_DIR}/node.c
   ${CMAKE_CURRENT_SOURCE_DIR}/qdma.c

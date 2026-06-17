@@ -116,6 +116,45 @@ struct emu_node_tree;
 struct emu_device;
 struct emu_resource;
 
+/**
+ * @brief A removable PCI function of an accelerator (hotplug REMOVE granularity).
+ *
+ * The ABI maps PCI function 1 to the QDMA endpoint subtree (@c qdma/) and
+ * function 2 to the control-register BAR subtree (@c bars/).  REMOVE
+ * (@ref emu_device_revoke_function) operates at this granularity -- one function
+ * at a time -- whereas SBR/HOTPLUG/teardown remove the whole device
+ * (@ref emu_device_revoke).  The bitmask form (@ref emu_device_function_mask) is
+ * used to track which functions of a device have been removed so the model is
+ * shut down only once @em both are gone.
+ */
+enum emu_device_function {
+    EMU_DEVICE_FUNCTION_QDMA = 1, /**< PCI function 1: the @c qdma/ subtree. */
+    EMU_DEVICE_FUNCTION_BARS = 2, /**< PCI function 2: the @c bars/ subtree. */
+};
+
+/** @brief Bit for @p func in a device's removed-functions mask. */
+#define emu_device_function_mask(func) (1u << (unsigned) (func))
+
+/** @brief Mask with both removable functions set (device fully removed). */
+#define EMU_DEVICE_FUNCTIONS_ALL \
+    (emu_device_function_mask(EMU_DEVICE_FUNCTION_QDMA) | \
+     emu_device_function_mask(EMU_DEVICE_FUNCTION_BARS))
+
+/**
+ * @brief Per-device model-shutdown seam (the T10 vpp_emu/vpp_sim teardown hook).
+ *
+ * Wired onto a device via @ref emu_device_set_model_shutdown.  The spine invokes
+ * it exactly once, with the tree lock @em held, the first time @em both
+ * functions of the device have been removed (whether via two per-function
+ * REMOVEs or a single whole-device revoke) -- modelling "shut down the model
+ * only once both Function 1 and Function 2 are gone".  It must not free the
+ * device or re-enter the spine's public (re-locking) API.
+ *
+ * @param dev The device whose model should be shut down.
+ * @param ctx The opaque context registered alongside the callback.
+ */
+typedef void (*emu_model_shutdown_fn)(struct emu_device *dev, void *ctx);
+
 /** @brief Non-owning array of node pointers (children lists / scratch). */
 DECLARE_ARRAY(emu_node_ref_array, struct emu_node *)
 
@@ -310,6 +349,46 @@ struct emu_node {
     bool unlinked;
 
     /**
+     * @brief Whether a user @c unlink(2) may remove this file (opt-in).
+     *
+     * The ABI makes only the @c qpair<Q> files user-unlinkable -- the VRTD
+     * delete-on-last-close nameless pattern (ADD -> open -> unlink while open).
+     * Every other endpoint (@c info, @c bar<M>, and the global @c hotplug control
+     * file) must @em not be removable by @c unlink: the per-device subtrees are
+     * removed by revocation, not by the holder, and the hotplug file is the
+     * control surface itself.  @ref emu_node_unlink_child gates the FUSE @c unlink
+     * op on this flag (returning @c -EPERM for a non-unlinkable file), so a stray
+     * @c unlink cannot free the control surface or an endpoint out from under the
+     * model.  Default @c false; the qdma endpoint sets it @c true on each
+     * @c qpair<Q> it creates (@ref emu_node_set_unlinkable).
+     *
+     * This also @em enforces the "the hotplug file is never unlinked" precondition
+     * the @ref ioctl_unlocked dropped-lock path relies on.
+     */
+    bool unlinkable;
+
+    /**
+     * @brief Invoke this node's @c ops->ioctl with the tree lock @em dropped.
+     *
+     * The device-endpoint ioctls (qdma QPAIR_ADD) run @em under the tree lock so
+     * the liveness gate and the dispatch are atomic with respect to revocation,
+     * and their hooks call the @c _locked spine cores.  The global @c hotplug
+     * file is different: its command @em is the revocation/reload machinery, and
+     * that machinery is the public, self-locking spine API (@ref
+     * emu_device_revoke, the materialize path) which would deadlock the
+     * non-recursive mutex if re-entered under the lock.  A node with this flag set
+     * therefore has @ref emu_node_ioctl resolve and liveness-gate it under the
+     * lock, then @em drop the lock before calling the hook.  Safe only for a node
+     * whose lifetime spans the tree's: the resolved node pointer must not be freed
+     * out from under the unlocked hook.  The hotplug file satisfies this because
+     * it is created with @c unlinkable @c == @c false (@ref emu_node::unlinkable),
+     * so the FUSE @c unlink op cannot remove it, and it is never revoked -- it has
+     * no @c device, so neither @ref emu_device_revoke nor
+     * @ref emu_device_revoke_function ever touches it.
+     */
+    bool ioctl_unlocked;
+
+    /**
      * @brief Require unbuffered (direct) I/O for this file (set by the endpoint).
      *
      * When true the FUSE layer opens the file with @c direct_io so the kernel
@@ -411,6 +490,24 @@ struct emu_device {
 
     /** @brief False once the device has been revoked (forced removal). */
     bool live;
+
+    /**
+     * @brief Functions removed so far, as an @ref emu_device_function_mask OR.
+     *
+     * A per-function REMOVE (@ref emu_device_revoke_function) sets one bit; a
+     * whole-device revoke (@ref emu_device_revoke) sets all bits.  Used to fire
+     * the model-shutdown seam exactly once both functions are gone.
+     */
+    unsigned int removed_functions;
+
+    /** @brief True once the model-shutdown seam has fired (fire-once guard). */
+    bool model_shutdown_fired;
+
+    /** @brief Model-shutdown seam (T10), or NULL (non-owning ctx). */
+    emu_model_shutdown_fn model_shutdown;
+
+    /** @brief Opaque context for @ref model_shutdown (borrowed). */
+    void *model_shutdown_ctx;
 };
 
 /**
@@ -633,12 +730,19 @@ void emu_node_unlink_locked(struct emu_node_tree *tree, struct emu_node *node);
  * "unlink the @c qpair<Q> file while its fd is open" pattern and the
  * prune-leftover-qpairs-on-startup pattern both ride it.
  *
+ * Unlinkability is @em opt-in (@ref emu_node::unlinkable): only nodes the
+ * endpoint explicitly marked unlinkable (the @c qpair<Q> files) may be removed
+ * this way.  A non-unlinkable file (@c info, @c bar<M>, the global @c hotplug
+ * control file) is rejected with @c -EPERM, so a stray @c unlink cannot free the
+ * control surface or an endpoint out from under the model.
+ *
  * @param tree   The tree.
  * @param parent Parent directory inode.
  * @param name   Entry name to unlink.
  * @return 0 on success; @c -ENOENT if the parent or name does not exist;
  *         @c -ENOTDIR if @p parent is not a directory; @c -EISDIR if the target
- *         is a directory (only files are unlinkable here).
+ *         is a directory; @c -EPERM if the target is a file that was not marked
+ *         unlinkable.
  */
 int emu_node_unlink_child(struct emu_node_tree *tree, emu_ino_t parent,
                           const char *name);
@@ -654,6 +758,43 @@ int emu_node_unlink_child(struct emu_node_tree *tree, emu_ino_t parent,
  * @param node The file node to mark (must belong to @p tree).
  */
 void emu_node_set_direct_io(struct emu_node_tree *tree, struct emu_node *node);
+
+/**
+ * @brief Mark a file node as user-unlinkable (opt-in; see @ref emu_node::unlinkable).
+ *
+ * Sets @ref emu_node::unlinkable so the FUSE @c unlink op may remove this file
+ * (delete-on-last-close).  Only the qdma endpoint calls this -- on each
+ * @c qpair<Q> it creates -- so the VRTD nameless-qpair pattern works while
+ * @c info / @c bar<M> / @c hotplug stay non-removable.
+ *
+ * @param tree The tree (for locking).
+ * @param node The file node to mark (must belong to @p tree).
+ */
+void emu_node_set_unlinkable(struct emu_node_tree *tree, struct emu_node *node);
+
+/**
+ * @brief Lock-held variant of @ref emu_node_set_unlinkable.
+ *
+ * Assumes the caller already holds @c tree->lock.  Used from the QPAIR_ADD ioctl
+ * hook (which the spine invokes with the lock held) to mark the freshly-created
+ * @c qpair<Q> file unlinkable without re-locking the non-recursive mutex.
+ */
+void emu_node_set_unlinkable_locked(struct emu_node_tree *tree,
+                                    struct emu_node *node);
+
+/**
+ * @brief Mark a node's ioctl hook to run with the tree lock dropped.
+ *
+ * Sets @ref emu_node::ioctl_unlocked.  The hotplug file calls this on itself so
+ * its command (the self-locking revoke/reload machinery) does not re-enter the
+ * non-recursive tree mutex.  Only valid for a node that is never unlinked (the
+ * global hotplug file); see the field documentation for the safety argument.
+ *
+ * @param tree The tree (for locking).
+ * @param node The node to mark (must belong to @p tree).
+ */
+void emu_node_set_ioctl_unlocked(struct emu_node_tree *tree,
+                                 struct emu_node *node);
 
 /**
  * @brief Attach an ops vtable + backing to an already-created node.
@@ -984,5 +1125,76 @@ int emu_resource_check_locked(struct emu_node_tree *tree,
  * @return 0 on success (including the already-revoked / absent no-op case).
  */
 int emu_device_revoke(struct emu_node_tree *tree, const char *bdf);
+
+/**
+ * @brief Eagerly revoke a single function (subtree) of a device (REMOVE).
+ *
+ * The per-function counterpart of @ref emu_device_revoke, implementing the
+ * hotplug REMOVE granularity: function 1 (@ref EMU_DEVICE_FUNCTION_QDMA) revokes
+ * just the @c qdma/ subtree and the device's registered resources (the qpairs);
+ * function 2 (@ref EMU_DEVICE_FUNCTION_BARS) revokes just the @c bars/ subtree.
+ * The other function's subtree stays fully live -- a new lookup resolves it and
+ * ops on its open fds succeed -- while the removed function obeys the revocation
+ * contract exactly as for a whole-device revoke: ops on already-open fds of the
+ * removed subtree return @c -ENODEV, new lookups return @c -ENOENT, and the
+ * removed names are invalidated via the notifier (lock dropped first).
+ *
+ * The device itself is @em not marked dead and is still found by
+ * @ref emu_node_tree_find_device until both functions are removed; the
+ * surviving function can therefore still be removed afterwards.  When this call
+ * makes both functions removed (this one plus a prior REMOVE of the other, or a
+ * single call after the other was already gone), the model-shutdown seam fires
+ * exactly once (see @ref emu_device_set_model_shutdown).
+ *
+ * Registered resources (qpairs) belong to the QDMA function: they are torn down
+ * by an @ref EMU_DEVICE_FUNCTION_QDMA removal and left untouched by an
+ * @ref EMU_DEVICE_FUNCTION_BARS removal.
+ *
+ * Idempotent: removing an already-removed function (or a function of an absent /
+ * fully-revoked device) is a no-op success.
+ *
+ * @param tree The tree.
+ * @param bdf  Normalized board-level BDF of the device.
+ * @param func The function to remove.
+ * @return 0 on success (including the idempotent no-op case); -1 on a bad
+ *         argument (NULL tree/bdf or an unknown @p func).
+ */
+int emu_device_revoke_function(struct emu_node_tree *tree, const char *bdf,
+                               enum emu_device_function func);
+
+/**
+ * @brief Wire the model-shutdown seam onto a device (T10).
+ *
+ * Registers the callback the spine fires exactly once when both functions of the
+ * device have been removed (see @ref emu_model_shutdown_fn).  Replaces any
+ * previously registered seam.  Setting it on an already-both-removed device does
+ * @em not retroactively fire it (the both-removed transition already passed);
+ * callers wire the seam at attach time, before any removal.
+ *
+ * @param tree The tree (for locking).
+ * @param bdf  Normalized board-level BDF of the device.
+ * @param fn   The model-shutdown callback, or NULL to clear it.
+ * @param ctx  Opaque context passed back to @p fn (borrowed).
+ * @return 0 on success; -1 if no live device with @p bdf exists.
+ */
+int emu_device_set_model_shutdown(struct emu_node_tree *tree, const char *bdf,
+                                  emu_model_shutdown_fn fn, void *ctx);
+
+/**
+ * @brief Collect the BDFs of every live device into @p out (RESCAN seeding).
+ *
+ * Appends the normalized board-level BDF of each currently-live device to
+ * @p out.  Used by the filesystem layer to seed the RESCAN running-set from the
+ * devices already in the tree so a re-invocation of the materialize path does
+ * not reselect (and double-attach) an already-running accelerator.
+ *
+ * @param      tree The tree.
+ * @param[out] out  A @c str_array (see utils.h) the BDFs are pushed onto; the
+ *                  caller owns the pushed copies and frees them via the array's
+ *                  own cleanup.
+ * @return 0 on success, -1 on allocation failure.
+ */
+int emu_node_tree_collect_live_bdfs(struct emu_node_tree *tree,
+                                    struct str_array *out);
 
 #endif // SLASH_EMU_NODE_H

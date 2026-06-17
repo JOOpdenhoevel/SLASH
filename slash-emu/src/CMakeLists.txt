@@ -29,6 +29,7 @@ set(SLASH_EMU_WARNING_FLAGS -Wall -Wextra -Werror)
 add_library(slash_emu_core STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/config.c
   ${CMAKE_CURRENT_SOURCE_DIR}/fs.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/node.c
 )
 
 target_compile_options(slash_emu_core PRIVATE ${SLASH_EMU_WARNING_FLAGS})
@@ -42,6 +43,7 @@ target_link_libraries(slash_emu_core
   PUBLIC
     PkgConfig::FUSE3
     PkgConfig::SYSTEMD
+    Threads::Threads
   PRIVATE
     PkgConfig::INIH
 )

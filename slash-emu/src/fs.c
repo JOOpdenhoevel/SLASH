@@ -23,7 +23,8 @@
  * @brief libfuse3 low-level session implementation for slash-emu.
  *
  * See fs.h for the design rationale (why low-level, and how the node tree is
- * meant to be extended).  This scaffold serves a single, empty root directory.
+ * structured).  At startup the session materializes a per-device subtree
+ * (/<BDF>/ + bars/ + qdma/) for each configured, available accelerator.
  */
 
 #define _GNU_SOURCE
@@ -43,6 +44,7 @@
 #include <systemd/sd-event.h>
 
 #include "config.h"
+#include "node.h"
 #include "utils.h"
 
 /*
@@ -76,28 +78,33 @@ struct emu_fs {
     /** @brief Reusable receive buffer; grown/managed by libfuse, mem freed by us. */
     struct fuse_buf recv_buf;
 
+    /** @brief The emulated device node tree (owning). */
+    struct emu_node_tree *tree; /* owning */
+
     /** @brief True once fuse_session_mount() succeeded (needs unmount on teardown). */
     bool mounted;
 };
 
-/*
- * Fill a struct stat for the given inode.  The scaffold knows only the root
- * directory; later tasks extend this to dispatch on the node tree.
- */
-static int emu_fs_stat(fuse_ino_t ino, struct stat *st)
+/* Retrieve the daemon FS state bound to a request. */
+static struct emu_fs *fs_of(fuse_req_t req)
 {
-    *st = (struct stat) {
-        .st_ino = ino,
+    return fuse_req_userdata(req);
+}
+
+/*
+ * Build a fuse_entry_param for a freshly-resolved node.  The node layer has
+ * already bumped the kernel lookup count; the entry's nlookup contract (+1 per
+ * reply) is balanced by emu_op_forget.
+ */
+static void fill_entry(struct emu_node_tree *tree, fuse_ino_t ino,
+                       struct fuse_entry_param *e)
+{
+    *e = (struct fuse_entry_param) {
+        .ino = ino,
+        .attr_timeout = EMU_FS_ATTR_TIMEOUT_S,
+        .entry_timeout = EMU_FS_ATTR_TIMEOUT_S,
     };
-
-    if (ino == FUSE_ROOT_ID) {
-        st->st_mode = S_IFDIR | 0555;
-        st->st_nlink = 2;
-        return 0;
-    }
-
-    /* No other inodes exist yet. */
-    return -1;
+    (void) emu_node_stat(tree, ino, &e->attr);
 }
 
 static void emu_op_getattr(fuse_req_t req, fuse_ino_t ino,
@@ -106,8 +113,9 @@ static void emu_op_getattr(fuse_req_t req, fuse_ino_t ino,
     (void) fi;
 
     struct stat st;
-    if (emu_fs_stat(ino, &st) == -1) {
-        (void) fuse_reply_err(req, ENOENT);
+    int ret = emu_node_stat(fs_of(req)->tree, ino, &st);
+    if (ret != 0) {
+        (void) fuse_reply_err(req, -ret);
         return;
     }
 
@@ -116,17 +124,25 @@ static void emu_op_getattr(fuse_req_t req, fuse_ino_t ino,
 
 static void emu_op_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
-    /*
-     * The root is currently empty, so every lookup below it fails with
-     * ENOENT.  Later tasks resolve @name against the parent's children here.
-     */
-    if (parent != FUSE_ROOT_ID) {
-        (void) fuse_reply_err(req, ENOTDIR);
+    struct emu_node_tree *tree = fs_of(req)->tree;
+
+    struct emu_node *child = NULL;
+    int ret = emu_node_lookup_child(tree, parent, name, &child);
+    if (ret != 0) {
+        /* -ESTALE on a vanished parent maps to ENOENT for the lookup contract. */
+        (void) fuse_reply_err(req, ret == -ESTALE ? ENOENT : -ret);
         return;
     }
 
-    (void) name;
-    (void) fuse_reply_err(req, ENOENT);
+    struct fuse_entry_param e;
+    fill_entry(tree, child->ino, &e);
+    (void) fuse_reply_entry(req, &e);
+}
+
+static void emu_op_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
+{
+    emu_node_forget(fs_of(req)->tree, ino, nlookup);
+    fuse_reply_none(req);
 }
 
 /*
@@ -137,11 +153,11 @@ static void emu_op_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
  */
 static size_t emu_dirbuf_add(fuse_req_t req, char *buf, size_t bufsize,
                              size_t used, const char *name, fuse_ino_t ino,
-                             off_t next_off)
+                             mode_t mode, off_t next_off)
 {
     struct stat st = {
         .st_ino = ino,
-        .st_mode = S_IFDIR,
+        .st_mode = mode,
     };
 
     size_t entsize = fuse_add_direntry(req, NULL, 0, name, NULL, 0);
@@ -153,15 +169,41 @@ static size_t emu_dirbuf_add(fuse_req_t req, char *buf, size_t bufsize,
     return used + entsize;
 }
 
+/*
+ * Accumulator threaded through emu_node_readdir: the kernel-supplied window
+ * (buf/size), the cursor the kernel handed us (off), the running offset, and how
+ * much we have filled.  Each live entry advances entry_off; entries at or before
+ * the cursor are skipped so a resumed readdir does not repeat them.
+ */
+struct readdir_ctx {
+    fuse_req_t req;
+    char *buf;
+    size_t size;
+    size_t used;
+    off_t off;       /* kernel's resume cursor */
+    off_t entry_off; /* running 1-based offset */
+};
+
+static bool readdir_emit(void *vctx, const char *name, emu_ino_t ino,
+                         enum emu_node_type type)
+{
+    struct readdir_ctx *ctx = vctx;
+
+    mode_t mode = type == EMU_NODE_DIR ? S_IFDIR : S_IFREG;
+
+    if (ctx->off <= ctx->entry_off) {
+        ctx->used = emu_dirbuf_add(ctx->req, ctx->buf, ctx->size, ctx->used,
+                                   name, ino, mode, ctx->entry_off + 1);
+    }
+    ctx->entry_off++;
+
+    return true;
+}
+
 static void emu_op_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
                            off_t off, struct fuse_file_info *fi)
 {
     (void) fi;
-
-    if (ino != FUSE_ROOT_ID) {
-        (void) fuse_reply_err(req, ENOTDIR);
-        return;
-    }
 
     _cleanup_(cleanup_free)
     char *buf = calloc(1, size);
@@ -170,32 +212,27 @@ static void emu_op_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
         return;
     }
 
-    /*
-     * The root has only "." and ".." for now.  Entry offsets are 1-based and
-     * monotonically increasing; the kernel passes the last-seen offset back in
-     * @off so we can resume.  Everything fits in a single reply here, but we
-     * keep the offset bookkeeping so adding children later is trivial.
-     */
-    size_t used = 0;
-    off_t entry_off = 0;
+    struct readdir_ctx ctx = {
+        .req = req,
+        .buf = buf,
+        .size = size,
+        .used = 0,
+        .off = off,
+        .entry_off = 0,
+    };
 
-    if (off <= entry_off) {
-        used = emu_dirbuf_add(req, buf, size, used, ".", FUSE_ROOT_ID,
-                              entry_off + 1);
+    int ret = emu_node_readdir(fs_of(req)->tree, ino, readdir_emit, &ctx);
+    if (ret != 0) {
+        (void) fuse_reply_err(req, -ret);
+        return;
     }
-    entry_off++;
 
-    if (off <= entry_off) {
-        used = emu_dirbuf_add(req, buf, size, used, "..", FUSE_ROOT_ID,
-                              entry_off + 1);
-    }
-    entry_off++;
-
-    (void) fuse_reply_buf(req, buf, used);
+    (void) fuse_reply_buf(req, buf, ctx.used);
 }
 
 static const struct fuse_lowlevel_ops emu_fs_ops = {
     .lookup = emu_op_lookup,
+    .forget = emu_op_forget,
     .getattr = emu_op_getattr,
     .readdir = emu_op_readdir,
 };
@@ -245,6 +282,68 @@ static int on_fuse_readable(sd_event_source *s, int fd, uint32_t revents,
     return 0;
 }
 
+/*
+ * Notifier callback wired into the node tree: when an endpoint is revoked, the
+ * node layer asks us to invalidate the kernel's dentry for it so a subsequent
+ * lookup misses (returns ENOENT).  fuse_lowlevel_notify_delete forces the kernel
+ * to drop the cached entry; -ENOSYS (old kernel) is harmless (entry_timeout then
+ * bounds staleness).  Called with the tree lock NOT held.
+ */
+static void emu_fs_notify_delete(void *ctx, emu_ino_t parent, emu_ino_t child,
+                                 const char *name)
+{
+    struct emu_fs *fs = ctx;
+    if (fs->session == NULL) {
+        return;
+    }
+
+    int ret = fuse_lowlevel_notify_delete(fs->session, parent, child, name,
+                                          strlen(name));
+    if (ret != 0 && ret != -ENOSYS) {
+        LOG(LOG_WARNING, "notify_delete(%s) failed: %s", name, strerror(-ret));
+    }
+}
+
+/*
+ * Materialize the per-device subtree for every configured accelerator that is
+ * not already running.  Reuses the config running-set computation so RESCAN (T9)
+ * drives the same path.  The endpoint files (info/bar<M>/qpair<Q>) are attached
+ * by later tasks; here we only stand up the <BDF>/, bars/, and qdma/ dirs.
+ */
+static int emu_fs_materialize(struct emu_fs *fs)
+{
+    if (fs->config == NULL) {
+        return 0;
+    }
+
+    _cleanup_(cleanup_running_setp)
+    struct emu_running_set *running = NULL;
+    if (emu_running_set_new(&running) == -1) {
+        return -1;
+    }
+
+    struct emu_accelerator_ref_array selected = emu_accelerator_ref_array_init();
+    int ret = emu_config_select_new(fs->config, running, &selected);
+    if (ret == -1) {
+        emu_accelerator_ref_array_free(&selected);
+        return -1;
+    }
+
+    for (size_t i = 0; i < selected.len; i++) {
+        const struct emu_accelerator *acc = selected.d[i];
+        if (emu_node_tree_add_device(fs->tree, acc->bdf, NULL) == -1) {
+            LOG(LOG_ERR, "Failed to materialize accelerator '%s'", acc->bdf);
+            emu_accelerator_ref_array_free(&selected);
+            return -1;
+        }
+        LOG(LOG_INFO, "Materialized accelerator '%s'", acc->bdf);
+    }
+
+    emu_accelerator_ref_array_free(&selected);
+
+    return 0;
+}
+
 int emu_fs_create(struct emu_fs **fsp, const char *mountpoint,
                   const struct emu_config *config)
 {
@@ -262,6 +361,20 @@ int emu_fs_create(struct emu_fs **fsp, const char *mountpoint,
     PROPAGATE_ERROR_NULL_LOG(fs->mountpoint, LOG_ERR,
                              "Failed to duplicate mountpoint");
 
+    struct emu_notifier notifier = {
+        .notify_delete = emu_fs_notify_delete,
+        .ctx = fs,
+    };
+    if (emu_node_tree_new(&fs->tree, &notifier) == -1) {
+        LOG(LOG_ERR, "Failed to create node tree");
+        return -1;
+    }
+
+    if (emu_fs_materialize(fs) == -1) {
+        LOG(LOG_ERR, "Failed to materialize device tree");
+        return -1;
+    }
+
     /*
      * fuse_session_new() requires a non-empty argv[0]; we pass only the
      * program name and let mount options come from elsewhere (the systemd unit
@@ -271,6 +384,14 @@ int emu_fs_create(struct emu_fs **fsp, const char *mountpoint,
     struct fuse_args args = FUSE_ARGS_INIT(1, argv);
 
     fs->session = fuse_session_new(&args, &emu_fs_ops, sizeof(emu_fs_ops), fs);
+    /*
+     * fuse_session_new parses @args into its own copy, reallocating @args's argv
+     * in place; that internal copy is never reclaimed unless we free @args here.
+     * fuse_opt_free_args is the documented owner-frees-its-args contract and
+     * fixes the 27-byte ASan leak the T3 audit flagged (a real missing free in
+     * our setup, not a libfuse one-time alloc).
+     */
+    fuse_opt_free_args(&args);
     if (fs->session == NULL) {
         LOG(LOG_ERR, "Failed to create FUSE session");
         return -1;
@@ -331,6 +452,14 @@ void cleanup_fs(struct emu_fs *fs)
         fuse_session_destroy(fs->session);
         fs->session = NULL;
     }
+
+    /*
+     * Free the node tree only after the session is gone: the notifier callback
+     * captures fs->session, and no op can run against the tree once the session
+     * is destroyed.
+     */
+    cleanup_node_tree(fs->tree);
+    fs->tree = NULL;
 
     /* libfuse allocates recv_buf.mem lazily inside fuse_session_receive_buf. */
     free(fs->recv_buf.mem);

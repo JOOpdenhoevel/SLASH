@@ -62,3 +62,19 @@ target_link_libraries(config_test PRIVATE slash_emu_core)
 target_compile_definitions(config_test PRIVATE
   SLASH_EMU_SAMPLE_CONF="${CMAKE_SOURCE_DIR}/conf/slash-emu.conf"
 )
+
+# Spine unit tests: node tree, per-device registry, refcounted resources, and
+# the revocation state machine.  Exercises the pure C data model in node.c
+# directly (no FUSE session needed).
+slash_emu_add_test(node_test node_test.cpp)
+target_link_libraries(node_test PRIVATE slash_emu_core)
+
+# Adversarial conformance suite for the spine (T5): exhaustive refcount drop
+# orders, idempotent teardown triggers, the dead-orphan revocation state machine,
+# nameless-qpair lifetime, notifier re-entry, and OOM/error-path cleanup (ASan).
+slash_emu_add_test(node_revocation_test node_revocation_test.cpp)
+target_link_libraries(node_revocation_test PRIVATE slash_emu_core)
+
+# End-to-end: the spine materializes the configured device tree over the real
+# FUSE mount (lookup / getattr / readdir wired to the node model).
+slash_emu_add_test(fs_tree_test fs_tree_test.cpp)

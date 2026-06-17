@@ -5,13 +5,14 @@ SLASH device tree to the rest of the system as a FUSE filesystem, so software
 can be developed and tested against the SLASH ABI without real AMD V80 FPGA
 hardware attached.
 
-This directory currently holds the **step-1 MVP scaffold**: a buildable,
-mountable libfuse3 skeleton in the vrtd house style. It stands up the full
-daemon lifecycle (CLI parsing, config load, FUSE mount, sd-event loop, signal
-handling, clean teardown) and serves a single, empty root directory. The
-endpoints (`info` / `bars` / `qdma` / `hotplug`), the real config parser, the
-SIM model bridge, the `vpp_emu` bridge, and streaming are **deferred to later
-tasks**.
+This directory holds the **step-1 MVP** under construction. It stands up the
+full daemon lifecycle (CLI parsing, config load, FUSE mount, sd-event loop,
+signal handling, clean teardown) in the vrtd house style, parses the accelerator
+configuration, and materializes the per-device node tree (`<BDF>/` with `bars/`
+and `qdma/` subdirs) over the FUSE mount, with a thread-safe per-device registry
+and revocation machinery as its spine. The endpoint **files** (`info` /
+`bar<M>` / `qpair<Q>` / `hotplug`), the SIM model bridge, the `vpp_emu` bridge,
+and streaming are **deferred to later tasks**.
 
 ## Layout
 
@@ -23,8 +24,10 @@ slash-emu/
 │   ├── CMakeLists.txt        # slash_emu_core static lib + slash-emud executable
 │   ├── utils.h               # PROPAGATE_ERROR family, _cleanup_, LOG (ported from vrtd)
 │   ├── array.h               # type-safe dynamic arrays (ported from vrtd)
-│   ├── config.h / config.c   # config interface + STUB loader (real parser = later task)
-│   ├── fs.h / fs.c           # libfuse3 LOW-LEVEL session: mount + empty root node tree
+│   ├── config.h / config.c   # config parser + persistent accelerator model
+│   ├── node.h / node.c       # spine: node tree, per-device registry, refcounted
+│   │                         #   resources, revocation machinery (thread-safe)
+│   ├── fs.h / fs.c           # libfuse3 LOW-LEVEL session: ops adapt to the node tree
 │   └── main.c                # CLI args, sd-event loop, signals, mount/teardown
 ├── systemd/
 │   └── slash-emu.service     # privileged unit (mounts /run/slash_emu)
@@ -32,7 +35,11 @@ slash-emu/
 │   └── slash-emu.conf        # client-access group (daemon itself runs as root)
 └── tests/
     ├── CMakeLists.txt        # GTest via FetchContent, gtest_discover_tests
-    └── smoke_test.cpp        # mount/browse/unmount end-to-end smoke test
+    ├── smoke_test.cpp        # mount/browse/unmount end-to-end smoke test
+    ├── daemon_lifecycle_test.cpp  # adversarial CLI / mount-failure / no-leak suite
+    ├── config_test.cpp      # config parser + accelerator model unit tests
+    ├── node_test.cpp        # spine: node tree, registry, refcount, revocation
+    └── fs_tree_test.cpp     # end-to-end: configured device tree over the mount
 ```
 
 ## Build and test
@@ -74,10 +81,23 @@ slash-emud --config /etc/slash-emu/slash-emu.conf --mount /run/slash_emu
   only available there. The session's channel fd is integrated into the
   sd-event loop as an I/O source (rather than `fuse_session_loop`) so FUSE and
   daemon events share one loop.
-- **Node tree.** The filesystem is a tree of inodes; the scaffold contains only
-  the root (`FUSE_ROOT_ID`). The op handlers in `fs.c` dispatch on inode number,
-  so later tasks add endpoints by allocating inodes and enumerating them in
-  `lookup` / `readdir` without touching the session plumbing. See `fs.h`.
+- **Node tree (the spine).** The filesystem is a generic tree of inodes
+  (`struct emu_node` in `node.h`), owned by an `emu_node_tree`. The FUSE ops in
+  `fs.c` are thin adapters over the node model (`emu_node_lookup_child` /
+  `_forget` / `_stat` / `_readdir`); no op hard-codes an inode. At startup the
+  daemon materializes one `<BDF>/` dir per configured accelerator with `bars/`
+  and `qdma/` subdirs. Endpoints (info/bars/qdma) attach their files via the
+  node API without touching the session plumbing. The tree, per-device registry,
+  and resource refcounts are mutex-guarded so the data model is safe for a future
+  multi-threaded session. See `node.h` for the full design and locking model.
+- **Revocation & nameless qpairs.** Each device has a registry that tracks live
+  communication resources — including QDMA qpairs that are unlinked-while-open
+  (nameless, so unreachable by walking `qdma/`). A qpair is a refcounted resource
+  whose lifetime is decoupled from its inode (registry ref + inode ref, freed
+  when both drop), with idempotent teardown on either cooperative inode eviction
+  or forced device removal. Forced removal eagerly revokes: new lookups get
+  `-ENOENT`, ops on already-open fds get `-ENODEV`, names are invalidated via
+  `fuse_lowlevel_notify_delete`, and `close` always succeeds. See `node.h`.
 - **Privileged service.** Unlike `vrtd`, the systemd unit is intentionally
   *not* hardened: it runs as root (FUSE needs `CAP_SYS_ADMIN`), and avoids
   mount-namespacing options that would hide the FUSE mount. The emulation model

@@ -39,6 +39,11 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 
+# pthreads: the node tree / registry / refcounts are mutex-guarded so the data
+# model is safe for a future multi-threaded FUSE session.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 # libfuse3 low-level API (we need fuse_lowlevel_notify_* in later tasks).
 pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
 

@@ -210,26 +210,6 @@ RunResult run_daemon(const std::vector<std::string> &args, int timeout_ms,
     return res;
 }
 
-// Count leftover lifecycle/smoke scratch dirs under .tmp (leak detector).
-int count_leftover_scratch_dirs()
-{
-    DIR *dir = ::opendir(SLASH_EMU_TMP_DIR);
-    if (dir == nullptr) {
-        return 0;
-    }
-    int n = 0;
-    struct dirent *ent;
-    while ((ent = ::readdir(dir)) != nullptr) {
-        std::string name = ent->d_name;
-        if (name.rfind("slash_emu_lifecycle_", 0) == 0 ||
-            name.rfind("slash_emu_smoke_", 0) == 0) {
-            n++;
-        }
-    }
-    ::closedir(dir);
-    return n;
-}
-
 }  // namespace
 
 // ===========================================================================
@@ -371,8 +351,6 @@ TEST(SlashEmuMountFailure, UnwritableMountpointParentExitsCleanly)
 
 TEST(SlashEmuLifecycle, CleanCycleLeavesNoLeak)
 {
-    const int before = count_leftover_scratch_dirs();
-
     const std::string mountpoint = make_mountpoint();
     ASSERT_FALSE(mountpoint.empty());
 
@@ -422,11 +400,17 @@ TEST(SlashEmuLifecycle, CleanCycleLeavesNoLeak)
     EXPECT_EQ(::rmdir(mountpoint.c_str()), 0)
         << "mountpoint not cleanly unmounted/removable: " << std::strerror(errno);
 
-    // Net scratch-dir count must return to baseline (no leak).
-    const int after = count_leftover_scratch_dirs();
-    EXPECT_EQ(after, before)
-        << "leftover scratch dirs under .tmp changed from " << before
-        << " to " << after;
+    // No leak: THIS cycle's own uniquely-named scratch dir must be gone after the
+    // rmdir above.  (We check only our own dir, not a global count of every
+    // slash_emu_lifecycle_*/smoke_* dir -- under parallel ctest -j16 other
+    // concurrent lifecycle/smoke tests create and reap their own such dirs
+    // between any before/after snapshot, so a global count is inherently racy and
+    // would false-positive even though this cycle leaked nothing.)
+    struct stat st {};
+    EXPECT_NE(::stat(mountpoint.c_str(), &st), 0)
+        << "this cycle's scratch dir " << mountpoint << " survived the clean cycle";
+    EXPECT_EQ(errno, ENOENT)
+        << "this cycle's scratch dir " << mountpoint << " is not cleanly gone";
 }
 
 // ===========================================================================

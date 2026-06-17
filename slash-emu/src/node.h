@@ -209,6 +209,41 @@ struct emu_node_ops {
                      const char *buf, size_t size, off_t off);
 
     /**
+     * @brief Serve an ioctl against a node (optional).
+     *
+     * The generic ioctl seam the FUSE @c ioctl op dispatches to via
+     * @ref emu_node_ioctl.  Used by directory nodes that accept a command --
+     * the @c qdma/ directory's @c QPAIR_ADD (T8) and the @c hotplug file's
+     * device commands (T9).  Both carry a fixed-size, fixed-layout @c _IOWR
+     * struct, so the contract here is deliberately narrow: the spine hands the
+     * hook the in-bound copy of the argument struct and a buffer to fill with
+     * the out-bound copy, both already sized and bounce-buffered by the FUSE
+     * layer (no @c FUSE_IOCTL_RETRY, no pointer chasing in the hook).
+     *
+     * @c in and @c out alias the @em same fixed-size region for an @c _IOWR
+     * command (read-modify-write); the hook reads its inputs from @p in, writes
+     * its outputs into @p out, and returns 0.  @p in_size / @p out_size are the
+     * byte counts the kernel granted (the caller's @c sizeof, clamped by the
+     * spine); a hook validates them against the struct prefix it requires and
+     * returns @c -EINVAL on a short/garbled buffer.  The @p cmd is the raw ioctl
+     * request number.
+     *
+     * Invoked by @ref emu_node_ioctl with the tree lock @em held and only after
+     * the liveness gate has passed, so a handler never races a revocation.
+     *
+     * @param node     The node the ioctl targets.
+     * @param backing  The node's @c backing pointer.
+     * @param cmd      The ioctl request number.
+     * @param in       Read-only view of the caller's argument struct.
+     * @param in_size  Bytes available at @p in.
+     * @param out      Buffer for the reply struct (may alias @p in).
+     * @param out_size Bytes available at @p out.
+     * @return 0 on success (then @p out holds the reply), or a negative errno.
+     */
+    int (*ioctl)(struct emu_node *node, void *backing, unsigned int cmd,
+                 const void *in, size_t in_size, void *out, size_t out_size);
+
+    /**
      * @brief Release the node's @c backing when the node is destroyed (optional).
      *
      * Called while the tree lock is @em held, exactly once, when the node is
@@ -540,6 +575,20 @@ int emu_node_create_child(struct emu_node_tree *tree, struct emu_node *parent,
                           struct emu_node **nodep);
 
 /**
+ * @brief Lock-held variant of @ref emu_node_create_child.
+ *
+ * Assumes the caller already holds @c tree->lock.  This is the entry point an
+ * @c ops->ioctl hook uses, since the spine invokes that hook with the lock
+ * already held (a public re-locking variant would deadlock the non-recursive
+ * mutex).  T8's QPAIR_ADD creates the @c qpair<Q> node through this.
+ */
+int emu_node_create_child_locked(struct emu_node_tree *tree,
+                                 struct emu_node *parent, const char *name,
+                                 enum emu_node_type type, mode_t mode,
+                                 const struct emu_node_ops *ops, void *backing,
+                                 struct emu_node **nodep);
+
+/**
  * @brief Unlink a single node from its parent (the delete-on-last-close primitive).
  *
  * Removes @p node from its parent's directory listing so it is no longer
@@ -565,6 +614,36 @@ int emu_node_create_child(struct emu_node_tree *tree, struct emu_node *parent,
 void emu_node_unlink(struct emu_node_tree *tree, struct emu_node *node);
 
 /**
+ * @brief Lock-held variant of @ref emu_node_unlink.
+ *
+ * Assumes the caller already holds @c tree->lock.  Used by an @c ops->ioctl
+ * hook to unwind a just-created node on an error path without deadlocking the
+ * non-recursive mutex (T8's QPAIR_ADD).
+ */
+void emu_node_unlink_locked(struct emu_node_tree *tree, struct emu_node *node);
+
+/**
+ * @brief Resolve a child by name within a directory and unlink it (FUSE unlink).
+ *
+ * The entry point the FUSE @c unlink op calls.  Resolves @p name under directory
+ * inode @p parent and unlinks the resulting @em file node via
+ * @ref emu_node_unlink (delete-on-last-close): if the kernel still holds the
+ * node open it survives as a nameless orphan until the final forget, otherwise
+ * it is reaped immediately.  This is the user-visible removal path -- the VRTD
+ * "unlink the @c qpair<Q> file while its fd is open" pattern and the
+ * prune-leftover-qpairs-on-startup pattern both ride it.
+ *
+ * @param tree   The tree.
+ * @param parent Parent directory inode.
+ * @param name   Entry name to unlink.
+ * @return 0 on success; @c -ENOENT if the parent or name does not exist;
+ *         @c -ENOTDIR if @p parent is not a directory; @c -EISDIR if the target
+ *         is a directory (only files are unlinkable here).
+ */
+int emu_node_unlink_child(struct emu_node_tree *tree, emu_ino_t parent,
+                          const char *name);
+
+/**
  * @brief Mark a file node as requiring unbuffered (direct) I/O.
  *
  * Sets @ref emu_node::direct_io so the FUSE layer opens the file with
@@ -575,6 +654,36 @@ void emu_node_unlink(struct emu_node_tree *tree, struct emu_node *node);
  * @param node The file node to mark (must belong to @p tree).
  */
 void emu_node_set_direct_io(struct emu_node_tree *tree, struct emu_node *node);
+
+/**
+ * @brief Attach an ops vtable + backing to an already-created node.
+ *
+ * @ref emu_node_create_child wires ops/backing at creation time, but the
+ * per-device @c bars/ and @c qdma/ directory nodes are materialized by
+ * @ref emu_node_tree_add_device before any endpoint exists.  This lets an
+ * endpoint (T8's @c emu_qdma_attach) attach a command vtable -- e.g. the
+ * @c QPAIR_ADD ioctl hook -- onto the @c qdma/ directory after the fact.  The
+ * node must not already own ops/backing (one owner only); ownership of
+ * @p backing then follows @p ops->destroy exactly as for a created node.
+ *
+ * @param tree    The tree (for locking).
+ * @param node    The node to attach to (must belong to @p tree).
+ * @param ops     Per-node ops hook (borrowed, may be NULL).
+ * @param backing Endpoint backing (ownership per @p ops->destroy, may be NULL).
+ * @return 0 on success, -1 on error (node already has ops or backing).
+ */
+int emu_node_set_ops(struct emu_node_tree *tree, struct emu_node *node,
+                     const struct emu_node_ops *ops, void *backing);
+
+/**
+ * @brief Lock-held variant of @ref emu_node_set_direct_io.
+ *
+ * Assumes the caller already holds @c tree->lock.  Used by an @c ops->ioctl
+ * hook (T8's QPAIR_ADD) to mark the freshly-created @c qpair<Q> file for
+ * unbuffered I/O without re-locking.
+ */
+void emu_node_set_direct_io_locked(struct emu_node_tree *tree,
+                                   struct emu_node *node);
 
 /**
  * @brief Query whether a file node requested unbuffered (direct) I/O.
@@ -725,6 +834,33 @@ ssize_t emu_node_pread(struct emu_node_tree *tree, emu_ino_t ino, char *buf,
 ssize_t emu_node_pwrite(struct emu_node_tree *tree, emu_ino_t ino,
                         const char *buf, size_t size, off_t off);
 
+/**
+ * @brief Dispatch an ioctl to a node's @c ops->ioctl hook.
+ *
+ * The single entry point the FUSE @c ioctl op calls, the ioctl sibling of
+ * @ref emu_node_pread / @ref emu_node_pwrite.  Under the tree lock it resolves
+ * @p ino, enforces the liveness gate (a revoked endpoint yields @c -ENODEV even
+ * on an already-open fd), and forwards to the node's @c ops->ioctl.  Performing
+ * the liveness check and the dispatch under one lock acquisition makes them
+ * atomic with respect to @ref emu_device_revoke.
+ *
+ * The buffers are the FUSE layer's already-bounced fixed-size copies (see
+ * @ref emu_node_ops::ioctl); @p in and @p out may alias for an @c _IOWR command.
+ *
+ * @param tree     The tree.
+ * @param ino      Inode the ioctl targets.
+ * @param cmd      The ioctl request number.
+ * @param in       Read-only view of the caller's argument struct.
+ * @param in_size  Bytes available at @p in.
+ * @param out      Buffer for the reply struct (may alias @p in).
+ * @param out_size Bytes available at @p out.
+ * @return 0 on success; @c -ENOENT if the inode does not exist; @c -ENODEV if it
+ *         has been revoked; @c -ENOTTY if the node has no ioctl hook; or any
+ *         negative errno the hook returns.
+ */
+int emu_node_ioctl(struct emu_node_tree *tree, emu_ino_t ino, unsigned int cmd,
+                   const void *in, size_t in_size, void *out, size_t out_size);
+
 /* ------------------------------------------------------------------ */
 /* Per-device registry + refcounted resources (qpair lifetime, T8)    */
 /* ------------------------------------------------------------------ */
@@ -752,6 +888,18 @@ int emu_device_register_resource(struct emu_device *dev, uint32_t id,
                                  void *backing, struct emu_resource **resp);
 
 /**
+ * @brief Lock-held variant of @ref emu_device_register_resource.
+ *
+ * Assumes the caller already holds @c tree->lock.  Used from an @c ops->ioctl
+ * hook (T8's QPAIR_ADD) to register the qpair resource without re-locking.
+ */
+int emu_device_register_resource_locked(struct emu_device *dev, uint32_t id,
+                                        emu_resource_teardown_fn teardown,
+                                        emu_resource_free_fn free_backing,
+                                        void *backing,
+                                        struct emu_resource **resp);
+
+/**
  * @brief Find a registered resource by id.
  * @param dev The device.
  * @param id  The resource id (QID).
@@ -759,6 +907,15 @@ int emu_device_register_resource(struct emu_device *dev, uint32_t id,
  */
 struct emu_resource *emu_device_find_resource(struct emu_device *dev,
                                               uint32_t id);
+
+/**
+ * @brief Lock-held variant of @ref emu_device_find_resource.
+ *
+ * Assumes the caller already holds @c tree->lock.  Used from an @c ops->ioctl
+ * hook (T8's QID allocator) to probe the registry without re-locking.
+ */
+struct emu_resource *emu_device_find_resource_locked(struct emu_device *dev,
+                                                     uint32_t id);
 
 /**
  * @brief Attach a resource to a node, taking an inode-side reference.
@@ -776,12 +933,32 @@ int emu_node_attach_resource(struct emu_node_tree *tree, struct emu_node *node,
                              struct emu_resource *res);
 
 /**
+ * @brief Lock-held variant of @ref emu_node_attach_resource.
+ *
+ * Assumes the caller already holds @c tree->lock.  Used from an @c ops->ioctl
+ * hook (T8's QPAIR_ADD) to take the inode reference without re-locking.
+ */
+int emu_node_attach_resource_locked(struct emu_node_tree *tree,
+                                    struct emu_node *node,
+                                    struct emu_resource *res);
+
+/**
  * @brief Liveness check for an op on an open resource handle (e.g. qpair fd).
  * @param tree The tree (for locking).
  * @param res  The resource the op targets.
  * @return 0 if live; -ENODEV if torn down / revoked.
  */
 int emu_resource_check(struct emu_node_tree *tree, struct emu_resource *res);
+
+/**
+ * @brief Lock-held variant of @ref emu_resource_check.
+ *
+ * Assumes the caller already holds @c tree->lock.  Used from the qpair
+ * @c read / @c write hooks (T8), which the spine invokes with the lock already
+ * held, to consult the resource's authoritative liveness without re-locking.
+ */
+int emu_resource_check_locked(struct emu_node_tree *tree,
+                              struct emu_resource *res);
 
 /* ------------------------------------------------------------------ */
 /* Revocation (forced removal -- the keystone for T9)                 */

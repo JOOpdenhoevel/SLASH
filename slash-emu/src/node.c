@@ -433,17 +433,15 @@ struct emu_device *emu_node_tree_find_device(struct emu_node_tree *tree,
     return find_device_locked(tree, bdf);
 }
 
-int emu_node_create_child(struct emu_node_tree *tree, struct emu_node *parent,
-                          const char *name, enum emu_node_type type, mode_t mode,
-                          const struct emu_node_ops *ops, void *backing,
-                          struct emu_node **nodep)
+int emu_node_create_child_locked(struct emu_node_tree *tree,
+                                 struct emu_node *parent, const char *name,
+                                 enum emu_node_type type, mode_t mode,
+                                 const struct emu_node_ops *ops, void *backing,
+                                 struct emu_node **nodep)
 {
     if (tree == NULL || parent == NULL || name == NULL) {
         return -1;
     }
-
-    tree_lock(tree);
-    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
 
     if (parent->type != EMU_NODE_DIR) {
         LOG(LOG_ERR, "Parent of '%s' is not a directory", name);
@@ -467,6 +465,32 @@ int emu_node_create_child(struct emu_node_tree *tree, struct emu_node *parent,
     return 0;
 }
 
+int emu_node_create_child(struct emu_node_tree *tree, struct emu_node *parent,
+                          const char *name, enum emu_node_type type, mode_t mode,
+                          const struct emu_node_ops *ops, void *backing,
+                          struct emu_node **nodep)
+{
+    if (tree == NULL) {
+        return -1;
+    }
+
+    tree_lock(tree);
+    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
+
+    return emu_node_create_child_locked(tree, parent, name, type, mode, ops,
+                                        backing, nodep);
+}
+
+void emu_node_set_direct_io_locked(struct emu_node_tree *tree,
+                                   struct emu_node *node)
+{
+    (void) tree;
+    if (node == NULL) {
+        return;
+    }
+    node->direct_io = true;
+}
+
 void emu_node_set_direct_io(struct emu_node_tree *tree, struct emu_node *node)
 {
     if (tree == NULL || node == NULL) {
@@ -477,6 +501,27 @@ void emu_node_set_direct_io(struct emu_node_tree *tree, struct emu_node *node)
     _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
 
     node->direct_io = true;
+}
+
+int emu_node_set_ops(struct emu_node_tree *tree, struct emu_node *node,
+                     const struct emu_node_ops *ops, void *backing)
+{
+    if (tree == NULL || node == NULL) {
+        return -1;
+    }
+
+    tree_lock(tree);
+    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
+
+    if (node->ops != NULL || node->backing != NULL) {
+        LOG(LOG_ERR, "Node '%s' already has ops/backing", node->name);
+        return -1;
+    }
+
+    node->ops = ops;
+    node->backing = backing;
+
+    return 0;
 }
 
 bool emu_node_wants_direct_io(struct emu_node_tree *tree, emu_ino_t ino)
@@ -564,17 +609,15 @@ static void resource_unregister_locked(struct emu_resource *res)
     }
 }
 
-int emu_device_register_resource(struct emu_device *dev, uint32_t id,
-                                 emu_resource_teardown_fn teardown,
-                                 emu_resource_free_fn free_backing,
-                                 void *backing, struct emu_resource **resp)
+int emu_device_register_resource_locked(struct emu_device *dev, uint32_t id,
+                                        emu_resource_teardown_fn teardown,
+                                        emu_resource_free_fn free_backing,
+                                        void *backing,
+                                        struct emu_resource **resp)
 {
     if (dev == NULL || dev->tree == NULL) {
         return -1;
     }
-
-    tree_lock(dev->tree);
-    _cleanup_(tree_unlockp) struct emu_node_tree *guard = dev->tree;
 
     if (!dev->live) {
         LOG(LOG_ERR, "Cannot register resource on revoked device '%s'",
@@ -609,6 +652,38 @@ int emu_device_register_resource(struct emu_device *dev, uint32_t id,
     return 0;
 }
 
+int emu_device_register_resource(struct emu_device *dev, uint32_t id,
+                                 emu_resource_teardown_fn teardown,
+                                 emu_resource_free_fn free_backing,
+                                 void *backing, struct emu_resource **resp)
+{
+    if (dev == NULL || dev->tree == NULL) {
+        return -1;
+    }
+
+    tree_lock(dev->tree);
+    _cleanup_(tree_unlockp) struct emu_node_tree *guard = dev->tree;
+
+    return emu_device_register_resource_locked(dev, id, teardown, free_backing,
+                                               backing, resp);
+}
+
+struct emu_resource *emu_device_find_resource_locked(struct emu_device *dev,
+                                                     uint32_t id)
+{
+    if (dev == NULL) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < dev->registry.len; i++) {
+        if (dev->registry.d[i]->id == id) {
+            return dev->registry.d[i];
+        }
+    }
+
+    return NULL;
+}
+
 struct emu_resource *emu_device_find_resource(struct emu_device *dev,
                                               uint32_t id)
 {
@@ -619,13 +694,27 @@ struct emu_resource *emu_device_find_resource(struct emu_device *dev,
     tree_lock(dev->tree);
     _cleanup_(tree_unlockp) struct emu_node_tree *guard = dev->tree;
 
-    for (size_t i = 0; i < dev->registry.len; i++) {
-        if (dev->registry.d[i]->id == id) {
-            return dev->registry.d[i];
-        }
+    return emu_device_find_resource_locked(dev, id);
+}
+
+int emu_node_attach_resource_locked(struct emu_node_tree *tree,
+                                    struct emu_node *node,
+                                    struct emu_resource *res)
+{
+    (void) tree;
+    if (node == NULL || res == NULL) {
+        return -1;
     }
 
-    return NULL;
+    if (node->resource != NULL) {
+        LOG(LOG_ERR, "Node '%s' already has a resource", node->name);
+        return -1;
+    }
+
+    node->resource = res;
+    res->refcount++; /* the inode reference */
+
+    return 0;
 }
 
 int emu_node_attach_resource(struct emu_node_tree *tree, struct emu_node *node,
@@ -638,15 +727,17 @@ int emu_node_attach_resource(struct emu_node_tree *tree, struct emu_node *node,
     tree_lock(tree);
     _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
 
-    if (node->resource != NULL) {
-        LOG(LOG_ERR, "Node '%s' already has a resource", node->name);
-        return -1;
+    return emu_node_attach_resource_locked(tree, node, res);
+}
+
+int emu_resource_check_locked(struct emu_node_tree *tree,
+                              struct emu_resource *res)
+{
+    (void) tree;
+    if (res == NULL) {
+        return -ENODEV;
     }
-
-    node->resource = res;
-    res->refcount++; /* the inode reference */
-
-    return 0;
+    return res->live ? 0 : -ENODEV;
 }
 
 int emu_resource_check(struct emu_node_tree *tree, struct emu_resource *res)
@@ -703,14 +794,11 @@ static void node_destroy_locked(struct emu_node_tree *tree,
     emu_node_owning_array_rm_by_reference(&tree->nodes, node);
 }
 
-void emu_node_unlink(struct emu_node_tree *tree, struct emu_node *node)
+void emu_node_unlink_locked(struct emu_node_tree *tree, struct emu_node *node)
 {
     if (tree == NULL || node == NULL) {
         return;
     }
-
-    tree_lock(tree);
-    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
 
     if (node->unlinked) {
         return;
@@ -734,6 +822,52 @@ void emu_node_unlink(struct emu_node_tree *tree, struct emu_node *node)
     } else {
         node->parent = NULL;
     }
+}
+
+void emu_node_unlink(struct emu_node_tree *tree, struct emu_node *node)
+{
+    if (tree == NULL || node == NULL) {
+        return;
+    }
+
+    tree_lock(tree);
+    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
+
+    emu_node_unlink_locked(tree, node);
+}
+
+int emu_node_unlink_child(struct emu_node_tree *tree, emu_ino_t parent,
+                          const char *name)
+{
+    if (tree == NULL || name == NULL) {
+        return -EINVAL;
+    }
+
+    tree_lock(tree);
+    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
+
+    struct emu_node *pnode = find_ino_locked(tree, parent);
+    if (pnode == NULL) {
+        return -ENOENT;
+    }
+    if (pnode->type != EMU_NODE_DIR) {
+        return -ENOTDIR;
+    }
+
+    struct emu_node *child = find_child_locked(pnode, name);
+    if (child == NULL) {
+        return -ENOENT;
+    }
+
+    /* Only files are unlinkable via this path (the qpair<Q> case); the endpoint
+     * directories are removed via revocation, not user unlink. */
+    if (child->type != EMU_NODE_FILE) {
+        return -EISDIR;
+    }
+
+    emu_node_unlink_locked(tree, child);
+
+    return 0;
 }
 
 /* ================================================================== */
@@ -950,6 +1084,35 @@ ssize_t emu_node_pwrite(struct emu_node_tree *tree, emu_ino_t ino,
     }
 
     return node->ops->write(node, node->backing, buf, size, off);
+}
+
+int emu_node_ioctl(struct emu_node_tree *tree, emu_ino_t ino, unsigned int cmd,
+                   const void *in, size_t in_size, void *out, size_t out_size)
+{
+    if (tree == NULL) {
+        return -EINVAL;
+    }
+
+    tree_lock(tree);
+    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
+
+    struct emu_node *node = find_ino_locked(tree, ino);
+    if (node == NULL) {
+        return -ENOENT;
+    }
+
+    /* Liveness gate: a revoked endpoint returns -ENODEV on an open fd. */
+    if (!node->live) {
+        return -ENODEV;
+    }
+
+    if (node->ops == NULL || node->ops->ioctl == NULL) {
+        /* No command vtable: the canonical "inappropriate ioctl" errno. */
+        return -ENOTTY;
+    }
+
+    return node->ops->ioctl(node, node->backing, cmd, in, in_size, out,
+                            out_size);
 }
 
 /* ================================================================== */

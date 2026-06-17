@@ -120,3 +120,42 @@ target_link_libraries(bars_adversarial_test PRIVATE slash_emu_core)
 slash_emu_add_test(bars_oom_test bars_oom_test.cpp)
 target_link_libraries(bars_oom_test PRIVATE slash_emu_core)
 target_link_options(bars_oom_test PRIVATE -Wl,--wrap=calloc)
+
+# qdma endpoint (T8): unit (the emu_qdma_check_range + emu_qdma_check_qpair_add
+# validation matrices, plus the full qpair lifecycle through the spine -- QID
+# allocation, MM round-trip into HBM/DDR, out-of-range rejection, nameless-qpair
+# lifecycle, forced/cooperative teardown idempotency, per-device isolation,
+# against slash_emu_core) and integration (QPAIR_ADD ioctl + qpair pread/pwrite,
+# unlink-while-open VRTD pattern, readdir visibility over the real FUSE mount).
+slash_emu_add_test(qdma_test qdma_test.cpp)
+target_link_libraries(qdma_test PRIVATE slash_emu_core)
+
+# Adversarial T8 conformance suite: the destructive counterpart of qdma_test.
+# Hammers the _locked spine refactor (QPAIR_ADD's whole create/register/attach/
+# set_direct_io chain under the held non-recursive lock -- self-deadlock watchdog
+# + per-tree concurrency stress + public/locked equivalence), the ioctl buffer
+# matrix (short/oversized/zero in&out, unknown cmd, unknown-inode -ENOENT, post-
+# revoke -ENODEV, malformed dir_mask/ring), the full qpair lifecycle matrix
+# (cooperative-exactly-once, forced -ENODEV, double-teardown, unlink-not-open,
+# unlink-dir -EISDIR / non-dir-parent -ENOTDIR, QID reuse-after-free), the sparse
+# store (multi-page straddle, exhaustive -ERANGE incl. reconfig+overflow, lazy
+# alloc RSS witness, destroy-frees-once ASan), the T10 mem-backend rc-contract
+# via a fake backend (rc==0 model / rc>0 store fallback / rc<0 -ENODEV; populate
+# keeps store current), and the qpair direct_io flag.  Per-test ctest TIMEOUTs so
+# a deadlock fails the suite rather than blocking it (the Watchdog is the inner
+# guard, the ctest TIMEOUT the outer backstop).
+add_executable(qdma_adversarial_test qdma_adversarial_test.cpp)
+target_link_libraries(qdma_adversarial_test PRIVATE GTest::gtest_main slash_emu_core)
+set_target_properties(qdma_adversarial_test PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED YES
+)
+target_compile_definitions(qdma_adversarial_test PRIVATE
+  SLASH_EMUD_PATH="$<TARGET_FILE:slash-emud>"
+  SLASH_EMU_TMP_DIR="${SLASH_EMU_TMP_DIR}"
+)
+# Per-test ctest TIMEOUT: a self-deadlock in the _locked chain must FAIL the
+# suite, never block it.  60s is far above the healthy runtime (<1s) yet below
+# any reasonable CI wall-clock; the in-test Watchdog (setitimer) is the faster
+# inner guard.
+gtest_discover_tests(qdma_adversarial_test PROPERTIES TIMEOUT 60)

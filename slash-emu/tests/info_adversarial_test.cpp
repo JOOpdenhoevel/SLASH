@@ -91,10 +91,7 @@ void counting_destroy(struct emu_node *node, void *backing)
 }
 
 const struct emu_node_ops kCountingOps = {
-    /* .size    = */ nullptr,
-    /* .read    = */ nullptr,
-    /* .write   = */ nullptr,
-    /* .destroy = */ counting_destroy,
+    .destroy = counting_destroy,
 };
 
 // Helper: attach a counting-destroy file node under `parent`, wiring its

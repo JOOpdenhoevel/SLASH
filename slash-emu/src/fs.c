@@ -47,6 +47,7 @@
 #include "config.h"
 #include "info.h"
 #include "node.h"
+#include "qdma.h"
 #include "utils.h"
 
 /*
@@ -316,14 +317,110 @@ static void emu_op_open(fuse_req_t req, fuse_ino_t ino,
     (void) fuse_reply_open(req, fi);
 }
 
+/*
+ * Serve an ioctl by dispatching to the target node's ops->ioctl hook via
+ * emu_node_ioctl (the ioctl sibling of emu_op_read/emu_op_write, with the same
+ * liveness gate: a revoked endpoint returns -ENODEV).  The qdma/ directory's
+ * QPAIR_ADD (T8) and, later, the hotplug file's device commands (T9) ride this.
+ *
+ * FUSE low-level ioctl protocol, and how we handle its quirks for a fixed-size
+ * _IOWR struct:
+ *
+ *   - Restricted (the default): we do NOT set FUSE_IOCTL_UNRESTRICTED, so the
+ *     kernel parses the _IOC encoding of `cmd` itself and bounce-buffers the
+ *     payload for us.  `in_buf`/`in_bufsz` carry the caller's argument bytes
+ *     (for _IOC_WRITE/_IOWR); `out_bufsz` is the room the kernel reserved for
+ *     the reply (for _IOC_READ/_IOWR).  Because the size is encoded in `cmd`
+ *     and matched to the caller's struct, a single round-trip suffices: there
+ *     is no FUSE_IOCTL_RETRY dance (that is only needed when the daemon must
+ *     itself describe the in/out iovecs for an unrestricted ioctl, which we
+ *     never do, so the kernel never asks us to retry inbound).
+ *
+ *   - Buffers: the kernel already copied the caller's struct in and will copy
+ *     our reply struct out, so the hook works purely on these daemon-side
+ *     bounce buffers and never touches the caller's address space.  For the
+ *     _IOWR QPAIR_ADD the same fixed-size region is both read (inputs) and
+ *     written (the allocated qid), so we hand the hook `in` for inputs and a
+ *     separate zeroed reply buffer for outputs, then reply with the reply
+ *     buffer clamped to `out_bufsz` (a shorter-struct caller gets the prefix it
+ *     asked for -- the same one-directional size-versioning the ABI uses).
+ *
+ *   - Compat (32-bit caller on a 64-bit kernel): the structs here are fixed
+ *     __u32 layouts with identical 32/64-bit representations, but we still
+ *     reject FUSE_IOCTL_COMPAT to avoid silently mishandling any future struct
+ *     with pointer/long members.
+ */
+static void emu_op_ioctl(fuse_req_t req, fuse_ino_t ino, unsigned int cmd,
+                         void *arg, struct fuse_file_info *fi,
+                         unsigned int flags, const void *in_buf,
+                         size_t in_bufsz, size_t out_bufsz)
+{
+    (void) arg;
+    (void) fi;
+
+    if (flags & FUSE_IOCTL_COMPAT) {
+        (void) fuse_reply_err(req, ENOSYS);
+        return;
+    }
+
+    /*
+     * Reply buffer for the out direction.  Cap it so a malformed/huge out_bufsz
+     * cannot make us allocate unboundedly; the real commands are small fixed
+     * structs.  We seed it from the in buffer so an _IOWR hook that only fills
+     * specific out fields leaves the rest as the caller supplied (then the hook
+     * overwrites what it owns).
+     */
+    enum { EMU_IOCTL_MAX = 4096 };
+    if (out_bufsz > EMU_IOCTL_MAX || in_bufsz > EMU_IOCTL_MAX) {
+        (void) fuse_reply_err(req, EINVAL);
+        return;
+    }
+
+    _cleanup_(cleanup_free)
+    char *out = out_bufsz != 0 ? calloc(1, out_bufsz) : NULL;
+    if (out_bufsz != 0 && out == NULL) {
+        (void) fuse_reply_err(req, ENOMEM);
+        return;
+    }
+    if (out != NULL) {
+        size_t seed = in_bufsz < out_bufsz ? in_bufsz : out_bufsz;
+        memcpy(out, in_buf, seed);
+    }
+
+    int ret = emu_node_ioctl(fs_of(req)->tree, ino, cmd, in_buf, in_bufsz, out,
+                             out_bufsz);
+    if (ret != 0) {
+        (void) fuse_reply_err(req, -ret);
+        return;
+    }
+
+    (void) fuse_reply_ioctl(req, 0, out, out_bufsz);
+}
+
+/*
+ * Serve an unlink by resolving (parent, name) and unlinking the file node via
+ * emu_node_unlink_child (delete-on-last-close).  This is the VRTD pattern's
+ * removal step -- unlink the qpair<Q> file while its fd is open so it becomes a
+ * nameless orphan that lives until the holder closes it -- and the path by which
+ * VRTD prunes leftover named qpairs on startup.  Only files are unlinkable; the
+ * endpoint directories are removed by revocation, not user unlink.
+ */
+static void emu_op_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
+{
+    int ret = emu_node_unlink_child(fs_of(req)->tree, parent, name);
+    (void) fuse_reply_err(req, ret == 0 ? 0 : -ret);
+}
+
 static const struct fuse_lowlevel_ops emu_fs_ops = {
     .lookup = emu_op_lookup,
     .forget = emu_op_forget,
+    .unlink = emu_op_unlink,
     .getattr = emu_op_getattr,
     .readdir = emu_op_readdir,
     .open = emu_op_open,
     .read = emu_op_read,
     .write = emu_op_write,
+    .ioctl = emu_op_ioctl,
 };
 
 /*
@@ -440,6 +537,12 @@ static int emu_fs_materialize(struct emu_fs *fs)
 
         if (emu_bars_attach(dev) == -1) {
             LOG(LOG_ERR, "Failed to attach bars endpoint for '%s'", acc->bdf);
+            emu_accelerator_ref_array_free(&selected);
+            return -1;
+        }
+
+        if (emu_qdma_attach(dev) == -1) {
+            LOG(LOG_ERR, "Failed to attach qdma endpoint for '%s'", acc->bdf);
             emu_accelerator_ref_array_free(&selected);
             return -1;
         }

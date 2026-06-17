@@ -44,6 +44,7 @@
 #include <systemd/sd-event.h>
 
 #include "config.h"
+#include "info.h"
 #include "node.h"
 #include "utils.h"
 
@@ -230,11 +231,41 @@ static void emu_op_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
     (void) fuse_reply_buf(req, buf, ctx.used);
 }
 
+/*
+ * Serve a positioned read by dispatching to the target node's ops->read hook
+ * via emu_node_pread (which enforces the liveness gate: a revoked endpoint
+ * returns -ENODEV on an already-open fd).  The node layer implements pread(2)
+ * semantics -- a short read near EOF, and a zero-length reply at/after EOF --
+ * so we pass libfuse exactly the bytes it produced.  Endpoint files (info,
+ * bar<M>, qpair<Q>) supply the read hook; a file without one yields -EIO.
+ */
+static void emu_op_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
+                        struct fuse_file_info *fi)
+{
+    (void) fi;
+
+    _cleanup_(cleanup_free)
+    char *buf = malloc(size != 0 ? size : 1);
+    if (buf == NULL) {
+        (void) fuse_reply_err(req, ENOMEM);
+        return;
+    }
+
+    ssize_t n = emu_node_pread(fs_of(req)->tree, ino, buf, size, off);
+    if (n < 0) {
+        (void) fuse_reply_err(req, (int) -n);
+        return;
+    }
+
+    (void) fuse_reply_buf(req, buf, (size_t) n);
+}
+
 static const struct fuse_lowlevel_ops emu_fs_ops = {
     .lookup = emu_op_lookup,
     .forget = emu_op_forget,
     .getattr = emu_op_getattr,
     .readdir = emu_op_readdir,
+    .read = emu_op_read,
 };
 
 /*
@@ -331,11 +362,24 @@ static int emu_fs_materialize(struct emu_fs *fs)
 
     for (size_t i = 0; i < selected.len; i++) {
         const struct emu_accelerator *acc = selected.d[i];
-        if (emu_node_tree_add_device(fs->tree, acc->bdf, NULL) == -1) {
+        struct emu_device *dev = NULL;
+        if (emu_node_tree_add_device(fs->tree, acc->bdf, &dev) == -1) {
             LOG(LOG_ERR, "Failed to materialize accelerator '%s'", acc->bdf);
             emu_accelerator_ref_array_free(&selected);
             return -1;
         }
+
+        /*
+         * Attach the per-device endpoints under the freshly-built subtree.  The
+         * info file is first; bars/qdma/hotplug (T7-T9) attach here too, each
+         * via its own emu_<endpoint>_attach following the same pattern.
+         */
+        if (emu_info_attach(dev) == -1) {
+            LOG(LOG_ERR, "Failed to attach info endpoint for '%s'", acc->bdf);
+            emu_accelerator_ref_array_free(&selected);
+            return -1;
+        }
+
         LOG(LOG_INFO, "Materialized accelerator '%s'", acc->bdf);
     }
 

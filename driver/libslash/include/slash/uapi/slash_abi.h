@@ -96,18 +96,21 @@
 /**
  * @brief Binary information returned by reading @c /dev/slash/<BDF>/info.
  *
- * The file is read-only.  The caller performs a single @c read(2) of at least
- * @c sizeof(struct slash_info) bytes.  New fields will be appended in future
- * ABI revisions; set and check @c size for compatibility.
+ * The file is read-only.  The caller performs a single @c read(2); the file
+ * size equals @c sizeof(struct slash_info) as known to the producer.  New
+ * fields are only ever appended in future ABI revisions, so a caller reads as
+ * many bytes as it understands and uses @c size to learn how much was actually
+ * populated.
  */
 struct slash_info {
     /**
-     * [in/out] ABI version / struct size.
+     * [out] ABI version / struct size.
      *
-     * Caller must set this to @c sizeof(struct slash_info) before the read.
-     * On return the kernel writes back the size of the struct *it* populated,
-     * which may be smaller (older kernel) or equal (matched version).  The
-     * caller must not access fields beyond the returned @c size.
+     * The producer sets this to the size of the struct *it* populated.  Unlike
+     * an ioctl, a plain @c read(2) has no input channel, so the caller does not
+     * (and cannot) pass a size in: it simply reads up to its own
+     * @c sizeof(struct slash_info), and a short read yields a valid prefix.
+     * The caller must not access fields beyond the returned @c size.
      */
     __u32 size;
 

@@ -36,7 +36,7 @@ What can be implemented thread-safe should be implemented thread-safe.
 #define SLASH_PCI_BDF_LEN 32
 
 struct slash_info {
-    __u32 size;                   /* [in/out] ABI version */
+    __u32 size;                   /* [out] ABI version (size populated; read(2) has no [in] channel) */
     __u32 acc_type;               /* [out] Bitflags describing the accelerator type. Currently: 0x1: System-Emulated */
     char  bdf[SLASH_PCI_BDF_LEN]; /* [out] PCI BDF string without function, NUL-terminated, e.g. "0000:61:00" */
 };

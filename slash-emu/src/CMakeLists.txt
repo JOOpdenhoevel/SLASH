@@ -29,6 +29,7 @@ set(SLASH_EMU_WARNING_FLAGS -Wall -Wextra -Werror)
 add_library(slash_emu_core STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/config.c
   ${CMAKE_CURRENT_SOURCE_DIR}/fs.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/info.c
   ${CMAKE_CURRENT_SOURCE_DIR}/node.c
 )
 
@@ -37,6 +38,10 @@ target_compile_options(slash_emu_core PRIVATE ${SLASH_EMU_WARNING_FLAGS})
 target_include_directories(slash_emu_core
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    # Shared user/kernel ABI (struct slash_info, SLASH_ACC_TYPE_*, ...).  The
+    # endpoints serve the exact UAPI structs callers consume, so we include the
+    # canonical libslash UAPI headers rather than copying definitions.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../driver/libslash/include
 )
 
 target_link_libraries(slash_emu_core

@@ -156,6 +156,33 @@ struct emu_node_ops {
     off_t (*size)(const struct emu_node *node, void *backing);
 
     /**
+     * @brief Serve a positioned read against a file node (optional).
+     *
+     * Implements @c pread(2) semantics for the endpoint: copy up to @p size
+     * bytes starting at byte offset @p off into @p buf and return the number of
+     * bytes produced.  A read wholly at or past EOF returns 0; a read straddling
+     * EOF returns the available prefix (a short read).  Reads are idempotent and
+     * carry no [in] size word -- unlike the ioctl structs, a plain @c read(2) has
+     * no place to deliver the caller's @c sizeof, so size-based ABI versioning is
+     * one-directional here: the file content always reflects the daemon's current
+     * struct, and an older reader simply takes the prefix it asked for (see the
+     * @c info endpoint for the full rationale).
+     *
+     * Invoked by @ref emu_node_pread with the tree lock @em held and only after
+     * the liveness gate has passed, so a handler never races a revocation and may
+     * read its (immutable) @p backing without further locking.
+     *
+     * @param node    The node being read.
+     * @param backing The node's @c backing pointer.
+     * @param buf     Destination buffer (at least @p size bytes).
+     * @param size    Maximum number of bytes to produce.
+     * @param off     Starting byte offset (>= 0).
+     * @return Number of bytes copied (0 at/after EOF), or a negative errno.
+     */
+    ssize_t (*read)(const struct emu_node *node, void *backing, char *buf,
+                    size_t size, off_t off);
+
+    /**
      * @brief Release the node's @c backing when the node is destroyed (optional).
      *
      * Called while the tree lock is @em held, exactly once, when the node is
@@ -591,6 +618,28 @@ int emu_node_readdir(struct emu_node_tree *tree, emu_ino_t ino,
  * @return 0 if live; -ENODEV if revoked; -ENOENT if the inode does not exist.
  */
 int emu_node_is_live(struct emu_node_tree *tree, emu_ino_t ino);
+
+/**
+ * @brief Dispatch a positioned read to a file node's @c ops->read hook.
+ *
+ * The single entry point the FUSE @c read op calls.  Under the tree lock it
+ * resolves @p ino, enforces the liveness gate (a revoked endpoint yields
+ * @c -ENODEV even on an already-open fd), and forwards to the node's
+ * @c ops->read.  Performing the liveness check and the dispatch under one lock
+ * acquisition makes them atomic with respect to @ref emu_device_revoke.
+ *
+ * @param tree    The tree.
+ * @param ino     Inode the read targets.
+ * @param buf     Destination buffer (at least @p size bytes).
+ * @param size    Maximum number of bytes to produce.
+ * @param off     Starting byte offset (>= 0).
+ * @return Bytes copied (0 at/after EOF) on success; @c -ENOENT if the inode does
+ *         not exist; @c -ENODEV if it has been revoked; @c -EINVAL on a bad
+ *         argument or an offset below zero; @c -EIO if the node has no read hook;
+ *         or any negative errno the hook returns.
+ */
+ssize_t emu_node_pread(struct emu_node_tree *tree, emu_ino_t ino, char *buf,
+                       size_t size, off_t off);
 
 /* ------------------------------------------------------------------ */
 /* Per-device registry + refcounted resources (qpair lifetime, T8)    */

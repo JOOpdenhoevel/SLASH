@@ -78,3 +78,19 @@ target_link_libraries(node_revocation_test PRIVATE slash_emu_core)
 # End-to-end: the spine materializes the configured device tree over the real
 # FUSE mount (lookup / getattr / readdir wired to the node model).
 slash_emu_add_test(fs_tree_test fs_tree_test.cpp)
+
+# info endpoint (T6): unit (pread/offset math + struct population and the
+# read-dispatch liveness gate, against slash_emu_core) and integration (read
+# /<BDF>/info over the real FUSE mount).
+slash_emu_add_test(info_test info_test.cpp)
+target_link_libraries(info_test PRIVATE slash_emu_core)
+
+# Adversarial T6 conformance suite: the destructive counterpart of info_test.
+# Hammers the SPINE touches that shipped with the info endpoint -- the
+# cleanup_node_tree destroy-hook pass (exactly-once / no double-destroy across
+# the cooperative / revoke-orphan / normal paths and orthogonality vs the T5
+# resource passes), the emu_node_pread error matrix + check/read atomicity, the
+# info pread/struct semantics + per-device isolation, and emu_info_attach
+# ownership / failure paths.
+slash_emu_add_test(info_adversarial_test info_adversarial_test.cpp)
+target_link_libraries(info_adversarial_test PRIVATE slash_emu_core)

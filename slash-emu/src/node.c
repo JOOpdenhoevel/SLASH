@@ -283,6 +283,24 @@ void cleanup_node_tree(struct emu_node_tree *tree)
         tree->nodes.d[i]->resource = NULL;
     }
 
+    /*
+     * Honour the per-node destroy hook for every surviving node before the shells
+     * are freed.  The cooperative/forced teardown paths (node_destroy_locked) run
+     * ops->destroy themselves, but a plain shutdown frees node shells directly via
+     * the owning array, which does not -- so endpoint backings (e.g. the info
+     * struct, T6) would otherwise leak.  Running it here, exactly once per node,
+     * is the shutdown counterpart of node_destroy_locked's hook call.  Clear the
+     * hook/backing afterwards so nothing can fire twice.
+     */
+    for (size_t i = 0; i < tree->nodes.len; i++) {
+        struct emu_node *node = tree->nodes.d[i];
+        if (node->ops != NULL && node->ops->destroy != NULL) {
+            node->ops->destroy(node, node->backing);
+        }
+        node->ops = NULL;
+        node->backing = NULL;
+    }
+
     emu_node_owning_array_free(&tree->nodes);
     emu_device_owning_array_free(&tree->devices);
 
@@ -853,6 +871,33 @@ int emu_node_is_live(struct emu_node_tree *tree, emu_ino_t ino)
     }
 
     return node->live ? 0 : -ENODEV;
+}
+
+ssize_t emu_node_pread(struct emu_node_tree *tree, emu_ino_t ino, char *buf,
+                       size_t size, off_t off)
+{
+    if (tree == NULL || buf == NULL || off < 0) {
+        return -EINVAL;
+    }
+
+    tree_lock(tree);
+    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
+
+    struct emu_node *node = find_ino_locked(tree, ino);
+    if (node == NULL) {
+        return -ENOENT;
+    }
+
+    /* Liveness gate: a revoked endpoint returns -ENODEV on an open fd. */
+    if (!node->live) {
+        return -ENODEV;
+    }
+
+    if (node->ops == NULL || node->ops->read == NULL) {
+        return -EIO;
+    }
+
+    return node->ops->read(node, node->backing, buf, size, off);
 }
 
 /* ================================================================== */

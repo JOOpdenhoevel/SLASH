@@ -261,3 +261,29 @@ int emu_bars_attach(struct emu_device *dev)
 
     return 0;
 }
+
+int emu_bars_set_backend(struct emu_device *dev,
+                         const struct emu_bar_backend *backend)
+{
+    if (dev == NULL || dev->bars == NULL) {
+        return -1;
+    }
+
+    /* The bars/ dir node's children are exactly the bar<M> files this endpoint
+     * created; set the backend on each one whose ops are ours.  No bar file
+     * created => the endpoint was not attached. */
+    bool found = false;
+    for (size_t i = 0; i < dev->bars->children.len; i++) {
+        struct emu_node *child = dev->bars->children.d[i];
+        if (child->ops != &emu_bar_ops) {
+            continue;
+        }
+        struct emu_bar_backing *b = child->backing;
+        if (b != NULL) {
+            b->backend = backend;
+            found = true;
+        }
+    }
+
+    return found ? 0 : -1;
+}

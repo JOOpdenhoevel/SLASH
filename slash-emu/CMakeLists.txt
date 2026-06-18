@@ -58,6 +58,10 @@ pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
 # silently ignored (see config.h and conf/slash-emu.conf).
 pkg_check_modules(INIH REQUIRED IMPORTED_TARGET inih)
 
+# libzmq (C API, zmq.h): the SIM bridge's daemon-side REQ client to the running
+# vpp_sim model (T10).  The daemon is C11, so we use the C API, not cppzmq.
+pkg_check_modules(ZMQ REQUIRED IMPORTED_TARGET libzmq)
+
 # enable_testing() at the top level so ctest discovers tests from the
 # top-level build dir (slash-emu/build).
 enable_testing()

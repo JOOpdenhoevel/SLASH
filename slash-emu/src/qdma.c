@@ -94,6 +94,10 @@ struct emu_qdma_store {
 
     /* SIM memory-bridge seam (T10).  NULL => in-memory sparse store only. */
     const struct emu_qdma_mem_backend *backend; /* non-owning, static */
+
+    /* Reconfiguration seam (T10): a write into the reconfig region is a VBIN. */
+    emu_qdma_reconfig_fn reconfig;     /* NULL => no reconfig handler attached */
+    void *reconfig_ctx;                /* borrowed (the device's emu_bridge) */
 };
 
 /* Find an existing page covering page-aligned address `base` (or NULL). */
@@ -233,6 +237,27 @@ int emu_qdma_check_range(uint64_t addr, size_t len)
     }
 
     return -ERANGE;
+}
+
+int emu_qdma_is_reconfig_write(uint64_t addr, size_t len)
+{
+    /* A zero-length write carries no VBIN: not a reconfiguration. */
+    if (len == 0) {
+        return 0;
+    }
+
+    /* Guard the end computation against overflow. */
+    uint64_t end = addr + (uint64_t) len;
+    if (end < addr) {
+        return 0;
+    }
+
+    /* The whole write must lie within the reconfiguration region. */
+    if (addr >= SLASH_RECONFIG_BASE && end <= SLASH_RECONFIG_END) {
+        return 1;
+    }
+
+    return 0;
 }
 
 int emu_qdma_check_qpair_add(uint32_t mode, uint32_t dir_mask,
@@ -401,6 +426,28 @@ static ssize_t qpair_write(const struct emu_node *node, void *backing,
     }
 
     uint64_t addr = (uint64_t) off;
+
+    /*
+     * Reconfiguration seam (T10): a write whose whole range lies in the reconfig
+     * region is (part of) a VBIN delivery, NOT an ordinary memory transfer.
+     * Detect it BEFORE the HBM/DDR range check (which still rejects the region
+     * with -ERANGE for reads and for the no-handler case), and route the bytes to
+     * the reconfiguration handler, which reassembles chunks the kernel split out
+     * of a large VBIN write.  A reconfig write with no handler attached is
+     * rejected with -ERANGE, exactly as the region would be without T10 -- the
+     * VBIN has nowhere to go.
+     */
+    if (emu_qdma_is_reconfig_write(addr, size)) {
+        if (b->store->reconfig == NULL) {
+            return -ERANGE;
+        }
+        rc = b->store->reconfig(b->store->reconfig_ctx, addr, buf, size);
+        if (rc != 0) {
+            return rc; /* negative errno from the handler (malformed VBIN, ...) */
+        }
+        return (ssize_t) size;
+    }
+
     rc = emu_qdma_check_range(addr, size);
     if (rc != 0) {
         return rc;
@@ -718,6 +765,24 @@ int emu_qdma_set_mem_backend(struct emu_device *dev,
     }
 
     d->store.backend = backend;
+
+    return 0;
+}
+
+int emu_qdma_set_reconfig_handler(struct emu_device *dev,
+                                  emu_qdma_reconfig_fn handler, void *ctx)
+{
+    if (dev == NULL || dev->qdma == NULL) {
+        return -1;
+    }
+
+    struct emu_qdma_dir_backing *d = dev->qdma->backing;
+    if (d == NULL) {
+        return -1;
+    }
+
+    d->store.reconfig = handler;
+    d->store.reconfig_ctx = ctx;
 
     return 0;
 }

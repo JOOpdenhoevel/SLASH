@@ -28,12 +28,15 @@ set(SLASH_EMU_WARNING_FLAGS -Wall -Wextra -Werror)
 # it directly (mirrors vrtd's vrtd_core split).
 add_library(slash_emu_core STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/bars.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/bridge.c
   ${CMAKE_CURRENT_SOURCE_DIR}/config.c
   ${CMAKE_CURRENT_SOURCE_DIR}/fs.c
   ${CMAKE_CURRENT_SOURCE_DIR}/hotplug.c
   ${CMAKE_CURRENT_SOURCE_DIR}/info.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/model_client.c
   ${CMAKE_CURRENT_SOURCE_DIR}/node.c
   ${CMAKE_CURRENT_SOURCE_DIR}/qdma.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/vbin.c
 )
 
 target_compile_options(slash_emu_core PRIVATE ${SLASH_EMU_WARNING_FLAGS})
@@ -54,6 +57,8 @@ target_link_libraries(slash_emu_core
     Threads::Threads
   PRIVATE
     PkgConfig::INIH
+    # libzmq (C API): the SIM bridge's REQ client to the vpp_sim model (T10).
+    PkgConfig::ZMQ
 )
 
 # Daemon executable.

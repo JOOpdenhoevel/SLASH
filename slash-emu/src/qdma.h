@@ -200,6 +200,52 @@ int emu_qdma_attach(struct emu_device *dev);
 int emu_qdma_set_mem_backend(struct emu_device *dev,
                              const struct emu_qdma_mem_backend *backend);
 
+/**
+ * @brief Reconfiguration handler: a VBIN-delivery write landed in the reconfig region.
+ *
+ * The T10 reconfiguration seam.  A @c pwrite through a @c qpair<Q> file whose
+ * @c [addr, addr+len) lies wholly within the reconfiguration region
+ * (@c SLASH_RECONFIG_BASE .. @c SLASH_RECONFIG_END) is @em not an ordinary memory
+ * transfer -- it is (part of) the delivery of a VBIN (architecture
+ * §Reconfiguration).  The qpair write hook detects that case @em before the
+ * normal HBM/DDR range check (which still rejects the region with @c -ERANGE) and
+ * routes the bytes here.  Invoked with the tree lock @em held.
+ *
+ * The kernel splits a write larger than its @c max_write into several
+ * @c ops->write calls, so a multi-MB VBIN arrives as several in-region chunks.
+ * The handler therefore receives the chunk's device address @p addr and
+ * reassembles contiguous chunks itself: a write at @c SLASH_RECONFIG_BASE starts
+ * (or replaces) a transfer; a write at the running @c BASE+accumulated offset
+ * appends; completion is detected from the archive structure (see the bridge).
+ *
+ * @param ctx  The handler context (the device's @ref emu_bridge).
+ * @param addr The chunk's device address (the qpair write offset).
+ * @param vbin The chunk bytes.
+ * @param len  Chunk length in bytes.
+ * @return 0 on success (chunk accepted, whether it completed the VBIN or awaits
+ *         more); a negative errno on a malformed VBIN, a non-contiguous chunk, an
+ *         over-cap stream, or a spawn failure.
+ */
+typedef int (*emu_qdma_reconfig_fn)(void *ctx, uint64_t addr, const void *vbin,
+                                    size_t len);
+
+/**
+ * @brief Attach (or detach) the reconfiguration handler for a device's store.
+ *
+ * The T10 wiring point for the reconfig-region write path.  The device's
+ * @c qdma/ endpoint must already be attached (@ref emu_qdma_attach).  @p ctx is
+ * borrowed (must outlive the device or be cleared first).  Pass @p handler NULL
+ * to detach.  Not internally locked: call at attach time or with the tree lock
+ * held.
+ *
+ * @param dev     The device whose @c qdma store gets the handler.
+ * @param handler The reconfig callback, or NULL to clear it.
+ * @param ctx     Opaque context passed back to @p handler (borrowed).
+ * @return 0 on success, -1 if the device has no attached @c qdma endpoint.
+ */
+int emu_qdma_set_reconfig_handler(struct emu_device *dev,
+                                  emu_qdma_reconfig_fn handler, void *ctx);
+
 /* ------------------------------------------------------------------ */
 /* Pure helpers exposed for unit testing (no FUSE mount required)     */
 /* ------------------------------------------------------------------ */
@@ -239,5 +285,22 @@ int emu_qdma_check_range(uint64_t addr, size_t len);
 int emu_qdma_check_qpair_add(uint32_t mode, uint32_t dir_mask,
                              uint32_t h2c_ring, uint32_t c2h_ring,
                              uint32_t cmpt_ring);
+
+/**
+ * @brief Test whether a write is a reconfiguration (whole-VBIN) delivery.
+ *
+ * Exposed for unit testing the region-detection.  Returns 1 iff
+ * @c [addr, addr+len) lies wholly within the reconfiguration region
+ * (@c SLASH_RECONFIG_BASE .. @c SLASH_RECONFIG_END) and @p len is non-zero and
+ * does not overflow.  A zero-length write carries no VBIN and is not a
+ * reconfiguration.  This is deliberately a separate predicate from
+ * @ref emu_qdma_check_range (which keeps rejecting the region with @c -ERANGE for
+ * ordinary transfers): the reconfig path is write-only and is checked first.
+ *
+ * @param addr Device address of the write.
+ * @param len  Write length in bytes.
+ * @return 1 if the write is a reconfig-region VBIN delivery; 0 otherwise.
+ */
+int emu_qdma_is_reconfig_write(uint64_t addr, size_t len);
 
 #endif // SLASH_EMU_QDMA_H

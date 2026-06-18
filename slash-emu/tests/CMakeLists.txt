@@ -203,3 +203,81 @@ target_compile_definitions(hotplug_adversarial_test PRIVATE
   SLASH_EMU_TMP_DIR="${SLASH_EMU_TMP_DIR}"
 )
 gtest_discover_tests(hotplug_adversarial_test PROPERTIES TIMEOUT 60)
+
+# ----------------------------------------------------------------------------
+# T10: SIM bridge (reconfiguration + vpp_sim model bridge)
+# ----------------------------------------------------------------------------
+
+# CI stub model: the standalone address-keyed SIM-dialect server the daemon's
+# bridge is tested against (a real vpp_sim cannot run in CI).  Built as its own
+# executable and linked against libzmq's C API, exactly as the daemon client is.
+add_executable(stub_model stub_model.c)
+target_link_libraries(stub_model PRIVATE PkgConfig::ZMQ)
+target_compile_options(stub_model PRIVATE -Wall -Wextra -Werror)
+
+# bridge unit suite (T10): the model client protocol vs the stub, the reconfig-
+# region write predicate, the bar/qdma backend rc-contract end-to-end through a
+# spawned stub, VBIN unpack/locate, and the no-hang failure paths (stub that
+# never binds / never answers must not wedge the client).  Links slash_emu_core
+# directly (it drives the C bridge/model_client/vbin/qdma APIs) and is handed the
+# stub path + a tar helper so it can build a CI VBIN.  Per-test TIMEOUT so a hang
+# FAILS rather than blocks.
+add_executable(bridge_test bridge_test.cpp)
+target_link_libraries(bridge_test PRIVATE GTest::gtest_main slash_emu_core PkgConfig::ZMQ)
+set_target_properties(bridge_test PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED YES
+)
+target_compile_definitions(bridge_test PRIVATE
+  SLASH_EMU_TMP_DIR="${SLASH_EMU_TMP_DIR}"
+  SLASH_EMU_STUB_MODEL_PATH="$<TARGET_FILE:stub_model>"
+)
+add_dependencies(bridge_test stub_model)
+gtest_discover_tests(bridge_test PROPERTIES TIMEOUT 60)
+
+# bridge integration suite (T10): the full end-to-end data plane over the real
+# FUSE mount -- write a CI VBIN (containing the stub as vpp_sim) into the reconfig
+# region through a qpair, spawn the model, round-trip BAR registers and qpair MM
+# transfers THROUGH the model, then remove both functions and assert the model is
+# torn down with no leaked process / socket / scratch.  Drives the daemon binary
+# and points its scratch root under .tmp via SLASH_EMU_SCRATCH_ROOT.  Per-test
+# TIMEOUT so a mount/handshake hang FAILS rather than blocks.
+add_executable(bridge_integration_test bridge_integration_test.cpp)
+target_link_libraries(bridge_integration_test PRIVATE GTest::gtest_main slash_emu_core)
+set_target_properties(bridge_integration_test PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED YES
+)
+target_compile_definitions(bridge_integration_test PRIVATE
+  SLASH_EMUD_PATH="$<TARGET_FILE:slash-emud>"
+  SLASH_EMU_TMP_DIR="${SLASH_EMU_TMP_DIR}"
+  SLASH_EMU_STUB_MODEL_PATH="$<TARGET_FILE:stub_model>"
+)
+add_dependencies(bridge_integration_test stub_model)
+gtest_discover_tests(bridge_integration_test PROPERTIES TIMEOUT 90)
+
+# Adversarial T10 conformance suite: the destructive counterpart of the bridge
+# tests.  Hammers process/fd/socket/scratch lifecycle (no leak on normal/shutdown/
+# re-VBIN/exit/crash/no-bind/no-answer paths, no zombie), no-hang under a dead/hung
+# model (watchdog + ctest TIMEOUT so a real hang FAILS), ustar/VBIN parser safety
+# (path traversal incl. longname, symlink/hardlink/device entries, truncated/
+# oversized/zero/duplicate members, name-length + exec-buffer edges), reconfig
+# interception (re-VBIN tears down prior model, reconfig-region read stays -ERANGE
+# after model up, large/chunked-VBIN contract), ZMQ desync (die-between-req-and-
+# reply latches dead; protocol garbage -> clean -EPROTO not UB), the backend
+# rc-contract end-to-end (BAR2/4 + width-8 served from shadow while a model runs,
+# never -EIO), and two-device no-cross-talk.  Per-test ctest TIMEOUT so a wedge
+# FAILS rather than blocks; the in-test Watchdog (alarm) is the faster inner guard.
+add_executable(bridge_adversarial_test bridge_adversarial_test.cpp)
+target_link_libraries(bridge_adversarial_test PRIVATE GTest::gtest_main slash_emu_core PkgConfig::ZMQ)
+set_target_properties(bridge_adversarial_test PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED YES
+)
+target_compile_definitions(bridge_adversarial_test PRIVATE
+  SLASH_EMUD_PATH="$<TARGET_FILE:slash-emud>"
+  SLASH_EMU_TMP_DIR="${SLASH_EMU_TMP_DIR}"
+  SLASH_EMU_STUB_MODEL_PATH="$<TARGET_FILE:stub_model>"
+)
+add_dependencies(bridge_adversarial_test stub_model)
+gtest_discover_tests(bridge_adversarial_test PROPERTIES TIMEOUT 90)

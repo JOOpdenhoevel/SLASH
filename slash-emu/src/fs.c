@@ -45,6 +45,7 @@
 
 #include "array.h"
 #include "bars.h"
+#include "bridge.h"
 #include "config.h"
 #include "hotplug.h"
 #include "info.h"
@@ -95,6 +96,12 @@ struct emu_fs {
 
     /** @brief The emulated device node tree (owning). */
     struct emu_node_tree *tree; /* owning */
+
+    /** @brief Per-device SIM bridges (reconfiguration + model lifecycle, T10). */
+    struct emu_bridge_registry *bridges; /* owning */
+
+    /** @brief Scratch root for per-device model runtime dirs (heap, owning). */
+    char *scratch_root; /* owning, or NULL for the bridge default */
 
     /** @brief True once fuse_session_mount() succeeded (needs unmount on teardown). */
     bool mounted;
@@ -502,20 +509,6 @@ static void emu_fs_notify_delete(void *ctx, emu_ino_t parent, emu_ino_t child,
     }
 }
 
-/*
- * Default per-device model-shutdown seam (T10 replaces this with the real
- * vpp_emu/vpp_sim teardown).  The spine fires it, with the tree lock held,
- * exactly once both functions of the device have been removed.  Kept minimal and
- * non-reentrant (it must not call back into the spine's public API under the
- * lock): it only logs, so the both-functions-gone transition is observable.
- */
-static void emu_fs_model_shutdown(struct emu_device *dev, void *ctx)
-{
-    (void) ctx;
-    LOG(LOG_INFO, "Model shutdown for '%s' (both functions removed)",
-        dev != NULL ? dev->bdf : "(null)");
-}
-
 /* Forward declaration: the reload callback re-runs materialize. */
 static int emu_fs_materialize(struct emu_fs *fs);
 
@@ -644,14 +637,18 @@ static int emu_fs_materialize(struct emu_fs *fs)
         }
 
         /*
-         * Wire the per-device model-shutdown seam.  The spine fires it once both
-         * functions of the device have been removed (REMOVE fn1 + fn2, or a
-         * whole-device revoke).  T10 replaces this default with the real
-         * vpp_emu/vpp_sim teardown; for now it is observable via the journal so
-         * the both-functions-gone transition is testable end-to-end.
+         * Attach the SIM bridge (T10): wires the reconfiguration handler onto
+         * the qdma store (a reconfig-region write delivers a VBIN) and installs
+         * the real vpp_sim teardown as the device's model-shutdown seam (which
+         * the spine fires once both functions are removed), replacing the
+         * logging-only default.  No model is spawned until the first
+         * reconfiguration write arrives.
          */
-        (void) emu_device_set_model_shutdown(fs->tree, acc->bdf,
-                                             emu_fs_model_shutdown, fs);
+        if (emu_bridge_attach(fs->bridges, dev, fs->scratch_root) == -1) {
+            LOG(LOG_ERR, "Failed to attach SIM bridge for '%s'", acc->bdf);
+            emu_accelerator_ref_array_free(&selected);
+            return -1;
+        }
 
         LOG(LOG_INFO, "Materialized accelerator '%s'", acc->bdf);
     }
@@ -677,6 +674,24 @@ int emu_fs_create(struct emu_fs **fsp, const char *mountpoint,
     fs->mountpoint = strdup(mountpoint);
     PROPAGATE_ERROR_NULL_LOG(fs->mountpoint, LOG_ERR,
                              "Failed to duplicate mountpoint");
+
+    /*
+     * Scratch root for per-device model runtime dirs (VBIN unpack + ipc:// socket
+     * for the spawned vpp_sim).  Configurable via SLASH_EMU_SCRATCH_ROOT so tests
+     * point it under the repo .tmp; NULL falls back to the bridge default.  The
+     * model never sees the FUSE mount -- this dir is outside it.
+     */
+    const char *scratch_env = getenv("SLASH_EMU_SCRATCH_ROOT");
+    if (scratch_env != NULL && scratch_env[0] != '\0') {
+        fs->scratch_root = strdup(scratch_env);
+        PROPAGATE_ERROR_NULL_LOG(fs->scratch_root, LOG_ERR,
+                                 "Failed to duplicate scratch root");
+    }
+
+    if (emu_bridge_registry_new(&fs->bridges) == -1) {
+        LOG(LOG_ERR, "Failed to create bridge registry");
+        return -1;
+    }
 
     struct emu_notifier notifier = {
         .notify_delete = emu_fs_notify_delete,
@@ -781,12 +796,26 @@ void cleanup_fs(struct emu_fs *fs)
     }
 
     /*
+     * Tear down every SIM bridge BEFORE the node tree: bridge teardown shuts down
+     * any still-running vpp_sim (exit + reap + close client + remove scratch) so
+     * no child process / socket / scratch leaks, and it consults the device's
+     * endpoint nodes (which the tree owns) when detaching backends.  A device
+     * whose model was already shut down (both functions removed) tears down
+     * idempotently here.
+     */
+    emu_bridge_registry_free(fs->bridges);
+    fs->bridges = NULL;
+
+    /*
      * Free the node tree only after the session is gone: the notifier callback
      * captures fs->session, and no op can run against the tree once the session
      * is destroyed.
      */
     cleanup_node_tree(fs->tree);
     fs->tree = NULL;
+
+    free(fs->scratch_root);
+    fs->scratch_root = NULL;
 
     /* The reloaded config (if any) is ours to free; the startup config is
      * borrowed from main and is NOT freed here. */

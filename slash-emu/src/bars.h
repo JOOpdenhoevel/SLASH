@@ -144,6 +144,25 @@ struct emu_bar_backend {
 int emu_bars_attach(struct emu_device *dev);
 
 /**
+ * @brief Attach (or detach) the SIM register-bridge backend for a device's BARs.
+ *
+ * The T10 wiring point and the seam the conformance suite uses to pin the bar
+ * backend rc-contract.  Sets @p backend on every BAR file (@c bar0/bar2/bar4) of
+ * the device, so a subsequent register @c pread/pwrite forwards to the model
+ * (with the shadow as the defined-bytes fallback).  @p backend is borrowed
+ * (non-owning, must outlive the device) and may be NULL to detach.  The device's
+ * @c bars endpoint must already be attached (@ref emu_bars_attach).  Not
+ * internally locked: call at attach time or with the tree lock held; the bridge
+ * attaches it right after a successful reconfiguration.
+ *
+ * @param dev     The device whose BAR files get the backend.
+ * @param backend The backend vtable (borrowed), or NULL to clear it.
+ * @return 0 on success, -1 if the device has no attached @c bars endpoint.
+ */
+int emu_bars_set_backend(struct emu_device *dev,
+                         const struct emu_bar_backend *backend);
+
+/**
  * @brief Validate a single BAR register transfer (the access policy kernel).
  *
  * Exposed (rather than file-static) so the validation matrix can be unit-tested

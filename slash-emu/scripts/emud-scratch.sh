@@ -53,7 +53,10 @@
 #   SLASH_EMUD          Explicit path to the slash-emud binary (overrides search).
 #
 # All generated scratch lives under <repo>/slash-emu/.tmp (never /tmp), matching
-# the project test convention.
+# the project test convention.  This includes the SIM bridge's per-device model
+# runtime dirs (the VBIN unpack dir + the ipc:// socket for a spawned vpp_sim):
+# the script points SLASH_EMU_SCRATCH_ROOT at a dir under .tmp so a reconfigured
+# accelerator's model leaves nothing outside .tmp, and the teardown removes it.
 set -u
 
 # --------------------------------------------------------------------------- #
@@ -73,7 +76,7 @@ MOUNT=""
 WAIT_TIMEOUT=5
 KEEP=0
 
-usage() { sed -n '24,63p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '24,59p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 CMD=()
 while [[ $# -gt 0 ]]; do
@@ -133,11 +136,18 @@ if [[ -z "$MOUNT" ]]; then
     GEN_MOUNT=1
 fi
 
+# SIM bridge (T10) model runtime scratch: the daemon unpacks a reconfigured
+# accelerator's VBIN here and binds the spawned vpp_sim's ipc:// socket here.
+# Keep it under .tmp (never the bridge default /run/...) so a manual reconfigure
+# leaves nothing outside the repo, and remove it on teardown.
+MODEL_SCRATCH="$(mktemp -d "$TMP/scratch_model_XXXXXX")"
+
 DPID=""
 cleanup() {
     if [[ "$KEEP" -eq 1 ]]; then
         echo "--keep: leaving mount '$MOUNT' (daemon pid ${DPID:-?})." >&2
-        echo "  clean up with: fusermount3 -u '$MOUNT'; kill ${DPID:-?}; rm -rf '$MOUNT' ${GEN_CONFIG:+'$CONFIG'}" >&2
+        echo "  model scratch: '$MODEL_SCRATCH'" >&2
+        echo "  clean up with: fusermount3 -u '$MOUNT'; kill ${DPID:-?}; rm -rf '$MOUNT' '$MODEL_SCRATCH' ${GEN_CONFIG:+'$CONFIG'}" >&2
         return
     fi
     [[ -n "$DPID" ]] && kill -TERM "$DPID" 2>/dev/null
@@ -146,6 +156,7 @@ cleanup() {
     [[ -n "$DPID" ]] && kill -9 "$DPID" 2>/dev/null
     [[ -n "$DPID" ]] && wait "$DPID" 2>/dev/null
     [[ "$GEN_MOUNT" -eq 1 ]] && rm -rf "$MOUNT"
+    rm -rf "$MODEL_SCRATCH"
     [[ "$GEN_CONFIG" -eq 1 ]] && rm -f "$CONFIG"
 }
 trap cleanup EXIT INT TERM
@@ -153,7 +164,7 @@ trap cleanup EXIT INT TERM
 # --------------------------------------------------------------------------- #
 # Launch + wait for the mount to come up.
 # --------------------------------------------------------------------------- #
-"$EMUD" --config "$CONFIG" --mount "$MOUNT" &
+SLASH_EMU_SCRATCH_ROOT="$MODEL_SCRATCH" "$EMUD" --config "$CONFIG" --mount "$MOUNT" &
 DPID=$!
 
 deadline=$(( WAIT_TIMEOUT * 20 ))   # 50ms ticks

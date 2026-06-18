@@ -70,4 +70,7 @@ add_subdirectory(src)
 
 if(SLASH_EMU_BUILD_TESTS)
   add_subdirectory(tests)
+  # The shared ABI conformance kselftest suite depends on the stub_model target
+  # defined in tests/, so it is added after it.
+  add_subdirectory(conformance)
 endif()

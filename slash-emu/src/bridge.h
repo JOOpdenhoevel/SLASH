@@ -94,6 +94,37 @@ int emu_bridge_attach(struct emu_bridge_registry *reg, struct emu_device *dev,
                       const char *scratch_root);
 
 /**
+ * @brief Re-wire a rediscovered function's data plane to the bridge (RESCAN restore).
+ *
+ * The bridge half of RESCAN's rediscovery: after @ref emu_device_restore_function
+ * rebuilds a removed function's subtree and @ref emu_bars_attach /
+ * @ref emu_qdma_attach re-create its in-memory endpoints, this re-establishes the
+ * function's path to the device's model/backend state (which the bridge owns).
+ *
+ *   - For @ref EMU_DEVICE_FUNCTION_QDMA the rebuilt store is brand new, so the
+ *     reconfiguration handler is always re-installed (the function awaits a VBIN
+ *     like a fresh device); if a model is currently running (the other function
+ *     was never removed, so the model never shut down) the qdma mem backend is
+ *     also re-pointed at it.
+ *   - For @ref EMU_DEVICE_FUNCTION_BARS the bar backend is re-attached iff a model
+ *     is currently running (otherwise the rebuilt shadow serves reads/writes).
+ *
+ * Idempotent / safe when no model is running and when no bridge exists for the
+ * device (a unit harness that never attached one): in those cases only the
+ * reconfig handler (fn1) is wired, leaving a bare in-memory endpoint awaiting a
+ * VBIN, which is the correct "both were removed -> model torn down" restore state.
+ *
+ * @param reg  The daemon's bridge registry.
+ * @param dev  The device whose function was just rediscovered.
+ * @param func The rediscovered function.
+ * @return 0 on success (including the no-bridge / no-model no-ops); -1 on a bad
+ *         argument or a wiring failure.
+ */
+int emu_bridge_reattach_function(struct emu_bridge_registry *reg,
+                                 struct emu_device *dev,
+                                 enum emu_device_function func);
+
+/**
  * @brief Reconfiguration handler: a (chunk of a) VBIN write landed in the region.
  *
  * Invoked from the qdma store's reconfig hook (qpair write path) with the tree

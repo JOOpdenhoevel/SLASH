@@ -1197,4 +1197,42 @@ int emu_device_set_model_shutdown(struct emu_node_tree *tree, const char *bdf,
 int emu_node_tree_collect_live_bdfs(struct emu_node_tree *tree,
                                     struct str_array *out);
 
+/**
+ * @brief Rediscover (restore) a previously-removed function of a live device.
+ *
+ * The additive half of RESCAN's rediscovery semantics, mirroring the hardware
+ * "a rescan re-enumerates the function" analogy.  After a per-function REMOVE
+ * (@ref emu_device_revoke_function) the device stays live but the function's
+ * subtree is gone (@c dev->bars / @c dev->qdma NULLed, the removed bit set).
+ * This call rebuilds @em just that function's directory node under the device's
+ * surviving @c <BDF>/ dir and clears the removed bit so the function is live
+ * again; the caller then re-attaches the endpoint files (@ref emu_bars_attach /
+ * @ref emu_qdma_attach) and re-wires the data plane (the bridge reattach).
+ *
+ * Crucially the rediscovered accelerator is the @em existing in-memory device --
+ * it is @em not reconciled against (possibly changed) config, exactly as hardware
+ * re-enumerates the physical device as-is.  The config-driven select_new pass
+ * still skips live BDFs; this is the orthogonal restore pass over a live device's
+ * removed functions.
+ *
+ * Re-arms the model-shutdown seam: since the device no longer has both functions
+ * removed, @ref emu_device::model_shutdown_fired is reset so a future
+ * both-removed transition fires the seam again.
+ *
+ * Idempotent: a device whose @p func is not in the removed set (never removed, or
+ * already restored) is left untouched (@p rebuilt is false, return 0).  An absent
+ * or fully-revoked BDF is likewise a no-op success (config-driven re-add is the
+ * select_new pass's job, not this one).
+ *
+ * @param tree         The tree.
+ * @param bdf          Normalized board-level BDF of the device.
+ * @param func         The function to rediscover.
+ * @param[out] rebuilt Set true iff the function's subtree was actually rebuilt
+ *                     (so the caller knows to re-attach + re-wire it); may be NULL.
+ * @return 0 on success (including the idempotent no-op cases); -1 on a bad
+ *         argument or an allocation failure rebuilding the dir node.
+ */
+int emu_device_restore_function(struct emu_node_tree *tree, const char *bdf,
+                                enum emu_device_function func, bool *rebuilt);
+
 #endif // SLASH_EMU_NODE_H

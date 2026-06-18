@@ -1535,3 +1535,72 @@ int emu_node_tree_collect_live_bdfs(struct emu_node_tree *tree,
 
     return 0;
 }
+
+int emu_device_restore_function(struct emu_node_tree *tree, const char *bdf,
+                                enum emu_device_function func, bool *rebuilt)
+{
+    if (rebuilt != NULL) {
+        *rebuilt = false;
+    }
+    if (tree == NULL || bdf == NULL) {
+        return -1;
+    }
+    if (func != EMU_DEVICE_FUNCTION_QDMA && func != EMU_DEVICE_FUNCTION_BARS) {
+        return -1;
+    }
+
+    tree_lock(tree);
+    _cleanup_(tree_unlockp) struct emu_node_tree *guard = tree;
+
+    struct emu_device *dev = find_device_locked(tree, bdf);
+    if (dev == NULL) {
+        /* Absent or fully revoked: nothing to rediscover (the additive restore
+         * pass leaves config-driven re-add to the select_new pass). */
+        return 0;
+    }
+
+    /* Idempotent: only a function whose subtree was removed gets rebuilt. */
+    if ((dev->removed_functions & emu_device_function_mask(func)) == 0) {
+        return 0;
+    }
+
+    /*
+     * The device must still own its <BDF>/ dir to re-anchor the subtree under it.
+     * A live device always does (a whole-device revoke clears dev->dir and marks
+     * it dead, so find_device_locked would not have returned it).  Defensive.
+     */
+    if (dev->dir == NULL) {
+        LOG(LOG_ERR, "Restore of '%s' function %d: device has no dir", bdf,
+            (int) func);
+        return -1;
+    }
+
+    const char *name = func == EMU_DEVICE_FUNCTION_QDMA ? "qdma" : "bars";
+    struct emu_node **slot =
+        func == EMU_DEVICE_FUNCTION_QDMA ? &dev->qdma : &dev->bars;
+
+    /* The slot was NULLed by emu_device_revoke_function; rebuild the dir node. */
+    struct emu_node *dir = NULL;
+    if (make_dir_locked(tree, dev->dir, name, &dir) == -1) {
+        LOG(LOG_ERR, "Restore of '%s': failed to rebuild %s/ dir", bdf, name);
+        return -1;
+    }
+    *slot = dir;
+
+    /*
+     * Clear the removed bit so the function is live again, and re-arm the
+     * model-shutdown seam: the device no longer has both functions gone, so a
+     * future both-removed transition must fire the seam again.  Resetting the
+     * fire-once guard on every restore is the minimal correct re-arm -- the seam
+     * fires only on the both-set transition while !model_shutdown_fired (see
+     * device_mark_function_removed_locked).
+     */
+    dev->removed_functions &= ~emu_device_function_mask(func);
+    dev->model_shutdown_fired = false;
+
+    if (rebuilt != NULL) {
+        *rebuilt = true;
+    }
+
+    return 0;
+}

@@ -565,6 +565,91 @@ static int emu_fs_reload(void *ctx)
  * are NOT -- re-attaching onto an already-attached subtree double-attaches ops --
  * so seeding the running-set is what keeps RESCAN from double-attaching.
  */
+static int emu_fs_materialize(struct emu_fs *fs);
+
+/*
+ * RESCAN rediscovery restore pass: rebuild any individually-removed function of a
+ * still-live device (the hardware "a rescan re-enumerates the function" analogy).
+ * This is the ADDITIVE half of RESCAN -- orthogonal to the config-driven
+ * select_new pass above, which keeps skipping live BDFs.  The rediscovered
+ * accelerator is the EXISTING in-memory device; it is deliberately NOT reconciled
+ * against (possibly changed) config, exactly as hardware re-enumerates the
+ * physical device as-is.
+ *
+ * For each live BDF and each removable function: emu_device_restore_function
+ * rebuilds just that function's directory node under the device's surviving
+ * <BDF>/ dir and clears the removed bit (a no-op if the function was not removed,
+ * so this never double-attaches an intact function).  When a function was
+ * actually rebuilt we then re-attach its in-memory endpoints (bars/qdma) and
+ * re-wire its data plane to the bridge (which owns the model/backend state): if
+ * the device's model is still running -- only one function had been removed -- the
+ * restored function re-routes to the live model; if both had been removed (model
+ * torn down) the function comes back in-memory with a fresh reconfig handler,
+ * awaiting a new VBIN like a fresh device.
+ */
+static int emu_fs_rediscover(struct emu_fs *fs)
+{
+    static const enum emu_device_function kFuncs[] = {
+        EMU_DEVICE_FUNCTION_QDMA,
+        EMU_DEVICE_FUNCTION_BARS,
+    };
+
+    struct str_array live = str_array_init();
+    if (emu_node_tree_collect_live_bdfs(fs->tree, &live) == -1) {
+        str_array_free(&live);
+        return -1;
+    }
+
+    int rc = 0;
+    for (size_t i = 0; i < live.len && rc == 0; i++) {
+        const char *bdf = live.d[i];
+        for (size_t f = 0; f < SIZEOF_ARRAY(kFuncs); f++) {
+            enum emu_device_function func = kFuncs[f];
+            bool rebuilt = false;
+
+            if (emu_device_restore_function(fs->tree, bdf, func, &rebuilt)
+                == -1) {
+                LOG(LOG_ERR, "Rediscover: failed to restore '%s' function %d",
+                    bdf, (int) func);
+                rc = -1;
+                break;
+            }
+            if (!rebuilt) {
+                continue; /* function was not removed; nothing to re-attach. */
+            }
+
+            struct emu_device *dev = emu_node_tree_find_device(fs->tree, bdf);
+            if (dev == NULL) {
+                /* Raced away (single-threaded today; defensive). */
+                continue;
+            }
+
+            int aret = func == EMU_DEVICE_FUNCTION_QDMA ? emu_qdma_attach(dev)
+                                                        : emu_bars_attach(dev);
+            if (aret == -1) {
+                LOG(LOG_ERR,
+                    "Rediscover: failed to re-attach '%s' function %d endpoint",
+                    bdf, (int) func);
+                rc = -1;
+                break;
+            }
+
+            if (emu_bridge_reattach_function(fs->bridges, dev, func) == -1) {
+                LOG(LOG_ERR,
+                    "Rediscover: failed to re-wire '%s' function %d data plane",
+                    bdf, (int) func);
+                rc = -1;
+                break;
+            }
+
+            LOG(LOG_INFO, "Rediscovered '%s' function %d", bdf, (int) func);
+        }
+    }
+
+    str_array_free(&live);
+    return rc;
+}
+
 static int emu_fs_materialize(struct emu_fs *fs)
 {
     if (fs->config == NULL) {
@@ -654,6 +739,17 @@ static int emu_fs_materialize(struct emu_fs *fs)
     }
 
     emu_accelerator_ref_array_free(&selected);
+
+    /*
+     * RESCAN rediscovery: after the config-driven select pass (which adds newly-
+     * configured BDFs and skips live ones), run the additive restore pass that
+     * rebuilds any individually-removed function of a still-live device.  On the
+     * first (startup) materialize no device has a removed function, so this is a
+     * no-op; on a RESCAN re-invocation it re-enumerates removed functions.
+     */
+    if (emu_fs_rediscover(fs) == -1) {
+        return -1;
+    }
 
     return 0;
 }

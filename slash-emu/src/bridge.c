@@ -651,6 +651,83 @@ void emu_bridge_registry_free(struct emu_bridge_registry *reg)
     free(reg);
 }
 
+/* Find the bridge owning @p dev in the registry, or NULL. */
+static struct emu_bridge *registry_find(struct emu_bridge_registry *reg,
+                                        const struct emu_device *dev)
+{
+    for (size_t i = 0; i < reg->bridges.len; i++) {
+        if (reg->bridges.d[i]->dev == dev) {
+            return reg->bridges.d[i];
+        }
+    }
+    return NULL;
+}
+
+int emu_bridge_reattach_function(struct emu_bridge_registry *reg,
+                                 struct emu_device *dev,
+                                 enum emu_device_function func)
+{
+    if (reg == NULL || dev == NULL) {
+        return -1;
+    }
+
+    struct emu_bridge *b = registry_find(reg, dev);
+    if (b == NULL) {
+        /* No bridge for this device (e.g. a unit harness that never attached
+         * one).  Nothing to re-wire; the rebuilt subtree is a bare in-memory
+         * endpoint, which is a valid state. */
+        return 0;
+    }
+
+    /*
+     * Re-establish the data-plane path for the just-rediscovered function:
+     *
+     *   - QDMA (fn1): the rebuilt qdma store is brand new (the old store + its
+     *     reconfig handler were freed when the function was revoked), so ALWAYS
+     *     re-install the reconfig handler -- a fresh function awaits a VBIN
+     *     exactly like a freshly-materialized device.  If a model is CURRENTLY
+     *     running (only this function had been removed, so the model never shut
+     *     down), also re-point the store's mem backend at the live model so a
+     *     post-restore QDMA transfer round-trips through it again.
+     *
+     *   - BARS (fn2): the rebuilt bar files carry fresh in-memory shadows; if a
+     *     model is running, re-attach the bar backend so a post-restore register
+     *     poke round-trips through it.  (The bar backend consults b->client at
+     *     call time, so with no model running it simply uses the shadow.)
+     *
+     * The bridge stays the single owner of model/backend state; node.c rebuilt
+     * only the tree topology and the qdma/bars endpoints re-attached their own
+     * in-memory backings before this call.
+     */
+    if (func == EMU_DEVICE_FUNCTION_QDMA) {
+        if (emu_qdma_set_reconfig_handler(dev, bridge_reconfig_hook, b) != 0) {
+            LOG(LOG_ERR, "Reattach: failed to wire reconfig handler for '%s'",
+                dev->bdf);
+            return -1;
+        }
+        if (b->client != NULL) {
+            if (emu_qdma_set_mem_backend(dev, &b->mem_backend) != 0) {
+                LOG(LOG_ERR,
+                    "Reattach: failed to re-wire qdma backend for '%s'",
+                    dev->bdf);
+                return -1;
+            }
+        }
+    } else if (func == EMU_DEVICE_FUNCTION_BARS) {
+        if (b->client != NULL) {
+            if (emu_bars_set_backend(dev, &b->bar_backend) != 0) {
+                LOG(LOG_ERR, "Reattach: failed to re-wire bar backend for '%s'",
+                    dev->bdf);
+                return -1;
+            }
+        }
+    } else {
+        return -1;
+    }
+
+    return 0;
+}
+
 int emu_bridge_attach(struct emu_bridge_registry *reg, struct emu_device *dev,
                       const char *scratch_root)
 {

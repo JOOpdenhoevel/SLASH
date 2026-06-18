@@ -256,6 +256,54 @@ target_compile_definitions(bridge_integration_test PRIVATE
 add_dependencies(bridge_integration_test stub_model)
 gtest_discover_tests(bridge_integration_test PROPERTIES TIMEOUT 90)
 
+# RESCAN rediscovery suite (task 14): restore an individually-removed function of
+# a still-live device.  Unit (against slash_emu_core: the restore building blocks
+# -- emu_device_restore_function + bars/qdma re-attach + bridge reattach, the
+# no-double-attach idempotency, the remove/restore cycle, and the
+# model_shutdown_fired re-arm) and integration over the real FUSE mount with the
+# CI stub model (RESCAN restores fn1/fn2 and the data plane round-trips THROUGH
+# the still-running model; restore after both-removed comes back model-less and a
+# fresh VBIN then spawns a model; RESCAN with nothing removed is a no-op).  Drives
+# the daemon binary + points its scratch root under .tmp; per-test TIMEOUT so a
+# mount/handshake hang FAILS rather than blocks.
+add_executable(rescan_test rescan_test.cpp)
+target_link_libraries(rescan_test PRIVATE GTest::gtest_main slash_emu_core)
+set_target_properties(rescan_test PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED YES
+)
+target_compile_definitions(rescan_test PRIVATE
+  SLASH_EMUD_PATH="$<TARGET_FILE:slash-emud>"
+  SLASH_EMU_TMP_DIR="${SLASH_EMU_TMP_DIR}"
+  SLASH_EMU_STUB_MODEL_PATH="$<TARGET_FILE:stub_model>"
+)
+add_dependencies(rescan_test stub_model)
+gtest_discover_tests(rescan_test PROPERTIES TIMEOUT 90)
+
+# Adversarial RESCAN rediscovery suite (task 14): the destructive counterpart of
+# rescan_test.  Hammers the model_shutdown re-arm bookkeeping WITHOUT re-installing
+# the seam (the real daemon never does -- it relies on the fn/ctx surviving a
+# per-function revoke), an exhaustive small-depth remove/restore sequence fuzz
+# against a reference model, the removed_functions bit integrity, leak/UAF over
+# many remove/restore cycles (ASan), and integration over the real FUSE mount:
+# the real-daemon double-teardown through the surviving seam, restore-from-both-
+# removed reading the FRESH model (not a stale shadow), and select_new staying
+# unchanged (no fabricated/unconfigured BDFs).  Per-test TIMEOUT so a hang FAILS.
+add_executable(rescan_adversarial_test rescan_adversarial_test.cpp)
+target_link_libraries(rescan_adversarial_test
+  PRIVATE GTest::gtest_main slash_emu_core)
+set_target_properties(rescan_adversarial_test PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED YES
+)
+target_compile_definitions(rescan_adversarial_test PRIVATE
+  SLASH_EMUD_PATH="$<TARGET_FILE:slash-emud>"
+  SLASH_EMU_TMP_DIR="${SLASH_EMU_TMP_DIR}"
+  SLASH_EMU_STUB_MODEL_PATH="$<TARGET_FILE:stub_model>"
+)
+add_dependencies(rescan_adversarial_test stub_model)
+gtest_discover_tests(rescan_adversarial_test PROPERTIES TIMEOUT 90)
+
 # Adversarial T10 conformance suite: the destructive counterpart of the bridge
 # tests.  Hammers process/fd/socket/scratch lifecycle (no leak on normal/shutdown/
 # re-VBIN/exit/crash/no-bind/no-answer paths, no zombie), no-hang under a dead/hung

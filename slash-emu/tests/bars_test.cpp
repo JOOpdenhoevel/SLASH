@@ -617,6 +617,16 @@ TEST(BarsMount, MmapSharedIsRejected)
 // watchdog: the child must terminate quickly (by SIGBUS, or cleanly if a future
 // kernel rejects the map outright) -- it must never be killed by the watchdog
 // for hanging.
+//
+// The watchdog must distinguish "hung" from "slow".  A genuine hang is UNBOUNDED
+// (the FUSE_READ a fault issues is never answered, so no signal arrives and the
+// child waits forever -- any finite margin catches it); a child that is merely
+// CPU-starved under ASan + a contended -j16 ctest run is still making progress.
+// A tight 4 s margin misclassified the latter as a hang and flaked, so the margin
+// is sized generously above the worst observed contended fork+open+mmap+fault
+// round-trip while staying finite (a real wedge still FAILS).
+static constexpr int kDerefWatchdogMs = 30000;
+
 TEST(BarsMount, MmapPrivateDerefFaultsPromptlyNeverHangs)
 {
     with_mounted_daemon([](const std::string &mountpoint) {
@@ -653,7 +663,8 @@ TEST(BarsMount, MmapPrivateDerefFaultsPromptlyNeverHangs)
         // the defect-2 failure and the only failure this test cares about.
         int status = 0;
         bool finished = wait_for(
-            [&] { return ::waitpid(child, &status, WNOHANG) == child; }, 4000);
+            [&] { return ::waitpid(child, &status, WNOHANG) == child; },
+            kDerefWatchdogMs);
         if (!finished) {
             ::kill(child, SIGKILL);
             ::waitpid(child, &status, 0);

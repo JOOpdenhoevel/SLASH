@@ -212,8 +212,18 @@ enum emu_vbin_status emu_vbin_classify(const void *data, size_t len)
 
         /* The end-of-archive terminator is (at least) one zero block.  GNU tar
          * writes two; a single zero block at a 512-aligned boundary is enough to
-         * recognise completion for our purposes (the unpacker stops there too). */
+         * recognise completion for our purposes (the unpacker stops there too).
+         *
+         * Agree with emu_vbin_unpack_find_sim, which requires a whole-block
+         * (len % 512 == 0) archive: if a non-512-aligned tail trails the
+         * terminator block, the stream is not yet a clean block-aligned archive,
+         * so report INCOMPLETE (the caller keeps accumulating) rather than a
+         * COMPLETE that unpack would then reject with -EINVAL.  This keeps
+         * classify and unpack consistent. */
         if (block_is_zero(base + off)) {
+            if (len % TAR_BLOCK != 0) {
+                return EMU_VBIN_INCOMPLETE;
+            }
             return EMU_VBIN_COMPLETE;
         }
 

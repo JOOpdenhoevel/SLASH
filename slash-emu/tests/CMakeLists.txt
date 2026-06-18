@@ -33,8 +33,16 @@ set(SLASH_EMU_TMP_DIR "${CMAKE_SOURCE_DIR}/../.tmp")
 # Every test exec is handed the freshly-built daemon path and the scratch dir as
 # compile definitions so it never hand-runs or guesses a binary (CTest drives
 # everything).
+#
+# An optional RESOURCE_LOCK <name> keyword serialises a suite against any other
+# suite holding the same lock (CTest never schedules two tests sharing a lock
+# concurrently).  Used to keep the CPU-heavy mount/fork/watchdog suites from
+# piling onto the same cores under ASan + -j16 -- a belt to the per-test watchdog
+# margins (the watchdogs are the real no-hang guard; the lock just keeps the slow
+# path from being hit).
 function(slash_emu_add_test target)
-  add_executable(${target} ${ARGN})
+  cmake_parse_arguments(SEAT "" "RESOURCE_LOCK" "" ${ARGN})
+  add_executable(${target} ${SEAT_UNPARSED_ARGUMENTS})
   target_link_libraries(${target} PRIVATE GTest::gtest_main)
   set_target_properties(${target} PROPERTIES
     CXX_STANDARD 20
@@ -44,7 +52,11 @@ function(slash_emu_add_test target)
     SLASH_EMUD_PATH="$<TARGET_FILE:slash-emud>"
     SLASH_EMU_TMP_DIR="${SLASH_EMU_TMP_DIR}"
   )
-  gtest_discover_tests(${target})
+  if(SEAT_RESOURCE_LOCK)
+    gtest_discover_tests(${target} PROPERTIES RESOURCE_LOCK ${SEAT_RESOURCE_LOCK})
+  else()
+    gtest_discover_tests(${target})
+  endif()
 endfunction()
 
 # End-to-end mount/browse/unmount smoke test.
@@ -99,7 +111,12 @@ target_link_libraries(info_adversarial_test PRIVATE slash_emu_core)
 # round-trip / geometry / revocation through the spine, against slash_emu_core)
 # and integration (pread/pwrite bar0/2/4 over the real FUSE mount, alignment /
 # width / beyond-BAR rejection, and the assertion that mmap is not offered).
-slash_emu_add_test(bars_test bars_test.cpp)
+# RESOURCE_LOCK bars_mount: bars_test and bars_adversarial_test both fork a
+# child that mmaps a BAR and faults under a watchdog over the real FUSE mount.
+# Sharing one lock keeps those two CPU-heavy mount suites from running
+# concurrently (with each other or themselves), so the watchdog'd deref is never
+# starved of cores by its sibling under ASan + -j16.
+slash_emu_add_test(bars_test bars_test.cpp RESOURCE_LOCK bars_mount)
 target_link_libraries(bars_test PRIVATE slash_emu_core)
 
 # Adversarial T7 conformance suite: the destructive counterpart of bars_test.
@@ -109,7 +126,8 @@ target_link_libraries(bars_test PRIVATE slash_emu_core)
 # (-EIO) + read-only-node confirmation, lazy-shadow no-eager-128MiB (RSS witness)
 # + destroy-once (ASan), exactly-three-BARs + isolation, and the no-mmap /
 # unbuffered-direct_io guarantees over the real mount.
-slash_emu_add_test(bars_adversarial_test bars_adversarial_test.cpp)
+slash_emu_add_test(bars_adversarial_test bars_adversarial_test.cpp
+  RESOURCE_LOCK bars_mount)
 target_link_libraries(bars_adversarial_test PRIVATE slash_emu_core)
 
 # OOM-injection coverage for the BAR shadow allocation (T7 defect-1): a

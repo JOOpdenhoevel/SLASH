@@ -806,6 +806,20 @@ TEST(BarsMountAdv, MmapSharedWritableFails)
 // terminal state PROMPTLY; a hang (watchdog SIGKILL) is the only failure.  A
 // clean exit 0 would mean the deref SUCCEEDED -- i.e. a usable device-memory
 // window was produced -- which we also reject: the deref MUST fault (SIGBUS).
+//
+// The watchdog distinguishes "hung" from "slow".  A genuine hang is UNBOUNDED:
+// the FUSE_READ a fault issues is never answered, so no signal is ever delivered
+// and the child waits forever -- any finite watchdog catches it.  What we must
+// NOT do is misclassify a child that IS making progress but is merely starved of
+// CPU (fork + open + mmap + a FUSE round-trip, all under ASan, while a -j16 ctest
+// run contends for cores).  The old 4 s margin did exactly that and flaked.  The
+// margin below is sized generously above the worst observed contended round-trip
+// yet remains finite, so a real wedge still FAILS; and a shared RESOURCE_LOCK on
+// the two bars mount suites (see "bars_mount" in tests/CMakeLists.txt) keeps this
+// fork+mmap+watchdog test from running concurrently with its sibling, so the
+// slow path is hit less often in the first place.
+static constexpr int kDerefWatchdogMs = 30000;
+
 TEST(BarsMountAdv, MmapPrivateDerefNeverHangsOrMapsAcrossOffsetsAndBars)
 {
     with_mounted_daemon([](const std::string &mountpoint) {
@@ -855,7 +869,7 @@ TEST(BarsMountAdv, MmapPrivateDerefNeverHangsOrMapsAcrossOffsetsAndBars)
                 int status = 0;
                 bool finished = wait_for(
                     [&] { return ::waitpid(child, &status, WNOHANG) == child; },
-                    4000);
+                    kDerefWatchdogMs);
                 if (!finished) {
                     ::kill(child, SIGKILL);
                     ::waitpid(child, &status, 0);

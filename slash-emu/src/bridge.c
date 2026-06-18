@@ -334,10 +334,16 @@ static int bridge_spawn(struct emu_bridge *b, const char *exec_path)
         return -errno;
     }
     if (pid == 0) {
-        /* Child: become a session leader so we can signal the whole group, set
-         * the endpoint env, cd into the exec dir, and exec it.  Any failure here
-         * exits the child with a distinctive code; the parent detects via the
-         * handshake timeout / waitpid. */
+        /* Child: detach into its own session/process group so the spawned model
+         * is insulated from the daemon's controlling terminal (a stray SIGINT/
+         * SIGHUP to the daemon's tty does not reach the model; teardown drives it
+         * explicitly via bridge_reap).  setsid() succeeds here because the forked
+         * child is not already a process-group leader; treat a failure as
+         * non-fatal rather than aborting an otherwise-good spawn.  Then set the
+         * endpoint env, cd into the exec dir, and exec it.  Any failure here exits
+         * the child with a distinctive code; the parent detects via the handshake
+         * timeout / waitpid. */
+        (void) setsid();
         if (chdir(dir) != 0) {
             _exit(127);
         }
@@ -620,6 +626,24 @@ static void emu_bridge_free_one(struct emu_bridge *b)
     if (b == NULL) {
         return;
     }
+
+    /*
+     * Belt-and-suspenders: clear the model-shutdown seam BEFORE freeing the
+     * bridge so no seam can ever reference a freed bridge.  This runs from the
+     * registry free path (no tree lock held -- so the lock-taking
+     * emu_device_set_model_shutdown is safe here, unlike inside
+     * bridge_teardown_model which the seam itself may invoke under the tree
+     * lock).  At this point the node tree is still alive (fs teardown frees the
+     * bridge registry before the tree); a device already gone from the tree just
+     * yields a benign lookup miss, which we ignore.  Combined with the seam-
+     * firing path NULLing b->client, this makes the shutdown ordering
+     * self-evidently safe.
+     */
+    if (b->dev != NULL && b->dev->tree != NULL) {
+        (void) emu_device_set_model_shutdown(b->dev->tree, b->dev->bdf, NULL,
+                                             NULL);
+    }
+
     bridge_teardown_model(b);
     pthread_mutex_destroy(&b->io_lock);
     free(b->scratch_root);

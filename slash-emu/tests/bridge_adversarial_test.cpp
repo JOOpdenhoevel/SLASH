@@ -558,6 +558,44 @@ TEST(VbinClassify, TerminatorExactlyOnChunkBoundary)
               EMU_VBIN_INCOMPLETE);
 }
 
+// classify and emu_vbin_unpack_find_sim must AGREE on a non-512-aligned tail.
+// A complete archive (member + terminator block) with a few stray trailing bytes
+// is not a clean block-aligned tar: unpack rejects it with -EINVAL, so classify
+// must NOT report COMPLETE for it (else the bridge would hand a doomed buffer to
+// unpack).  classify reports INCOMPLETE (keep accumulating); the moment the tail
+// rounds back up to a block boundary it agrees with unpack again.
+TEST(VbinClassify, NonAlignedTailNotCompleteAgreesWithUnpack)
+{
+    // A real vpp_sim member followed by one terminator block: block-aligned and
+    // genuinely complete -> classify COMPLETE and unpack succeeds.
+    auto base = make_tar_entry("vpp_sim", '0', std::vector<uint8_t>(8, 'A'), 0755,
+                               "", /*trailer=*/false);
+    base.resize(base.size() + 512, 0);  // single zero terminator block
+    ASSERT_EQ(base.size() % 512u, 0u);
+    EXPECT_EQ(emu_vbin_classify(base.data(), base.size()), EMU_VBIN_COMPLETE);
+
+    // Now append a non-512-aligned tail of stray bytes.  classify must report
+    // INCOMPLETE (not COMPLETE), matching unpack's -EINVAL on the same buffer.
+    auto tail = base;
+    tail.insert(tail.end(), {0x01, 0x02, 0x03});  // 3 stray bytes
+    ASSERT_NE(tail.size() % 512u, 0u);
+    EXPECT_EQ(emu_vbin_classify(tail.data(), tail.size()), EMU_VBIN_INCOMPLETE)
+        << "non-512-aligned tail must not be reported COMPLETE";
+
+    std::string dir = make_scratch_dir("vbin_align");
+    char exec[4096];
+    EXPECT_EQ(emu_vbin_unpack_find_sim(tail.data(), tail.size(), dir.c_str(),
+                                       exec, sizeof(exec)),
+              -EINVAL)
+        << "unpack must reject the same non-aligned buffer (the divergence)";
+    rm_rf(dir);
+
+    // Rounding the tail back up to a block boundary makes both agree again.
+    tail.resize(((tail.size() + 511) / 512) * 512, 0);
+    ASSERT_EQ(tail.size() % 512u, 0u);
+    EXPECT_EQ(emu_vbin_classify(tail.data(), tail.size()), EMU_VBIN_COMPLETE);
+}
+
 TEST(VbinClassify, ChunkEndingMidHeaderIsIncompleteThenCompletes)
 {
     // A chunk boundary that falls in the MIDDLE of a header block must classify

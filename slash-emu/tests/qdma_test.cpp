@@ -20,19 +20,19 @@
 
 /**
  * @file qdma_test.cpp
- * @brief Unit + integration tests for the /<BDF>/qdma/ endpoint (T8).
+ * @brief Unit + integration tests for the /<BDF>/qdma/ endpoint.
  *
  * Two layers, matching the build rules (CMake+CTest, GTest, scratch under .tmp):
  *
  *   - Unit, against slash_emu_core directly (no FUSE mount): the pure validation
- *     matrices (emu_qdma_check_range, emu_qdma_check_qpair_add), and the
- *     end-to-end qpair lifecycle through the spine (emu_qdma_attach -> QPAIR_ADD
- *     via emu_node_ioctl -> qpair pread/pwrite via emu_node_pread/pwrite),
- *     including QID allocation/uniqueness, MM round-trip into HBM and DDR,
- *     out-of-range rejection, unwritten-reads-zero, the full nameless-qpair
- *     lifecycle (open -> unlink-while-open -> still works -> last close ->
- *     cooperative teardown exactly once), forced teardown via revoke (-ENODEV),
- *     double-teardown idempotency, multiple qpairs, and per-device isolation.
+ *     matrices (qdmaCheckRange, qdmaCheckQpairAdd), and the end-to-end qpair
+ *     lifecycle through the spine (qdmaAttach -> QPAIR_ADD via NodeTree::ioctl ->
+ *     qpair pread/pwrite via NodeTree::pread/pwrite), including QID
+ *     allocation/uniqueness, MM round-trip into HBM and DDR, out-of-range
+ *     rejection, unwritten-reads-zero, the full nameless-qpair lifecycle (open ->
+ *     unlink-while-open -> still works -> last close -> cooperative teardown
+ *     exactly once), forced teardown via revoke (-ENODEV), double-teardown
+ *     idempotency, multiple qpairs, and per-device isolation.
  *
  *   - Integration, over the real FUSE mount (fork+exec the freshly-built daemon,
  *     the bars_test.cpp pattern): QPAIR_ADD ioctl on the qdma/ dir fd, open the
@@ -63,69 +63,68 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-extern "C" {
-#include "node.h"
-#include "qdma.h"
+#include "node.hpp"
+#include "qdma.hpp"
 #include "slash/uapi/slash_abi.h"
-}
+
+using namespace slash::emu;
 
 namespace {
 
 // ===========================================================================
-// Unit: pure range-validation matrix (emu_qdma_check_range)
+// Unit: pure range-validation matrix (qdmaCheckRange)
 // ===========================================================================
 
 TEST(QdmaCheckRange, ZeroLengthAlwaysInRange)
 {
     // A zero-length transfer copies nothing; accepted everywhere, even at an
     // address outside any window (no bytes are touched).
-    EXPECT_EQ(emu_qdma_check_range(0, 0), 0);
-    EXPECT_EQ(emu_qdma_check_range(SLASH_HBM_BASE, 0), 0);
-    EXPECT_EQ(emu_qdma_check_range(0xdeadbeefULL, 0), 0);
+    EXPECT_EQ(qdmaCheckRange(0, 0), 0);
+    EXPECT_EQ(qdmaCheckRange(SLASH_HBM_BASE, 0), 0);
+    EXPECT_EQ(qdmaCheckRange(0xdeadbeefULL, 0), 0);
 }
 
 TEST(QdmaCheckRange, HbmWindowAccepted)
 {
-    EXPECT_EQ(emu_qdma_check_range(SLASH_HBM_BASE, 8), 0);
-    EXPECT_EQ(emu_qdma_check_range(SLASH_HBM_BASE, SLASH_HBM_END - SLASH_HBM_BASE),
-              0);
+    EXPECT_EQ(qdmaCheckRange(SLASH_HBM_BASE, 8), 0);
+    EXPECT_EQ(qdmaCheckRange(SLASH_HBM_BASE, SLASH_HBM_END - SLASH_HBM_BASE), 0);
     // Last valid byte.
-    EXPECT_EQ(emu_qdma_check_range(SLASH_HBM_END - 1, 1), 0);
+    EXPECT_EQ(qdmaCheckRange(SLASH_HBM_END - 1, 1), 0);
 }
 
 TEST(QdmaCheckRange, DdrWindowAccepted)
 {
-    EXPECT_EQ(emu_qdma_check_range(SLASH_DDR_BASE, 4096), 0);
-    EXPECT_EQ(emu_qdma_check_range(SLASH_DDR_END - 8, 8), 0);
+    EXPECT_EQ(qdmaCheckRange(SLASH_DDR_BASE, 4096), 0);
+    EXPECT_EQ(qdmaCheckRange(SLASH_DDR_END - 8, 8), 0);
 }
 
 TEST(QdmaCheckRange, OutsideWindowsRejected)
 {
     // Below HBM, between HBM and DDR, and above DDR.
-    EXPECT_EQ(emu_qdma_check_range(0, 8), -ERANGE);
-    EXPECT_EQ(emu_qdma_check_range(SLASH_HBM_BASE - 8, 8), -ERANGE);
-    EXPECT_EQ(emu_qdma_check_range(SLASH_HBM_END, 8), -ERANGE);
-    EXPECT_EQ(emu_qdma_check_range(SLASH_DDR_END, 8), -ERANGE);
-    // The reconfiguration region is NOT accepted here (T10's path).
-    EXPECT_EQ(emu_qdma_check_range(SLASH_RECONFIG_BASE, 8), -ERANGE);
+    EXPECT_EQ(qdmaCheckRange(0, 8), -ERANGE);
+    EXPECT_EQ(qdmaCheckRange(SLASH_HBM_BASE - 8, 8), -ERANGE);
+    EXPECT_EQ(qdmaCheckRange(SLASH_HBM_END, 8), -ERANGE);
+    EXPECT_EQ(qdmaCheckRange(SLASH_DDR_END, 8), -ERANGE);
+    // The reconfiguration region is NOT accepted here (the VBIN path).
+    EXPECT_EQ(qdmaCheckRange(SLASH_RECONFIG_BASE, 8), -ERANGE);
 }
 
 TEST(QdmaCheckRange, StraddlingWindowEndRejected)
 {
     // A transfer that starts in-window but runs past the end is rejected,
     // not clamped.
-    EXPECT_EQ(emu_qdma_check_range(SLASH_HBM_END - 4, 8), -ERANGE);
-    EXPECT_EQ(emu_qdma_check_range(SLASH_DDR_END - 4, 8), -ERANGE);
+    EXPECT_EQ(qdmaCheckRange(SLASH_HBM_END - 4, 8), -ERANGE);
+    EXPECT_EQ(qdmaCheckRange(SLASH_DDR_END - 4, 8), -ERANGE);
 }
 
 TEST(QdmaCheckRange, OverflowRejected)
 {
-    EXPECT_EQ(emu_qdma_check_range(SLASH_HBM_BASE, SIZE_MAX), -ERANGE);
-    EXPECT_EQ(emu_qdma_check_range(UINT64_MAX, 2), -ERANGE);
+    EXPECT_EQ(qdmaCheckRange(SLASH_HBM_BASE, SIZE_MAX), -ERANGE);
+    EXPECT_EQ(qdmaCheckRange(UINT64_MAX, 2), -ERANGE);
 }
 
 // ===========================================================================
-// Unit: QPAIR_ADD parameter-validation matrix (emu_qdma_check_qpair_add)
+// Unit: QPAIR_ADD parameter-validation matrix (qdmaCheckQpairAdd)
 // ===========================================================================
 
 constexpr uint32_t kH2C = 0x1u;
@@ -136,59 +135,48 @@ constexpr uint32_t kST = 1u;
 
 TEST(QdmaCheckQpairAdd, ValidMmAccepted)
 {
-    EXPECT_EQ(emu_qdma_check_qpair_add(kMM, kH2C, 0, 0, 0), 0);
-    EXPECT_EQ(emu_qdma_check_qpair_add(kMM, kC2H, 15, 15, 15), 0);
-    EXPECT_EQ(emu_qdma_check_qpair_add(kMM, kH2C | kC2H, 7, 8, 0), 0);
+    EXPECT_EQ(qdmaCheckQpairAdd(kMM, kH2C, 0, 0, 0), 0);
+    EXPECT_EQ(qdmaCheckQpairAdd(kMM, kC2H, 15, 15, 15), 0);
+    EXPECT_EQ(qdmaCheckQpairAdd(kMM, kH2C | kC2H, 7, 8, 0), 0);
 }
 
 TEST(QdmaCheckQpairAdd, StreamingModeUnsupported)
 {
-    EXPECT_EQ(emu_qdma_check_qpair_add(kST, kH2C, 0, 0, 0), -EOPNOTSUPP);
+    EXPECT_EQ(qdmaCheckQpairAdd(kST, kH2C, 0, 0, 0), -EOPNOTSUPP);
 }
 
 TEST(QdmaCheckQpairAdd, BadModeRejected)
 {
-    EXPECT_EQ(emu_qdma_check_qpair_add(2, kH2C, 0, 0, 0), -EINVAL);
+    EXPECT_EQ(qdmaCheckQpairAdd(2, kH2C, 0, 0, 0), -EINVAL);
 }
 
 TEST(QdmaCheckQpairAdd, CmptDirectionUnsupported)
 {
-    EXPECT_EQ(emu_qdma_check_qpair_add(kMM, kH2C | kCMPT, 0, 0, 0), -EOPNOTSUPP);
-    EXPECT_EQ(emu_qdma_check_qpair_add(kMM, kCMPT, 0, 0, 0), -EOPNOTSUPP);
+    EXPECT_EQ(qdmaCheckQpairAdd(kMM, kH2C | kCMPT, 0, 0, 0), -EOPNOTSUPP);
+    EXPECT_EQ(qdmaCheckQpairAdd(kMM, kCMPT, 0, 0, 0), -EOPNOTSUPP);
 }
 
 TEST(QdmaCheckQpairAdd, EmptyOrUnknownDirMaskRejected)
 {
-    EXPECT_EQ(emu_qdma_check_qpair_add(kMM, 0, 0, 0, 0), -EINVAL);
-    EXPECT_EQ(emu_qdma_check_qpair_add(kMM, 0x8u, 0, 0, 0), -EINVAL);
+    EXPECT_EQ(qdmaCheckQpairAdd(kMM, 0, 0, 0, 0), -EINVAL);
+    EXPECT_EQ(qdmaCheckQpairAdd(kMM, 0x8u, 0, 0, 0), -EINVAL);
 }
 
 TEST(QdmaCheckQpairAdd, OutOfRangeRingIndexRejected)
 {
-    EXPECT_EQ(emu_qdma_check_qpair_add(kMM, kH2C, 16, 0, 0), -EINVAL);
-    EXPECT_EQ(emu_qdma_check_qpair_add(kMM, kH2C, 0, 16, 0), -EINVAL);
-    EXPECT_EQ(emu_qdma_check_qpair_add(kMM, kH2C, 0, 0, 16), -EINVAL);
+    EXPECT_EQ(qdmaCheckQpairAdd(kMM, kH2C, 16, 0, 0), -EINVAL);
+    EXPECT_EQ(qdmaCheckQpairAdd(kMM, kH2C, 0, 16, 0), -EINVAL);
+    EXPECT_EQ(qdmaCheckQpairAdd(kMM, kH2C, 0, 0, 16), -EINVAL);
 }
 
 // ===========================================================================
 // Unit: qpair lifecycle through the spine (no FUSE mount)
 // ===========================================================================
 
-// RAII tree wrapper (mirrors node_test.cpp / bars_test.cpp).
-class Tree {
-public:
-    Tree() { EXPECT_EQ(emu_node_tree_new(&tree_, nullptr), 0); }
-    ~Tree() { cleanup_node_tree(tree_); }
-    emu_node_tree *get() { return tree_; }
-
-private:
-    emu_node_tree *tree_ = nullptr;
-};
-
 // Issue a QPAIR_ADD ioctl against the qdma/ dir inode and return the new QID.
 // `mode`/`dir_mask` default to a valid MM/H2C qpair.
-int qpair_add(emu_node_tree *tree, emu_device *dev, uint32_t *qid_out,
-              uint32_t mode = kMM, uint32_t dir_mask = kH2C)
+int qpair_add(NodeTree &tree, Device *dev, uint32_t *qid_out, uint32_t mode = kMM,
+              uint32_t dir_mask = kH2C)
 {
     struct slash_abi_qdma_qpair_add req {};
     req.size = sizeof(req);
@@ -201,8 +189,8 @@ int qpair_add(emu_node_tree *tree, emu_device *dev, uint32_t *qid_out,
     // _IOWR: in and out alias the same fixed-size region (read-modify-write),
     // exactly as the FUSE layer presents it.
     struct slash_abi_qdma_qpair_add out = req;
-    int rc = emu_node_ioctl(tree, dev->qdma->ino, SLASH_ABI_QDMA_IOCTL_QPAIR_ADD,
-                            &req, sizeof(req), &out, sizeof(out));
+    int rc = tree.ioctl(dev->qdma->ino, SLASH_ABI_QDMA_IOCTL_QPAIR_ADD, &req,
+                        sizeof(req), &out, sizeof(out));
     if (rc == 0 && qid_out != nullptr) {
         *qid_out = out.qid;
     }
@@ -210,26 +198,24 @@ int qpair_add(emu_node_tree *tree, emu_device *dev, uint32_t *qid_out,
 }
 
 // Resolve qdma/qpair<Q> to its inode (bumps lookup_count, modelling an open).
-emu_ino_t open_qpair(emu_node_tree *tree, emu_device *dev, uint32_t qid)
+Ino open_qpair(NodeTree &tree, Device *dev, uint32_t qid)
 {
     char name[32];
     std::snprintf(name, sizeof(name), "qpair%u", qid);
-    emu_node *child = nullptr;
-    EXPECT_EQ(emu_node_lookup_child(tree, dev->qdma->ino, name, &child), 0)
-        << name;
+    Node *child = nullptr;
+    EXPECT_EQ(tree.lookupChild(dev->qdma->ino, name, &child), 0) << name;
     return child != nullptr ? child->ino : 0;
 }
 
 // Find the qpair<Q> node WITHOUT bumping its lookup_count (a plain finder, not
-// an "open"): walk the qdma/ directory's children directly.  emu_node_lookup_child
-// would increment lookup_count, which would skew the cooperative-teardown tests.
-emu_node *find_qpair_node(emu_node_tree *, emu_device *dev, uint32_t qid)
+// an "open"): walk the qdma/ directory's children directly.  lookupChild would
+// increment lookup_count, which would skew the cooperative-teardown tests.
+Node *find_qpair_node(Device *dev, uint32_t qid)
 {
     char name[32];
     std::snprintf(name, sizeof(name), "qpair%u", qid);
-    for (size_t i = 0; i < dev->qdma->children.len; i++) {
-        emu_node *child = dev->qdma->children.d[i];
-        if (!child->unlinked && std::strcmp(child->name, name) == 0) {
+    for (Node *child : dev->qdma->children) {
+        if (!child->unlinked && child->name == name) {
             return child;
         }
     }
@@ -238,48 +224,47 @@ emu_node *find_qpair_node(emu_node_tree *, emu_device *dev, uint32_t qid)
 
 TEST(QdmaEndpoint, AttachAddsIoctlToQdmaDir)
 {
-    Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_qdma_attach(dev), 0);
+    NodeTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(qdmaAttach(*dev), 0);
 
     uint32_t qid = 0xffffffff;
-    ASSERT_EQ(qpair_add(t.get(), dev, &qid), 0);
+    ASSERT_EQ(qpair_add(t, dev, &qid), 0);
     EXPECT_EQ(qid, 0u) << "first allocated QID is 0";
 
     // The qpair<0> file now resolves under qdma/.
-    emu_node *child = find_qpair_node(t.get(), dev, 0);
+    Node *child = find_qpair_node(dev, 0);
     EXPECT_NE(child, nullptr);
 }
 
 TEST(QdmaEndpoint, IoctlOnNonQdmaNodeIsEnotty)
 {
-    // A node without an ioctl hook (a bar file) yields -ENOTTY.
-    Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_qdma_attach(dev), 0);
+    // A node without an ioctl hook (the <BDF>/ dir) yields -ENOTTY.
+    NodeTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(qdmaAttach(*dev), 0);
 
     struct slash_abi_qdma_qpair_add req {};
     req.size = sizeof(req);
     // dev->dir has no ioctl hook.
-    EXPECT_EQ(emu_node_ioctl(t.get(), dev->dir->ino,
-                             SLASH_ABI_QDMA_IOCTL_QPAIR_ADD, &req, sizeof(req),
-                             &req, sizeof(req)),
+    EXPECT_EQ(t.ioctl(dev->dir->ino, SLASH_ABI_QDMA_IOCTL_QPAIR_ADD, &req,
+                      sizeof(req), &req, sizeof(req)),
               -ENOTTY);
 }
 
 TEST(QdmaEndpoint, QidsAreUniqueAndMonotonic)
 {
-    Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_qdma_attach(dev), 0);
+    NodeTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(qdmaAttach(*dev), 0);
 
     std::set<uint32_t> seen;
     for (int i = 0; i < 8; i++) {
         uint32_t qid = 0;
-        ASSERT_EQ(qpair_add(t.get(), dev, &qid), 0) << "add " << i;
+        ASSERT_EQ(qpair_add(t, dev, &qid), 0) << "add " << i;
         EXPECT_EQ(qid, static_cast<uint32_t>(i)) << "monotonic";
         EXPECT_TRUE(seen.insert(qid).second) << "unique";
     }
@@ -287,67 +272,65 @@ TEST(QdmaEndpoint, QidsAreUniqueAndMonotonic)
 
 TEST(QdmaEndpoint, UnsupportedModeRejectedNoQpairCreated)
 {
-    Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_qdma_attach(dev), 0);
+    NodeTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(qdmaAttach(*dev), 0);
 
     uint32_t qid = 0;
-    EXPECT_EQ(qpair_add(t.get(), dev, &qid, kST, kH2C), -EOPNOTSUPP);
-    EXPECT_EQ(qpair_add(t.get(), dev, &qid, kMM, kCMPT), -EOPNOTSUPP);
+    EXPECT_EQ(qpair_add(t, dev, &qid, kST, kH2C), -EOPNOTSUPP);
+    EXPECT_EQ(qpair_add(t, dev, &qid, kMM, kCMPT), -EOPNOTSUPP);
 
     // No qpair node was created by a rejected add: the first VALID add still
     // gets QID 0 (the allocator did not advance for the rejected attempts).
-    ASSERT_EQ(qpair_add(t.get(), dev, &qid, kMM, kH2C), 0);
+    ASSERT_EQ(qpair_add(t, dev, &qid, kMM, kH2C), 0);
     EXPECT_EQ(qid, 0u);
 }
 
 TEST(QdmaEndpoint, ShortIoctlBufferRejected)
 {
-    Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_qdma_attach(dev), 0);
+    NodeTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(qdmaAttach(*dev), 0);
 
     struct slash_abi_qdma_qpair_add req {};
     req.size = sizeof(req);
     req.mode = kMM;
     req.dir_mask = kH2C;
     // in_size too small to hold the input prefix.
-    EXPECT_EQ(emu_node_ioctl(t.get(), dev->qdma->ino,
-                             SLASH_ABI_QDMA_IOCTL_QPAIR_ADD, &req, 4, &req,
-                             sizeof(req)),
+    EXPECT_EQ(t.ioctl(dev->qdma->ino, SLASH_ABI_QDMA_IOCTL_QPAIR_ADD, &req, 4,
+                      &req, sizeof(req)),
               -EINVAL);
     // out_size too small to hold the qid.
-    EXPECT_EQ(emu_node_ioctl(t.get(), dev->qdma->ino,
-                             SLASH_ABI_QDMA_IOCTL_QPAIR_ADD, &req, sizeof(req),
-                             &req, 4),
+    EXPECT_EQ(t.ioctl(dev->qdma->ino, SLASH_ABI_QDMA_IOCTL_QPAIR_ADD, &req,
+                      sizeof(req), &req, 4),
               -EINVAL);
 }
 
 TEST(QdmaEndpoint, UnknownIoctlCmdIsEnotty)
 {
-    Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_qdma_attach(dev), 0);
+    NodeTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(qdmaAttach(*dev), 0);
 
     char buf[64] = {};
-    EXPECT_EQ(emu_node_ioctl(t.get(), dev->qdma->ino, 0xdeadbeef, buf,
-                             sizeof(buf), buf, sizeof(buf)),
+    EXPECT_EQ(t.ioctl(dev->qdma->ino, 0xdeadbeef, buf, sizeof(buf), buf,
+                      sizeof(buf)),
               -ENOTTY);
 }
 
 TEST(QdmaEndpoint, MmRoundTripHbmAndDdr)
 {
-    Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_qdma_attach(dev), 0);
+    NodeTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(qdmaAttach(*dev), 0);
 
     uint32_t qid = 0;
-    ASSERT_EQ(qpair_add(t.get(), dev, &qid), 0);
-    emu_ino_t ino = open_qpair(t.get(), dev, qid);
+    ASSERT_EQ(qpair_add(t, dev, &qid), 0);
+    Ino ino = open_qpair(t, dev, qid);
     ASSERT_NE(ino, 0u);
 
     struct Case {
@@ -367,16 +350,14 @@ TEST(QdmaEndpoint, MmRoundTripHbmAndDdr)
         for (size_t i = 0; i < c.len; i++) {
             in[i] = static_cast<uint8_t>((c.addr + i) & 0xff);
         }
-        ASSERT_EQ(emu_node_pwrite(t.get(), ino,
-                                  reinterpret_cast<const char *>(in.data()),
-                                  c.len, static_cast<off_t>(c.addr)),
+        ASSERT_EQ(t.pwrite(ino, reinterpret_cast<const char *>(in.data()), c.len,
+                           static_cast<off_t>(c.addr)),
                   static_cast<ssize_t>(c.len))
             << "addr " << std::hex << c.addr;
 
         std::vector<uint8_t> out(c.len, 0xcc);
-        ASSERT_EQ(emu_node_pread(t.get(), ino,
-                                 reinterpret_cast<char *>(out.data()), c.len,
-                                 static_cast<off_t>(c.addr)),
+        ASSERT_EQ(t.pread(ino, reinterpret_cast<char *>(out.data()), c.len,
+                          static_cast<off_t>(c.addr)),
                   static_cast<ssize_t>(c.len))
             << "addr " << std::hex << c.addr;
         EXPECT_EQ(in, out) << "addr " << std::hex << c.addr;
@@ -385,19 +366,19 @@ TEST(QdmaEndpoint, MmRoundTripHbmAndDdr)
 
 TEST(QdmaEndpoint, UnwrittenReadsZero)
 {
-    Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_qdma_attach(dev), 0);
+    NodeTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(qdmaAttach(*dev), 0);
 
     uint32_t qid = 0;
-    ASSERT_EQ(qpair_add(t.get(), dev, &qid), 0);
-    emu_ino_t ino = open_qpair(t.get(), dev, qid);
+    ASSERT_EQ(qpair_add(t, dev, &qid), 0);
+    Ino ino = open_qpair(t, dev, qid);
     ASSERT_NE(ino, 0u);
 
     std::vector<uint8_t> out(512, 0xff);
-    ASSERT_EQ(emu_node_pread(t.get(), ino, reinterpret_cast<char *>(out.data()),
-                             out.size(), static_cast<off_t>(SLASH_HBM_BASE + 1)),
+    ASSERT_EQ(t.pread(ino, reinterpret_cast<char *>(out.data()), out.size(),
+                      static_cast<off_t>(SLASH_HBM_BASE + 1)),
               static_cast<ssize_t>(out.size()));
     for (uint8_t b : out) {
         EXPECT_EQ(b, 0u);
@@ -406,54 +387,53 @@ TEST(QdmaEndpoint, UnwrittenReadsZero)
 
 TEST(QdmaEndpoint, OutOfRangeRejected)
 {
-    Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_qdma_attach(dev), 0);
+    NodeTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(qdmaAttach(*dev), 0);
 
     uint32_t qid = 0;
-    ASSERT_EQ(qpair_add(t.get(), dev, &qid), 0);
-    emu_ino_t ino = open_qpair(t.get(), dev, qid);
+    ASSERT_EQ(qpair_add(t, dev, &qid), 0);
+    Ino ino = open_qpair(t, dev, qid);
     ASSERT_NE(ino, 0u);
 
     char buf[16] = {};
     // Below any window.
-    EXPECT_EQ(emu_node_pwrite(t.get(), ino, buf, 8, 0), -ERANGE);
-    EXPECT_EQ(emu_node_pread(t.get(), ino, buf, 8, 0), -ERANGE);
+    EXPECT_EQ(t.pwrite(ino, buf, 8, 0), -ERANGE);
+    EXPECT_EQ(t.pread(ino, buf, 8, 0), -ERANGE);
     // Straddling the HBM end.
-    EXPECT_EQ(emu_node_pwrite(t.get(), ino, buf, 8,
-                              static_cast<off_t>(SLASH_HBM_END - 4)),
+    EXPECT_EQ(t.pwrite(ino, buf, 8, static_cast<off_t>(SLASH_HBM_END - 4)),
               -ERANGE);
 }
 
 TEST(QdmaEndpoint, PerDeviceMemoryIsolation)
 {
-    Tree t;
-    emu_device *d1 = nullptr;
-    emu_device *d2 = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &d1), 0);
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:62:00", &d2), 0);
-    ASSERT_EQ(emu_qdma_attach(d1), 0);
-    ASSERT_EQ(emu_qdma_attach(d2), 0);
+    NodeTree t;
+    Device *d1 = t.addDevice("0000:61:00");
+    Device *d2 = t.addDevice("0000:62:00");
+    ASSERT_NE(d1, nullptr);
+    ASSERT_NE(d2, nullptr);
+    ASSERT_EQ(qdmaAttach(*d1), 0);
+    ASSERT_EQ(qdmaAttach(*d2), 0);
 
     uint32_t q1 = 0;
     uint32_t q2 = 0;
-    ASSERT_EQ(qpair_add(t.get(), d1, &q1), 0);
-    ASSERT_EQ(qpair_add(t.get(), d2, &q2), 0);
-    emu_ino_t i1 = open_qpair(t.get(), d1, q1);
-    emu_ino_t i2 = open_qpair(t.get(), d2, q2);
+    ASSERT_EQ(qpair_add(t, d1, &q1), 0);
+    ASSERT_EQ(qpair_add(t, d2, &q2), 0);
+    Ino i1 = open_qpair(t, d1, q1);
+    Ino i2 = open_qpair(t, d2, q2);
     ASSERT_NE(i1, 0u);
     ASSERT_NE(i2, 0u);
 
     uint64_t v = 0xA5A5A5A5A5A5A5A5ull;
-    ASSERT_EQ(emu_node_pwrite(t.get(), i1, reinterpret_cast<const char *>(&v), 8,
-                              static_cast<off_t>(SLASH_HBM_BASE)),
+    ASSERT_EQ(t.pwrite(i1, reinterpret_cast<const char *>(&v), 8,
+                       static_cast<off_t>(SLASH_HBM_BASE)),
               8);
 
     // Device 2's memory at the same address is untouched (zero).
     uint64_t got = 0xdeadbeef;
-    ASSERT_EQ(emu_node_pread(t.get(), i2, reinterpret_cast<char *>(&got), 8,
-                             static_cast<off_t>(SLASH_HBM_BASE)),
+    ASSERT_EQ(t.pread(i2, reinterpret_cast<char *>(&got), 8,
+                      static_cast<off_t>(SLASH_HBM_BASE)),
               8);
     EXPECT_EQ(got, 0u);
 }
@@ -464,143 +444,134 @@ TEST(QdmaEndpoint, PerDeviceMemoryIsolation)
 // keeps working until the final forget.
 TEST(QdmaEndpoint, NamelessQpairLifecycle)
 {
-    Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_qdma_attach(dev), 0);
+    NodeTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(qdmaAttach(*dev), 0);
 
     uint32_t qid = 0;
-    ASSERT_EQ(qpair_add(t.get(), dev, &qid), 0);
+    ASSERT_EQ(qpair_add(t, dev, &qid), 0);
 
     // Open (lookup bumps lookup_count to 1, modelling the held fd).
-    emu_node *node = find_qpair_node(t.get(), dev, qid);
+    Node *node = find_qpair_node(dev, qid);
     ASSERT_NE(node, nullptr);
-    emu_ino_t ino = node->ino;
+    Ino ino = node->ino;
     {
-        emu_node *child = nullptr;
-        ASSERT_EQ(emu_node_lookup_child(t.get(), dev->qdma->ino, "qpair0",
-                                        &child),
-                  0);
+        Node *child = nullptr;
+        ASSERT_EQ(t.lookupChild(dev->qdma->ino, "qpair0", &child), 0);
     }
 
     // Unlink while open: nameless now -- not resolvable, gone from readdir.
-    emu_node_unlink(t.get(), node);
+    t.unlink(node);
     {
-        emu_node *child = nullptr;
-        EXPECT_EQ(emu_node_lookup_child(t.get(), dev->qdma->ino, "qpair0",
-                                        &child),
-                  -ENOENT);
+        Node *child = nullptr;
+        EXPECT_EQ(t.lookupChild(dev->qdma->ino, "qpair0", &child), -ENOENT);
     }
 
     // The open inode STILL works (a live, merely-unlinked qpair).
     uint64_t v = 0x1122334455667788ull;
-    ASSERT_EQ(emu_node_pwrite(t.get(), ino, reinterpret_cast<const char *>(&v),
-                              8, static_cast<off_t>(SLASH_HBM_BASE)),
+    ASSERT_EQ(t.pwrite(ino, reinterpret_cast<const char *>(&v), 8,
+                       static_cast<off_t>(SLASH_HBM_BASE)),
               8);
     uint64_t got = 0;
-    ASSERT_EQ(emu_node_pread(t.get(), ino, reinterpret_cast<char *>(&got), 8,
-                             static_cast<off_t>(SLASH_HBM_BASE)),
+    ASSERT_EQ(t.pread(ino, reinterpret_cast<char *>(&got), 8,
+                      static_cast<off_t>(SLASH_HBM_BASE)),
               8);
     EXPECT_EQ(got, v);
 
     // Last close: cooperative teardown destroys the node + frees the resource.
-    emu_node_forget(t.get(), ino, 1);
+    t.forget(ino, 1);
 
     // The inode is gone now; an op on the (stale) ino is -ENOENT.
     char buf[8] = {};
-    EXPECT_EQ(emu_node_pread(t.get(), ino, buf, 8,
-                             static_cast<off_t>(SLASH_HBM_BASE)),
-              -ENOENT);
+    EXPECT_EQ(t.pread(ino, buf, 8, static_cast<off_t>(SLASH_HBM_BASE)), -ENOENT);
 }
 
 // Named-but-not-unlinked qpairs are visible in readdir until unlinked: this is
 // how VRTD prunes leftovers from a previous crash.
 TEST(QdmaEndpoint, NamedQpairVisibleInReaddirUntilUnlinked)
 {
-    Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_qdma_attach(dev), 0);
+    NodeTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(qdmaAttach(*dev), 0);
 
     uint32_t qid = 0;
-    ASSERT_EQ(qpair_add(t.get(), dev, &qid), 0);
+    ASSERT_EQ(qpair_add(t, dev, &qid), 0);
 
-    struct Ctx {
-        std::set<std::string> names;
-    } ctx;
-    auto cb = [](void *vctx, const char *name, emu_ino_t, enum emu_node_type) {
-        static_cast<Ctx *>(vctx)->names.insert(name);
+    std::set<std::string> names;
+    auto cb = [&names](const std::string &name, Ino, NodeType) {
+        names.insert(name);
         return true;
     };
-    ASSERT_EQ(emu_node_readdir(t.get(), dev->qdma->ino, cb, &ctx), 0);
-    EXPECT_TRUE(ctx.names.count("qpair0")) << "named qpair visible in readdir";
+    ASSERT_EQ(t.readdir(dev->qdma->ino, cb), 0);
+    EXPECT_TRUE(names.count("qpair0")) << "named qpair visible in readdir";
 
     // Prune it (unlink with no open fd -> immediate destroy).
-    emu_node *node = find_qpair_node(t.get(), dev, qid);
+    Node *node = find_qpair_node(dev, qid);
     ASSERT_NE(node, nullptr);
-    emu_node_unlink(t.get(), node);
+    t.unlink(node);
 
-    Ctx ctx2;
-    ASSERT_EQ(emu_node_readdir(t.get(), dev->qdma->ino, cb, &ctx2), 0);
-    EXPECT_FALSE(ctx2.names.count("qpair0")) << "pruned qpair gone from readdir";
+    std::set<std::string> names2;
+    auto cb2 = [&names2](const std::string &name, Ino, NodeType) {
+        names2.insert(name);
+        return true;
+    };
+    ASSERT_EQ(t.readdir(dev->qdma->ino, cb2), 0);
+    EXPECT_FALSE(names2.count("qpair0")) << "pruned qpair gone from readdir";
 }
 
 // Forced teardown via device revoke: an op on a still-open fd returns -ENODEV.
 TEST(QdmaEndpoint, ForcedTeardownEnodevOnOpenFd)
 {
-    Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_qdma_attach(dev), 0);
+    NodeTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(qdmaAttach(*dev), 0);
 
     uint32_t qid = 0;
-    ASSERT_EQ(qpair_add(t.get(), dev, &qid), 0);
-    emu_ino_t ino = open_qpair(t.get(), dev, qid); // bumps lookup_count
+    ASSERT_EQ(qpair_add(t, dev, &qid), 0);
+    Ino ino = open_qpair(t, dev, qid); // bumps lookup_count
 
     // Forced removal: the lookup above keeps the node alive as a dead orphan.
-    ASSERT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);
+    ASSERT_EQ(t.revokeDevice("0000:61:00"), 0);
 
     char buf[8] = {};
-    EXPECT_EQ(emu_node_pread(t.get(), ino, buf, 8,
-                             static_cast<off_t>(SLASH_HBM_BASE)),
-              -ENODEV);
-    EXPECT_EQ(emu_node_pwrite(t.get(), ino, buf, 8,
-                              static_cast<off_t>(SLASH_HBM_BASE)),
+    EXPECT_EQ(t.pread(ino, buf, 8, static_cast<off_t>(SLASH_HBM_BASE)), -ENODEV);
+    EXPECT_EQ(t.pwrite(ino, buf, 8, static_cast<off_t>(SLASH_HBM_BASE)),
               -ENODEV);
 
     // Cooperative close after a forced teardown is a no-op (idempotent): the
     // forget must not crash or double-free.
-    emu_node_forget(t.get(), ino, 1);
+    t.forget(ino, 1);
 }
 
 // Double-teardown idempotency: forced revoke then cooperative forget, both on a
 // qpair that was unlinked-while-open. Neither path double-frees (ASan witness).
 TEST(QdmaEndpoint, DoubleTeardownIdempotent)
 {
-    Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_qdma_attach(dev), 0);
+    NodeTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(qdmaAttach(*dev), 0);
 
     uint32_t qid = 0;
-    ASSERT_EQ(qpair_add(t.get(), dev, &qid), 0);
-    emu_node *node = find_qpair_node(t.get(), dev, qid);
+    ASSERT_EQ(qpair_add(t, dev, &qid), 0);
+    Node *node = find_qpair_node(dev, qid);
     ASSERT_NE(node, nullptr);
-    emu_ino_t ino = node->ino;
+    Ino ino = node->ino;
 
     // Open + unlink-while-open: nameless, registry+inode refs both live.
     {
-        emu_node *child = nullptr;
-        ASSERT_EQ(emu_node_lookup_child(t.get(), dev->qdma->ino, "qpair0",
-                                        &child),
-                  0);
+        Node *child = nullptr;
+        ASSERT_EQ(t.lookupChild(dev->qdma->ino, "qpair0", &child), 0);
     }
-    emu_node_unlink(t.get(), node);
+    t.unlink(node);
 
     // Forced teardown drops the registry ref + runs teardown once.
-    ASSERT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);
+    ASSERT_EQ(t.revokeDevice("0000:61:00"), 0);
     // Cooperative trigger drops the inode ref; teardown is a no-op the 2nd time.
-    emu_node_forget(t.get(), ino, 1);
+    t.forget(ino, 1);
     // No crash / no double free => pass (ASan build is the real assertion).
     SUCCEED();
 }
@@ -609,26 +580,26 @@ TEST(QdmaEndpoint, MultipleQpairsShareDeviceMemory)
 {
     // Two qpairs of the same device address the same per-device store: a write
     // through one is visible through the other (shared HBM/DDR).
-    Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_qdma_attach(dev), 0);
+    NodeTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(qdmaAttach(*dev), 0);
 
     uint32_t qa = 0;
     uint32_t qb = 0;
-    ASSERT_EQ(qpair_add(t.get(), dev, &qa), 0);
-    ASSERT_EQ(qpair_add(t.get(), dev, &qb), 0);
+    ASSERT_EQ(qpair_add(t, dev, &qa), 0);
+    ASSERT_EQ(qpair_add(t, dev, &qb), 0);
     ASSERT_NE(qa, qb);
-    emu_ino_t ia = open_qpair(t.get(), dev, qa);
-    emu_ino_t ib = open_qpair(t.get(), dev, qb);
+    Ino ia = open_qpair(t, dev, qa);
+    Ino ib = open_qpair(t, dev, qb);
 
     uint64_t v = 0xCAFEF00DDEADBEEFull;
-    ASSERT_EQ(emu_node_pwrite(t.get(), ia, reinterpret_cast<const char *>(&v), 8,
-                              static_cast<off_t>(SLASH_DDR_BASE + 4096)),
+    ASSERT_EQ(t.pwrite(ia, reinterpret_cast<const char *>(&v), 8,
+                       static_cast<off_t>(SLASH_DDR_BASE + 4096)),
               8);
     uint64_t got = 0;
-    ASSERT_EQ(emu_node_pread(t.get(), ib, reinterpret_cast<char *>(&got), 8,
-                             static_cast<off_t>(SLASH_DDR_BASE + 4096)),
+    ASSERT_EQ(t.pread(ib, reinterpret_cast<char *>(&got), 8,
+                      static_cast<off_t>(SLASH_DDR_BASE + 4096)),
               8);
     EXPECT_EQ(got, v);
 }

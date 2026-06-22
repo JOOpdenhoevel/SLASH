@@ -25,16 +25,16 @@
  * Two layers, matching the build rules (CMake+CTest, GTest, scratch under .tmp):
  *
  *   - Unit, against slash_emu_core directly (no FUSE mount): the pure access
- *     validation matrix (emu_bar_check_access), and the end-to-end register
- *     round-trip + geometry through the spine (emu_bars_attach -> emu_node_stat /
- *     emu_node_pread / emu_node_pwrite), including the -ENODEV liveness gate
- *     after a forced revoke (reachable here before T9 wires revoke to a
- *     mount-visible trigger).
+ *     validation matrix (barCheckAccess), and the end-to-end register
+ *     round-trip + geometry through the spine (barsAttach -> tree.stat /
+ *     tree.pread / tree.pwrite), including the -ENODEV liveness gate after a
+ *     forced revoke.
  *
- *   - Integration, over the real FUSE mount (fork+exec the freshly-built daemon,
- *     the info_test.cpp pattern): open /<BDF>/bars/bar{0,2,4}, round-trip
- *     register writes/reads, assert the file sizes, reject misaligned/bad-width
- *     and beyond-BAR transfers, and assert mmap is NOT offered.
+ *   - Integration, over the real FUSE mount (fork+exec the freshly-built
+ *     daemon, the info_test.cpp pattern): open /<BDF>/bars/bar{0,2,4},
+ *     round-trip register writes/reads, assert the file sizes, reject
+ *     misaligned/bad-width and beyond-BAR transfers, and assert mmap is NOT
+ *     offered.
  */
 
 #include <gtest/gtest.h>
@@ -57,16 +57,16 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-extern "C" {
-#include "bars.h"
-#include "node.h"
+#include "bars.hpp"
+#include "node.hpp"
 #include "slash/uapi/slash_abi.h"
-}
+
+using namespace slash::emu;
 
 namespace {
 
 // ===========================================================================
-// Unit: pure access validation matrix (emu_bar_check_access)
+// Unit: pure access validation matrix (barCheckAccess)
 // ===========================================================================
 
 TEST(BarCheckAccess, AllValidWidthsAlignedAccepted)
@@ -74,8 +74,8 @@ TEST(BarCheckAccess, AllValidWidthsAlignedAccepted)
     const uint64_t bar = SLASH_BAR_CLK_SIZE;  // 512 KiB
     for (size_t w : {1u, 2u, 4u, 8u}) {
         // Aligned at 0 and at a width-multiple offset deep in the BAR.
-        EXPECT_EQ(emu_bar_check_access(0, w, bar), 0) << "width " << w;
-        EXPECT_EQ(emu_bar_check_access(static_cast<off_t>(8 * w), w, bar), 0)
+        EXPECT_EQ(barCheckAccess(0, w, bar), 0) << "width " << w;
+        EXPECT_EQ(barCheckAccess(static_cast<off_t>(8 * w), w, bar), 0)
             << "width " << w;
     }
 }
@@ -84,7 +84,7 @@ TEST(BarCheckAccess, BadWidthsRejected)
 {
     const uint64_t bar = SLASH_BAR_CLK_SIZE;
     for (size_t w : {0u, 3u, 5u, 6u, 7u, 9u, 16u, 1024u}) {
-        EXPECT_EQ(emu_bar_check_access(0, w, bar), -EINVAL) << "width " << w;
+        EXPECT_EQ(barCheckAccess(0, w, bar), -EINVAL) << "width " << w;
     }
 }
 
@@ -92,30 +92,30 @@ TEST(BarCheckAccess, MisalignedOffsetsRejected)
 {
     const uint64_t bar = SLASH_BAR_CLK_SIZE;
     // width 2 at odd offset; width 4 at offset 2; width 8 at offset 4.
-    EXPECT_EQ(emu_bar_check_access(1, 2, bar), -EINVAL);
-    EXPECT_EQ(emu_bar_check_access(2, 4, bar), -EINVAL);
-    EXPECT_EQ(emu_bar_check_access(4, 8, bar), -EINVAL);
-    EXPECT_EQ(emu_bar_check_access(3, 1, bar), 0);  // width 1 is always aligned
+    EXPECT_EQ(barCheckAccess(1, 2, bar), -EINVAL);
+    EXPECT_EQ(barCheckAccess(2, 4, bar), -EINVAL);
+    EXPECT_EQ(barCheckAccess(4, 8, bar), -EINVAL);
+    EXPECT_EQ(barCheckAccess(3, 1, bar), 0);  // width 1 is always aligned
 }
 
 TEST(BarCheckAccess, NegativeOffsetRejected)
 {
-    EXPECT_EQ(emu_bar_check_access(-1, 1, SLASH_BAR_CLK_SIZE), -EINVAL);
-    EXPECT_EQ(emu_bar_check_access(-8, 8, SLASH_BAR_CLK_SIZE), -EINVAL);
+    EXPECT_EQ(barCheckAccess(-1, 1, SLASH_BAR_CLK_SIZE), -EINVAL);
+    EXPECT_EQ(barCheckAccess(-8, 8, SLASH_BAR_CLK_SIZE), -EINVAL);
 }
 
 TEST(BarCheckAccess, BeyondBarRejected)
 {
     const uint64_t bar = SLASH_BAR_CLK_SIZE;
     // Last valid 8-byte read starts at bar - 8.
-    EXPECT_EQ(emu_bar_check_access(static_cast<off_t>(bar - 8), 8, bar), 0);
+    EXPECT_EQ(barCheckAccess(static_cast<off_t>(bar - 8), 8, bar), 0);
     // A transfer that straddles the end is invalid, not clamped.
-    EXPECT_EQ(emu_bar_check_access(static_cast<off_t>(bar - 4), 8, bar),
+    EXPECT_EQ(barCheckAccess(static_cast<off_t>(bar - 4), 8, bar),
               -EINVAL);
     // A transfer starting exactly at the end.
-    EXPECT_EQ(emu_bar_check_access(static_cast<off_t>(bar), 1, bar), -EINVAL);
+    EXPECT_EQ(barCheckAccess(static_cast<off_t>(bar), 1, bar), -EINVAL);
     // The last valid single byte.
-    EXPECT_EQ(emu_bar_check_access(static_cast<off_t>(bar - 1), 1, bar), 0);
+    EXPECT_EQ(barCheckAccess(static_cast<off_t>(bar - 1), 1, bar), 0);
 }
 
 // ===========================================================================
@@ -125,19 +125,18 @@ TEST(BarCheckAccess, BeyondBarRejected)
 // RAII tree wrapper (mirrors node_test.cpp / info_test.cpp).
 class Tree {
 public:
-    Tree() { EXPECT_EQ(emu_node_tree_new(&tree_, nullptr), 0); }
-    ~Tree() { cleanup_node_tree(tree_); }
-    emu_node_tree *get() { return tree_; }
+    Tree() = default;
+    NodeTree &get() { return tree_; }
 
 private:
-    emu_node_tree *tree_ = nullptr;
+    NodeTree tree_;
 };
 
 // Resolve a bars/<name> inode under a device.
-emu_ino_t bar_ino(emu_node_tree *tree, emu_device *dev, const char *name)
+Ino bar_ino(NodeTree &tree, Device *dev, const char *name)
 {
-    emu_node *child = nullptr;
-    EXPECT_EQ(emu_node_lookup_child(tree, dev->bars->ino, name, &child), 0);
+    Node *child = nullptr;
+    EXPECT_EQ(tree.lookupChild(dev->bars->ino, name, &child), 0);
     return child != nullptr ? child->ino : 0;
 }
 
@@ -155,21 +154,19 @@ constexpr BarSpec kBars[] = {
 TEST(BarsEndpoint, AttachCreatesExactlyThreeBars)
 {
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_bars_attach(dev), 0);
+    Device *dev = t.get().addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(barsAttach(*dev), 0);
 
     // bar0, bar2, bar4 resolve; bar1/bar3/bar5 do not.
     for (const auto &b : kBars) {
-        emu_node *child = nullptr;
-        EXPECT_EQ(emu_node_lookup_child(t.get(), dev->bars->ino, b.name, &child),
-                  0)
+        Node *child = nullptr;
+        EXPECT_EQ(t.get().lookupChild(dev->bars->ino, b.name, &child), 0)
             << b.name;
     }
     for (const char *absent : {"bar1", "bar3", "bar5"}) {
-        emu_node *child = nullptr;
-        EXPECT_EQ(emu_node_lookup_child(t.get(), dev->bars->ino, absent, &child),
-                  -ENOENT)
+        Node *child = nullptr;
+        EXPECT_EQ(t.get().lookupChild(dev->bars->ino, absent, &child), -ENOENT)
             << absent;
     }
 }
@@ -177,15 +174,15 @@ TEST(BarsEndpoint, AttachCreatesExactlyThreeBars)
 TEST(BarsEndpoint, GetattrReportsBarSize)
 {
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_bars_attach(dev), 0);
+    Device *dev = t.get().addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(barsAttach(*dev), 0);
 
     for (const auto &b : kBars) {
-        emu_ino_t ino = bar_ino(t.get(), dev, b.name);
+        Ino ino = bar_ino(t.get(), dev, b.name);
         ASSERT_NE(ino, 0u) << b.name;
-        struct stat st {};
-        ASSERT_EQ(emu_node_stat(t.get(), ino, &st), 0) << b.name;
+        struct stat st{};
+        ASSERT_EQ(t.get().stat(ino, &st), 0) << b.name;
         EXPECT_TRUE(S_ISREG(st.st_mode)) << b.name;
         EXPECT_EQ(st.st_size, static_cast<off_t>(b.size)) << b.name;
     }
@@ -194,10 +191,10 @@ TEST(BarsEndpoint, GetattrReportsBarSize)
 TEST(BarsEndpoint, RoundTripWriteThenReadAtVariousOffsets)
 {
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_bars_attach(dev), 0);
-    emu_ino_t ino = bar_ino(t.get(), dev, "bar0");
+    Device *dev = t.get().addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(barsAttach(*dev), 0);
+    Ino ino = bar_ino(t.get(), dev, "bar0");
     ASSERT_NE(ino, 0u);
 
     struct Case {
@@ -215,14 +212,14 @@ TEST(BarsEndpoint, RoundTripWriteThenReadAtVariousOffsets)
 
     for (const auto &c : cases) {
         uint64_t in = c.value;
-        ASSERT_EQ(emu_node_pwrite(t.get(), ino,
+        ASSERT_EQ(t.get().pwrite(ino,
                                   reinterpret_cast<const char *>(&in), c.width,
                                   c.off),
                   static_cast<ssize_t>(c.width))
             << "off " << c.off << " width " << c.width;
 
         uint64_t out = 0;
-        ASSERT_EQ(emu_node_pread(t.get(), ino, reinterpret_cast<char *>(&out),
+        ASSERT_EQ(t.get().pread(ino, reinterpret_cast<char *>(&out),
                                  c.width, c.off),
                   static_cast<ssize_t>(c.width))
             << "off " << c.off << " width " << c.width;
@@ -236,19 +233,17 @@ TEST(BarsEndpoint, RoundTripWriteThenReadAtVariousOffsets)
 TEST(BarsEndpoint, ReadOfUnwrittenIsZero)
 {
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_bars_attach(dev), 0);
-    emu_ino_t ino = bar_ino(t.get(), dev, "bar4");
+    Device *dev = t.get().addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(barsAttach(*dev), 0);
+    Ino ino = bar_ino(t.get(), dev, "bar4");
     ASSERT_NE(ino, 0u);
 
     // No write has touched this BAR; every aligned read returns zero, never EIO.
     for (off_t off : {static_cast<off_t>(0), static_cast<off_t>(4096),
                       static_cast<off_t>(SLASH_BAR_CLK_SIZE - 8)}) {
         uint64_t out = 0xdeadbeef;
-        ASSERT_EQ(emu_node_pread(t.get(), ino, reinterpret_cast<char *>(&out), 8,
-                                 off),
-                  8)
+        ASSERT_EQ(t.get().pread(ino, reinterpret_cast<char *>(&out), 8, off), 8)
             << "off " << off;
         EXPECT_EQ(out, 0u) << "off " << off;
     }
@@ -257,39 +252,39 @@ TEST(BarsEndpoint, ReadOfUnwrittenIsZero)
 TEST(BarsEndpoint, ValidationMatrixThroughSpine)
 {
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_bars_attach(dev), 0);
-    emu_ino_t ino = bar_ino(t.get(), dev, "bar0");
+    Device *dev = t.get().addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(barsAttach(*dev), 0);
+    Ino ino = bar_ino(t.get(), dev, "bar0");
     ASSERT_NE(ino, 0u);
 
     char buf[8] = {};
 
     // Valid widths aligned: accepted (both read and write).
     for (size_t w : {1u, 2u, 4u, 8u}) {
-        EXPECT_EQ(emu_node_pread(t.get(), ino, buf, w, 0),
+        EXPECT_EQ(t.get().pread(ino, buf, w, 0),
                   static_cast<ssize_t>(w));
-        EXPECT_EQ(emu_node_pwrite(t.get(), ino, buf, w, 0),
+        EXPECT_EQ(t.get().pwrite(ino, buf, w, 0),
                   static_cast<ssize_t>(w));
     }
 
     // Bad widths: rejected.
     for (size_t w : {0u, 3u, 5u, 6u, 7u}) {
-        EXPECT_EQ(emu_node_pread(t.get(), ino, buf, w, 0), -EINVAL)
+        EXPECT_EQ(t.get().pread(ino, buf, w, 0), -EINVAL)
             << "read width " << w;
-        EXPECT_EQ(emu_node_pwrite(t.get(), ino, buf, w, 0), -EINVAL)
+        EXPECT_EQ(t.get().pwrite(ino, buf, w, 0), -EINVAL)
             << "write width " << w;
     }
 
     // Misaligned offsets: rejected.
-    EXPECT_EQ(emu_node_pread(t.get(), ino, buf, 4, 2), -EINVAL);
-    EXPECT_EQ(emu_node_pwrite(t.get(), ino, buf, 4, 2), -EINVAL);
+    EXPECT_EQ(t.get().pread(ino, buf, 4, 2), -EINVAL);
+    EXPECT_EQ(t.get().pwrite(ino, buf, 4, 2), -EINVAL);
 
     // Beyond BAR: rejected.
-    EXPECT_EQ(emu_node_pread(t.get(), ino, buf, 8,
+    EXPECT_EQ(t.get().pread(ino, buf, 8,
                              static_cast<off_t>(SLASH_BAR_USER_SIZE - 4)),
               -EINVAL);
-    EXPECT_EQ(emu_node_pwrite(t.get(), ino, buf, 8,
+    EXPECT_EQ(t.get().pwrite(ino, buf, 8,
                               static_cast<off_t>(SLASH_BAR_USER_SIZE - 4)),
               -EINVAL);
 }
@@ -297,46 +292,44 @@ TEST(BarsEndpoint, ValidationMatrixThroughSpine)
 TEST(BarsEndpoint, PerDeviceIsolation)
 {
     Tree t;
-    emu_device *d1 = nullptr;
-    emu_device *d2 = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &d1), 0);
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:62:00", &d2), 0);
-    ASSERT_EQ(emu_bars_attach(d1), 0);
-    ASSERT_EQ(emu_bars_attach(d2), 0);
+    Device *d1 = t.get().addDevice("0000:61:00");
+    Device *d2 = t.get().addDevice("0000:62:00");
+    ASSERT_NE(d1, nullptr);
+    ASSERT_NE(d2, nullptr);
+    ASSERT_EQ(barsAttach(*d1), 0);
+    ASSERT_EQ(barsAttach(*d2), 0);
 
-    emu_ino_t i1 = bar_ino(t.get(), d1, "bar0");
-    emu_ino_t i2 = bar_ino(t.get(), d2, "bar0");
+    Ino i1 = bar_ino(t.get(), d1, "bar0");
+    Ino i2 = bar_ino(t.get(), d2, "bar0");
     ASSERT_NE(i1, 0u);
     ASSERT_NE(i2, 0u);
     ASSERT_NE(i1, i2);
 
     uint32_t v = 0xCAFEBABE;
-    ASSERT_EQ(emu_node_pwrite(t.get(), i1, reinterpret_cast<const char *>(&v), 4,
-                              64),
+    ASSERT_EQ(t.get().pwrite(i1, reinterpret_cast<const char *>(&v), 4, 64),
               4);
 
     // Device 2's BAR0 at the same offset is untouched (still zero).
     uint32_t got = 0xffffffff;
-    ASSERT_EQ(
-        emu_node_pread(t.get(), i2, reinterpret_cast<char *>(&got), 4, 64), 4);
+    ASSERT_EQ(t.get().pread(i2, reinterpret_cast<char *>(&got), 4, 64), 4);
     EXPECT_EQ(got, 0u);
 }
 
 TEST(BarsEndpoint, AccessAfterRevokeIsEnodev)
 {
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_bars_attach(dev), 0);
-    emu_ino_t ino = bar_ino(t.get(), dev, "bar0");  // bumps lookup_count
+    Device *dev = t.get().addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(barsAttach(*dev), 0);
+    Ino ino = bar_ino(t.get(), dev, "bar0");  // bumps lookup_count
     ASSERT_NE(ino, 0u);
 
     // The lookup above holds the node alive as a dead orphan across revoke.
-    ASSERT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);
+    ASSERT_EQ(t.get().revokeDevice("0000:61:00"), 0);
 
     char buf[8] = {};
-    EXPECT_EQ(emu_node_pread(t.get(), ino, buf, 4, 0), -ENODEV);
-    EXPECT_EQ(emu_node_pwrite(t.get(), ino, buf, 4, 0), -ENODEV);
+    EXPECT_EQ(t.get().pread(ino, buf, 4, 0), -ENODEV);
+    EXPECT_EQ(t.get().pwrite(ino, buf, 4, 0), -ENODEV);
 }
 
 TEST(BarsEndpoint, WriteToReadOnlyNodeIsEio)
@@ -344,15 +337,14 @@ TEST(BarsEndpoint, WriteToReadOnlyNodeIsEio)
     // A node with no write hook (the spine's read-only default) yields -EIO on
     // pwrite: confirms the write dispatch mirrors the read dispatch.
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
+    Device *dev = t.get().addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
 
-    emu_node *node = nullptr;
-    ASSERT_EQ(emu_node_create_child(t.get(), dev->dir, "plain", EMU_NODE_FILE,
-                                    0444, nullptr, nullptr, &node),
-              0);
+    Node *node = t.get().createChild(dev->dir, "plain", NodeType::File,
+                                     0444, nullptr);
+    ASSERT_NE(node, nullptr);
     char buf[4] = {};
-    EXPECT_EQ(emu_node_pwrite(t.get(), node->ino, buf, 4, 0), -EIO);
+    EXPECT_EQ(t.get().pwrite(node->ino, buf, 4, 0), -EIO);
 }
 
 // ===========================================================================
@@ -410,7 +402,7 @@ bool wait_for(Pred pred, int timeout_ms)
 
 bool mount_is_ready(const std::string &mountpoint)
 {
-    struct statfs sfs {};
+    struct statfs sfs{};
     if (::statfs(mountpoint.c_str(), &sfs) != 0) {
         return false;
     }
@@ -475,7 +467,7 @@ TEST(BarsMount, FileSizesMatchGeometry)
             { "bar4", static_cast<off_t>(SLASH_BAR_CLK_SIZE) },
         };
         for (const auto &e : expect) {
-            struct stat st {};
+            struct stat st{};
             ASSERT_EQ(::stat((base + e.name).c_str(), &st), 0)
                 << e.name << ": " << std::strerror(errno);
             EXPECT_TRUE(S_ISREG(st.st_mode)) << e.name;
@@ -483,7 +475,7 @@ TEST(BarsMount, FileSizesMatchGeometry)
         }
         // The absent BARs do not exist.
         for (const char *absent : {"bar1", "bar3", "bar5"}) {
-            struct stat st {};
+            struct stat st{};
             EXPECT_NE(::stat((base + absent).c_str(), &st), 0) << absent;
             EXPECT_EQ(errno, ENOENT) << absent;
         }
@@ -573,10 +565,8 @@ TEST(BarsMount, BeyondBarRejected)
 }
 
 // A SHARED mapping -- the only kind that could ever be a coherent register
-// window the daemon would have to keep in sync and zap on revocation -- is
-// rejected at mmap() time.  With FOPEN_DIRECT_IO the kernel cannot provide
-// MAP_SHARED coherency and returns -ENODEV (fs/fuse/file.c fuse_file_mmap),
-// for both writable and read-only SHARED maps.
+// window -- is rejected at mmap() time.  With FOPEN_DIRECT_IO the kernel
+// cannot provide MAP_SHARED coherency and returns -ENODEV.
 TEST(BarsMount, MmapSharedIsRejected)
 {
     with_mounted_daemon([](const std::string &mountpoint) {
@@ -605,26 +595,9 @@ TEST(BarsMount, MmapSharedIsRejected)
     });
 }
 
-// The "no mmap" guarantee, defect-2 arm: a MAP_PRIVATE mapping is a kernel-side
-// page-cache COW snapshot that no userspace FUSE op set can refuse at mmap()
-// time (with FOPEN_DIRECT_IO the kernel routes MAP_PRIVATE through
-// generic_file_mmap; there is no low-level .mmap hook to veto it).  What the
-// daemon MUST guarantee is that touching such a mapping never HANGS the client:
-// the first page-fault issues a page-sized FUSE_READ, which the BAR read hook
-// rejects (size is not a {1,2,4,8} register width) and the daemon answers
-// PROMPTLY with -EINVAL, so the fault resolves to a prompt SIGBUS rather than
-// blocking forever.  We verify this by dereferencing in a CHILD under a
-// watchdog: the child must terminate quickly (by SIGBUS, or cleanly if a future
-// kernel rejects the map outright) -- it must never be killed by the watchdog
-// for hanging.
-//
-// The watchdog must distinguish "hung" from "slow".  A genuine hang is UNBOUNDED
-// (the FUSE_READ a fault issues is never answered, so no signal arrives and the
-// child waits forever -- any finite margin catches it); a child that is merely
-// CPU-starved under ASan + a contended -j16 ctest run is still making progress.
-// A tight 4 s margin misclassified the latter as a hang and flaked, so the margin
-// is sized generously above the worst observed contended fork+open+mmap+fault
-// round-trip while staying finite (a real wedge still FAILS).
+// MAP_PRIVATE deref: the first page-fault issues a page-sized FUSE_READ which
+// the BAR hook rejects with -EINVAL, so the fault resolves promptly (SIGBUS)
+// rather than hanging.
 static constexpr int kDerefWatchdogMs = 30000;
 
 TEST(BarsMount, MmapPrivateDerefFaultsPromptlyNeverHangs)
@@ -635,15 +608,6 @@ TEST(BarsMount, MmapPrivateDerefFaultsPromptlyNeverHangs)
         pid_t child = ::fork();
         ASSERT_NE(child, -1) << "fork failed: " << std::strerror(errno);
         if (child == 0) {
-            // Child: map MAP_PRIVATE and touch the first page.  Either the map
-            // is refused (clean exit 0) or the deref faults (SIGBUS).  Either
-            // way we must reach a terminal state fast; we never loop/block.
-            //
-            // Restore the default SIGBUS disposition first: under the ASan/UBSan
-            // build the sanitizer installs its own SIGBUS handler that prints a
-            // DEADLYSIGNAL report and _exit()s with a nonzero code, which would
-            // otherwise mask the clean signal-death we are characterizing.  With
-            // SIG_DFL the fault terminates the child by SIGBUS in every build.
             ::signal(SIGBUS, SIG_DFL);
             int fd = ::open(path.c_str(), O_RDONLY);
             if (fd < 0) {
@@ -651,16 +615,13 @@ TEST(BarsMount, MmapPrivateDerefFaultsPromptlyNeverHangs)
             }
             void *p = ::mmap(nullptr, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
             if (p == MAP_FAILED) {
-                ::_exit(0);  // map refused outright -- the ideal end state.
+                ::_exit(0);
             }
             volatile char c = *static_cast<volatile char *>(p);
-            (void) c;        // deref returned without faulting (e.g. served 0s).
+            (void) c;
             ::_exit(0);
         }
 
-        // Parent: watchdog.  The load-bearing assertion is that the child
-        // reaches a terminal state PROMPTLY; a hang (watchdog must SIGKILL) is
-        // the defect-2 failure and the only failure this test cares about.
         int status = 0;
         bool finished = wait_for(
             [&] { return ::waitpid(child, &status, WNOHANG) == child; },
@@ -672,11 +633,6 @@ TEST(BarsMount, MmapPrivateDerefFaultsPromptlyNeverHangs)
                       "child) -- a page-fault read was left unanswered";
         }
 
-        // Any prompt terminal state is acceptable: a clean exit (map refused or
-        // deref served zeros) or death by SIGBUS (the prompt fault, possibly via
-        // the sanitizer's interposed handler under the ASan build).  We only
-        // reject a missing/forced terminal state, already handled above.  When
-        // the child died by a signal, require it to be SIGBUS specifically.
         SUCCEED() << "MAP_PRIVATE deref reached a terminal state promptly "
                      "(no hang)";
         if (WIFSIGNALED(status)) {

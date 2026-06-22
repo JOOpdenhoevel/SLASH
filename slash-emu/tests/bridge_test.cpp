@@ -22,7 +22,7 @@
  * @file bridge_test.cpp
  * @brief Unit tests for the T10 SIM bridge, against slash_emu_core (no FUSE mount).
  *
- *   - emu_qdma_is_reconfig_write predicate matrix.
+ *   - qdmaIsReconfigWrite predicate matrix.
  *   - The model client protocol vs the CI stub model (spawned over an ipc://
  *     socket): start/exit handshake, reg/scalar round-trip, populate/fetch
  *     round-trip, byte-exactness.
@@ -42,6 +42,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -52,12 +54,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-extern "C" {
-#include "model_client.h"
-#include "qdma.h"
+#include "model_client.hpp"
+#include "qdma.hpp"
+#include "vbin.hpp"
+
 #include "slash/uapi/slash_abi.h"
-#include "vbin.h"
-}
+
+using namespace slash::emu;
 
 namespace {
 
@@ -183,26 +186,25 @@ std::vector<uint8_t> read_stub_binary()
 
 TEST(BridgeReconfigPredicate, RegionMatchedWriteOnly)
 {
-    EXPECT_EQ(emu_qdma_is_reconfig_write(SLASH_RECONFIG_BASE, 8), 1);
-    EXPECT_EQ(emu_qdma_is_reconfig_write(SLASH_RECONFIG_END - 8, 8), 1);
-    EXPECT_EQ(emu_qdma_is_reconfig_write(SLASH_RECONFIG_BASE,
-                                         SLASH_RECONFIG_END - SLASH_RECONFIG_BASE),
-              1);
+    EXPECT_TRUE(qdmaIsReconfigWrite(SLASH_RECONFIG_BASE, 8));
+    EXPECT_TRUE(qdmaIsReconfigWrite(SLASH_RECONFIG_END - 8, 8));
+    EXPECT_TRUE(qdmaIsReconfigWrite(SLASH_RECONFIG_BASE,
+                                    SLASH_RECONFIG_END - SLASH_RECONFIG_BASE));
 }
 
 TEST(BridgeReconfigPredicate, OutsideRegionNotMatched)
 {
-    EXPECT_EQ(emu_qdma_is_reconfig_write(SLASH_HBM_BASE, 8), 0);
-    EXPECT_EQ(emu_qdma_is_reconfig_write(SLASH_DDR_BASE, 8), 0);
-    EXPECT_EQ(emu_qdma_is_reconfig_write(SLASH_RECONFIG_BASE - 1, 1), 0);
-    EXPECT_EQ(emu_qdma_is_reconfig_write(SLASH_RECONFIG_END, 1), 0);
+    EXPECT_FALSE(qdmaIsReconfigWrite(SLASH_HBM_BASE, 8));
+    EXPECT_FALSE(qdmaIsReconfigWrite(SLASH_DDR_BASE, 8));
+    EXPECT_FALSE(qdmaIsReconfigWrite(SLASH_RECONFIG_BASE - 1, 1));
+    EXPECT_FALSE(qdmaIsReconfigWrite(SLASH_RECONFIG_END, 1));
 }
 
 TEST(BridgeReconfigPredicate, ZeroLengthAndOverflowNotMatched)
 {
-    EXPECT_EQ(emu_qdma_is_reconfig_write(SLASH_RECONFIG_BASE, 0), 0);
-    EXPECT_EQ(emu_qdma_is_reconfig_write(SLASH_RECONFIG_END - 4, 8), 0); // straddle
-    EXPECT_EQ(emu_qdma_is_reconfig_write(UINT64_MAX, 8), 0);            // overflow
+    EXPECT_FALSE(qdmaIsReconfigWrite(SLASH_RECONFIG_BASE, 0));
+    EXPECT_FALSE(qdmaIsReconfigWrite(SLASH_RECONFIG_END - 4, 8)); // straddle
+    EXPECT_FALSE(qdmaIsReconfigWrite(UINT64_MAX, 8));             // overflow
 }
 
 // ===========================================================================
@@ -214,7 +216,7 @@ protected:
     std::string dir;
     std::string endpoint;
     pid_t pid = -1;
-    emu_model_client *client = nullptr;
+    std::unique_ptr<ModelClient> client;
 
     void SetUp() override
     {
@@ -226,17 +228,13 @@ protected:
         pid = spawn_stub(endpoint, env);
         ASSERT_GT(pid, 0);
     }
-    void connect()
+    void do_connect()
     {
-        ASSERT_EQ(emu_model_client_connect(endpoint.c_str(),
-                                           EMU_MODEL_DEFAULT_TIMEOUT_MS, &client),
-                  0);
+        ASSERT_EQ(ModelClient::connect(endpoint, kModelDefaultTimeoutMs, client), 0);
     }
     void TearDown() override
     {
-        if (client != nullptr) {
-            emu_model_client_close(client);
-        }
+        client.reset(); /* RAII: closes the socket */
         reap(pid);
         rm_rf(dir);
     }
@@ -245,48 +243,51 @@ protected:
 TEST_F(StubModel, StartRegScalarRoundTrip)
 {
     start_stub();
-    connect();
-    ASSERT_EQ(emu_model_client_start(client), 0);
+    do_connect();
+    ASSERT_EQ(client->start(), 0);
 
-    ASSERT_EQ(emu_model_reg_write(client, 0x40, 0xdeadbeef), 0);
+    ASSERT_EQ(client->regWrite(0x40, 0xdeadbeef), 0);
     uint32_t v = 0;
-    ASSERT_EQ(emu_model_scalar_read(client, 0x40, &v), 0);
+    ASSERT_EQ(client->scalarRead(0x40, v), 0);
     EXPECT_EQ(v, 0xdeadbeefu);
 
     // Unwritten register reads zero.
-    ASSERT_EQ(emu_model_scalar_read(client, 0x80, &v), 0);
+    ASSERT_EQ(client->scalarRead(0x80, v), 0);
     EXPECT_EQ(v, 0u);
 
-    EXPECT_EQ(emu_model_client_exit(client), 0);
+    EXPECT_EQ(client->sendExit(), 0);
 }
 
 TEST_F(StubModel, PopulateFetchRoundTrip)
 {
     start_stub();
-    connect();
-    ASSERT_EQ(emu_model_client_start(client), 0);
+    do_connect();
+    ASSERT_EQ(client->start(), 0);
 
     std::vector<uint8_t> payload(256);
     for (size_t i = 0; i < payload.size(); i++) {
         payload[i] = (uint8_t) (i * 7 + 1);
     }
-    ASSERT_EQ(emu_model_populate(client, SLASH_HBM_BASE, payload.data(),
-                                 payload.size()),
-              0);
+    auto paySpan = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(payload.data()), payload.size());
+    ASSERT_EQ(client->populate(SLASH_HBM_BASE, paySpan), 0);
 
     std::vector<uint8_t> got(256, 0xFF);
-    ASSERT_EQ(emu_model_fetch(client, SLASH_HBM_BASE, got.data(), got.size()), 0);
+    auto gotSpan =
+        std::span<std::byte>(reinterpret_cast<std::byte *>(got.data()), got.size());
+    ASSERT_EQ(client->fetch(SLASH_HBM_BASE, gotSpan), 0);
     EXPECT_EQ(got, payload);
 
     // Unwritten memory fetches zero.
     std::vector<uint8_t> zeros(16, 0xAA);
-    ASSERT_EQ(emu_model_fetch(client, SLASH_DDR_BASE, zeros.data(), zeros.size()),
-              0);
+    auto zeroSpan = std::span<std::byte>(
+        reinterpret_cast<std::byte *>(zeros.data()), zeros.size());
+    ASSERT_EQ(client->fetch(SLASH_DDR_BASE, zeroSpan), 0);
     for (auto b : zeros) {
         EXPECT_EQ(b, 0u);
     }
 
-    EXPECT_EQ(emu_model_client_exit(client), 0);
+    EXPECT_EQ(client->sendExit(), 0);
 }
 
 // ===========================================================================
@@ -297,26 +298,26 @@ TEST_F(StubModel, HandshakeTimesOutWhenModelNeverBinds)
 {
     // Use a short timeout so the test is fast; the stub binds nothing.
     start_stub({"SLASH_EMU_STUB_NO_BIND=1"});
-    ASSERT_EQ(emu_model_client_connect(endpoint.c_str(), 300, &client), 0);
+    ASSERT_EQ(ModelClient::connect(endpoint, 300, client), 0);
 
     // start must fail promptly (not hang) with a timeout-class errno.
-    int rc = emu_model_client_start(client);
+    int rc = client->start();
     EXPECT_LT(rc, 0);
     EXPECT_EQ(rc, -ETIMEDOUT);
 
     // After a transport failure the client is latched dead: subsequent calls
     // fail fast with -ENODEV, they do not block.
     uint32_t v = 0;
-    EXPECT_EQ(emu_model_scalar_read(client, 0, &v), -ENODEV);
+    EXPECT_EQ(client->scalarRead(0, v), -ENODEV);
 }
 
 TEST_F(StubModel, CallTimesOutWhenModelNeverAnswers)
 {
     start_stub({"SLASH_EMU_STUB_HANG=1"});
-    ASSERT_EQ(emu_model_client_connect(endpoint.c_str(), 300, &client), 0);
+    ASSERT_EQ(ModelClient::connect(endpoint, 300, client), 0);
 
     // The stub binds and accepts but never replies; the call must time out.
-    int rc = emu_model_client_start(client);
+    int rc = client->start();
     EXPECT_EQ(rc, -ETIMEDOUT);
 }
 
@@ -331,12 +332,12 @@ TEST(BridgeVbin, UnpacksAndLocatesExecutableSim)
     ASSERT_FALSE(stub.empty());
 
     std::vector<uint8_t> tar = make_tar("vpp_sim", stub, 0755);
+    auto sp = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(tar.data()), tar.size());
 
-    char exec[4096];
-    ASSERT_EQ(emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                       sizeof(exec)),
-              0);
-    EXPECT_EQ(::access(exec, X_OK), 0);
+    std::string execPath;
+    ASSERT_EQ(vbinUnpackFindSim(sp, dir, execPath), 0);
+    EXPECT_EQ(::access(execPath.c_str(), X_OK), 0);
     rm_rf(dir);
 }
 
@@ -345,12 +346,12 @@ TEST(BridgeVbin, NestedSimLocated)
     std::string dir = make_scratch_dir("vbin");
     std::vector<uint8_t> stub = read_stub_binary();
     std::vector<uint8_t> tar = make_tar("sub/dir/vpp_sim", stub, 0755);
+    auto sp = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(tar.data()), tar.size());
 
-    char exec[4096];
-    ASSERT_EQ(emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                       sizeof(exec)),
-              0);
-    EXPECT_EQ(::access(exec, X_OK), 0);
+    std::string execPath;
+    ASSERT_EQ(vbinUnpackFindSim(sp, dir, execPath), 0);
+    EXPECT_EQ(::access(execPath.c_str(), X_OK), 0);
     rm_rf(dir);
 }
 
@@ -359,11 +360,11 @@ TEST(BridgeVbin, MissingSimRejected)
     std::string dir = make_scratch_dir("vbin");
     std::vector<uint8_t> tar =
         make_tar("system_map.xml", {'<', 'x', '/', '>'}, 0644);
+    auto sp = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(tar.data()), tar.size());
 
-    char exec[4096];
-    EXPECT_EQ(emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                       sizeof(exec)),
-              -ENOENT);
+    std::string execPath;
+    EXPECT_EQ(vbinUnpackFindSim(sp, dir, execPath), -ENOENT);
     rm_rf(dir);
 }
 
@@ -372,10 +373,11 @@ TEST(BridgeVbin, MalformedArchiveRejected)
     std::string dir = make_scratch_dir("vbin");
     // Not block-aligned / too small.
     std::vector<uint8_t> junk(100, 0xAB);
-    char exec[4096];
-    EXPECT_EQ(emu_vbin_unpack_find_sim(junk.data(), junk.size(), dir.c_str(),
-                                       exec, sizeof(exec)),
-              -EINVAL);
+    auto sp = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(junk.data()), junk.size());
+
+    std::string execPath;
+    EXPECT_EQ(vbinUnpackFindSim(sp, dir, execPath), -EINVAL);
     rm_rf(dir);
 }
 
@@ -383,10 +385,11 @@ TEST(BridgeVbin, PathTraversalRejected)
 {
     std::string dir = make_scratch_dir("vbin");
     std::vector<uint8_t> tar = make_tar("../escape", {'x'}, 0644);
-    char exec[4096];
-    EXPECT_EQ(emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                       sizeof(exec)),
-              -EINVAL);
+    auto sp = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(tar.data()), tar.size());
+
+    std::string execPath;
+    EXPECT_EQ(vbinUnpackFindSim(sp, dir, execPath), -EINVAL);
     rm_rf(dir);
 }
 
@@ -396,15 +399,18 @@ TEST(BridgeVbin, PathTraversalRejected)
 
 TEST(BridgeVbinClassify, EmptyIsIncomplete)
 {
-    EXPECT_EQ(emu_vbin_classify(nullptr, 0), EMU_VBIN_INCOMPLETE);
-    uint8_t z = 0;
-    EXPECT_EQ(emu_vbin_classify(&z, 0), EMU_VBIN_INCOMPLETE);
+    EXPECT_EQ(vbinClassify(std::span<const std::byte>{}), VbinStatus::Incomplete);
+    std::byte z{0};
+    EXPECT_EQ(vbinClassify(std::span<const std::byte>(&z, 0)),
+              VbinStatus::Incomplete);
 }
 
 TEST(BridgeVbinClassify, CompleteArchiveRecognized)
 {
     std::vector<uint8_t> tar = make_tar("vpp_sim", std::vector<uint8_t>(3000, 7));
-    EXPECT_EQ(emu_vbin_classify(tar.data(), tar.size()), EMU_VBIN_COMPLETE);
+    auto sp = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(tar.data()), tar.size());
+    EXPECT_EQ(vbinClassify(sp), VbinStatus::Complete);
 }
 
 TEST(BridgeVbinClassify, TruncatedPrefixesAreIncomplete)
@@ -416,10 +422,14 @@ TEST(BridgeVbinClassify, TruncatedPrefixesAreIncomplete)
         make_tar("vpp_sim", std::vector<uint8_t>(5000, 0xCD));
     size_t body_end = tar.size() - 1024; // start of the two trailing zero blocks
     for (size_t cut = 1; cut < body_end; cut += 137) {
-        EXPECT_EQ(emu_vbin_classify(tar.data(), cut), EMU_VBIN_INCOMPLETE)
+        auto sp = std::span<const std::byte>(
+            reinterpret_cast<const std::byte *>(tar.data()), cut);
+        EXPECT_EQ(vbinClassify(sp), VbinStatus::Incomplete)
             << "prefix len " << cut << " should be INCOMPLETE";
     }
-    EXPECT_EQ(emu_vbin_classify(tar.data(), 512 + 16), EMU_VBIN_INCOMPLETE);
+    auto sp512 = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(tar.data()), 512 + 16);
+    EXPECT_EQ(vbinClassify(sp512), VbinStatus::Incomplete);
 }
 
 TEST(BridgeVbinClassify, GarbageHeaderIsInvalid)
@@ -427,7 +437,9 @@ TEST(BridgeVbinClassify, GarbageHeaderIsInvalid)
     // 512 non-zero bytes without the ustar magic: structurally invalid, no amount
     // of further bytes fixes it (a bogus first chunk fails fast).
     std::vector<uint8_t> junk(512, 0xAB);
-    EXPECT_EQ(emu_vbin_classify(junk.data(), junk.size()), EMU_VBIN_INVALID);
+    auto sp = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(junk.data()), junk.size());
+    EXPECT_EQ(vbinClassify(sp), VbinStatus::Invalid);
 }
 
 TEST(BridgeVbinClassify, ChunkBoundaryMidBlockIsIncomplete)
@@ -435,7 +447,9 @@ TEST(BridgeVbinClassify, ChunkBoundaryMidBlockIsIncomplete)
     std::vector<uint8_t> tar = make_tar("vpp_sim", std::vector<uint8_t>(1000, 1));
     // A non-block-aligned prefix (a chunk boundary fell mid-block) is incomplete,
     // not invalid.
-    EXPECT_EQ(emu_vbin_classify(tar.data(), 512 + 300), EMU_VBIN_INCOMPLETE);
+    auto sp = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(tar.data()), 512 + 300);
+    EXPECT_EQ(vbinClassify(sp), VbinStatus::Incomplete);
 }
 
 } // namespace

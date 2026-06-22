@@ -34,9 +34,9 @@
  * Two layers (CMake+CTest, GTest, scratch under .tmp):
  *
  *   - Unit, against slash_emu_core directly (the restore building blocks --
- *     emu_device_restore_function + emu_bars_attach / emu_qdma_attach +
- *     emu_bridge_reattach_function): a removed function's endpoints reappear, the
- *     restore is a no-op when nothing was removed (no duplicate children), a
+ *     NodeTree::restoreFunction + barsAttach / qdmaAttach +
+ *     BridgeRegistry::reattachFunction): a removed function's endpoints reappear,
+ *     the restore is a no-op when nothing was removed (no duplicate children), a
  *     restored function can be REMOVED again and restored again, the
  *     model_shutdown_fired re-arm (remove both -> seam fires once; restore; remove
  *     both again -> fires again), and the additive restore leaves the live-BDF
@@ -74,15 +74,24 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-extern "C" {
-#include "bars.h"
-#include "bridge.h"
-#include "hotplug.h"
-#include "info.h"
-#include "node.h"
-#include "qdma.h"
 #include "slash/uapi/slash_abi.h"
-}
+
+#include "bars.hpp"
+#include "bridge.hpp"
+#include "info.hpp"
+#include "node.hpp"
+#include "qdma.hpp"
+
+using slash::emu::BridgeRegistry;
+using slash::emu::Device;
+using slash::emu::DeviceFunction;
+using slash::emu::Ino;
+using slash::emu::ModelShutdownFn;
+using slash::emu::Node;
+using slash::emu::NodeTree;
+using slash::emu::barsAttach;
+using slash::emu::infoAttach;
+using slash::emu::qdmaAttach;
 
 namespace {
 
@@ -94,34 +103,33 @@ namespace {
 
 struct ShutdownState {
     std::atomic<int> calls{0};
-    emu_device *last{nullptr};
+    Device *last{nullptr};
 };
 
-void stub_model_shutdown(emu_device *dev, void *ctx)
+void stub_model_shutdown_fn(ShutdownState &sd, Device &d)
 {
-    auto *s = static_cast<ShutdownState *>(ctx);
-    s->calls++;
-    s->last = dev;
+    sd.calls++;
+    sd.last = &d;
 }
 
 class RescanTree {
 public:
-    RescanTree() { EXPECT_EQ(emu_node_tree_new(&tree_, nullptr), 0); }
-    ~RescanTree() { cleanup_node_tree(tree_); }
-    emu_node_tree *get() { return tree_; }
+    RescanTree() : tree_() {}
+    NodeTree &get() { return tree_; }
 
     // Add a fully-attached device (info + bars + qdma + optional shutdown seam).
-    emu_device *add_device(const char *bdf, emu_model_shutdown_fn sd = nullptr,
-                           void *sd_ctx = nullptr)
+    Device *addDevice(const std::string &bdf, ModelShutdownFn sd = {})
     {
-        emu_device *dev = nullptr;
-        EXPECT_EQ(emu_node_tree_add_device(tree_, bdf, &dev), 0);
+        Device *dev = tree_.addDevice(bdf);
         EXPECT_NE(dev, nullptr);
-        EXPECT_EQ(emu_info_attach(dev), 0);
-        EXPECT_EQ(emu_bars_attach(dev), 0);
-        EXPECT_EQ(emu_qdma_attach(dev), 0);
-        if (sd != nullptr) {
-            EXPECT_EQ(emu_device_set_model_shutdown(tree_, bdf, sd, sd_ctx), 0);
+        if (dev == nullptr) {
+            return nullptr;
+        }
+        EXPECT_EQ(infoAttach(*dev), 0);
+        EXPECT_EQ(barsAttach(*dev), 0);
+        EXPECT_EQ(qdmaAttach(*dev), 0);
+        if (sd) {
+            EXPECT_EQ(tree_.setModelShutdown(bdf, std::move(sd)), 0);
         }
         return dev;
     }
@@ -129,42 +137,40 @@ public:
     // The RESCAN restore building block: rebuild a removed function's subtree +
     // re-attach its in-memory endpoint (no bridge in the unit harness).  Returns
     // whether the function was actually rebuilt.
-    bool restore(emu_device *dev, emu_device_function func)
+    bool restore(Device *dev, DeviceFunction func)
     {
         bool rebuilt = false;
-        EXPECT_EQ(
-            emu_device_restore_function(tree_, dev->bdf, func, &rebuilt), 0);
+        EXPECT_EQ(tree_.restoreFunction(dev->bdf(), func, &rebuilt), 0);
         if (rebuilt) {
-            int aret = func == EMU_DEVICE_FUNCTION_QDMA ? emu_qdma_attach(dev)
-                                                        : emu_bars_attach(dev);
+            int aret = func == DeviceFunction::Qdma ? qdmaAttach(*dev)
+                                                    : barsAttach(*dev);
             EXPECT_EQ(aret, 0);
         }
         return rebuilt;
     }
 
 private:
-    emu_node_tree *tree_ = nullptr;
+    NodeTree tree_;
 };
 
 // True if a directory name resolves live under a parent inode.
-bool resolves(emu_node_tree *tree, emu_ino_t parent, const char *name)
+bool resolves(NodeTree &tree, Ino parent, const char *name)
 {
-    emu_node *child = nullptr;
-    int rc = emu_node_lookup_child(tree, parent, name, &child);
+    Node *child = nullptr;
+    int rc = tree.lookupChild(parent, name, &child);
     return rc == 0 && child != nullptr;
 }
 
 // Count live children of a directory inode (excludes . / .. and dead ones).
-int live_children(emu_node_tree *tree, emu_ino_t parent, const char *name)
+int live_children(NodeTree &tree, Ino parent, const char *name)
 {
-    emu_node *dir = nullptr;
-    EXPECT_EQ(emu_node_lookup_child(tree, parent, name, &dir), 0);
+    Node *dir = nullptr;
+    EXPECT_EQ(tree.lookupChild(parent, name, &dir), 0);
     if (dir == nullptr) {
         return -1;
     }
     int n = 0;
-    for (size_t i = 0; i < dir->children.len; i++) {
-        emu_node *c = dir->children.d[i];
+    for (Node *c : dir->children) {
         if (!c->unlinked && c->live) {
             n++;
         }
@@ -173,24 +179,23 @@ int live_children(emu_node_tree *tree, emu_ino_t parent, const char *name)
 }
 
 // Resolve a child inode by walking from a parent dir (bumps lookup count once).
-emu_ino_t child_ino(emu_node_tree *tree, emu_ino_t parent, const char *name)
+Ino child_ino(NodeTree &tree, Ino parent, const char *name)
 {
-    emu_node *child = nullptr;
-    EXPECT_EQ(emu_node_lookup_child(tree, parent, name, &child), 0);
+    Node *child = nullptr;
+    EXPECT_EQ(tree.lookupChild(parent, name, &child), 0);
     return child != nullptr ? child->ino : 0;
 }
 
 // Add a qpair via the QDMA dir ioctl; returns the allocated qid.
-uint32_t add_qpair(emu_node_tree *tree, emu_device *dev)
+uint32_t add_qpair(NodeTree &tree, Device *dev)
 {
     struct slash_abi_qdma_qpair_add req {};
     req.size = sizeof(req);
     req.mode = 0;        // MM
     req.dir_mask = 0x3;  // H2C | C2H
     struct slash_abi_qdma_qpair_add out = req;
-    EXPECT_EQ(emu_node_ioctl(tree, dev->qdma->ino,
-                             SLASH_ABI_QDMA_IOCTL_QPAIR_ADD, &req, sizeof(req),
-                             &out, sizeof(out)),
+    EXPECT_EQ(tree.ioctl(dev->qdma->ino, SLASH_ABI_QDMA_IOCTL_QPAIR_ADD,
+                         &req, sizeof(req), &out, sizeof(out)),
               0);
     return out.qid;
 }
@@ -202,34 +207,32 @@ uint32_t add_qpair(emu_node_tree *tree, emu_device *dev)
 TEST(RescanRestore, Function1QdmaReappearsAndIsUsable)
 {
     RescanTree t;
-    emu_device *dev = t.add_device("0000:61:00");
+    Device *dev = t.addDevice("0000:61:00");
 
     // Remove fn1 (qdma); the subtree vanishes, bars survives.
-    ASSERT_EQ(emu_device_revoke_function(t.get(), "0000:61:00",
-                                         EMU_DEVICE_FUNCTION_QDMA),
-              0);
+    ASSERT_EQ(t.get().revokeFunction("0000:61:00", DeviceFunction::Qdma), 0);
     ASSERT_FALSE(resolves(t.get(), dev->dir->ino, "qdma"));
     ASSERT_TRUE(resolves(t.get(), dev->dir->ino, "bars"));
 
     // Restore (the RESCAN rediscovery building block).
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_QDMA));
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma));
 
     // qdma/ resolves again and a fresh qpair + MM round-trip works.
     ASSERT_TRUE(resolves(t.get(), dev->dir->ino, "qdma"));
     uint32_t qid = add_qpair(t.get(), dev);
     char qname[32];
     std::snprintf(qname, sizeof(qname), "qpair%u", qid);
-    emu_ino_t qp = child_ino(t.get(), dev->qdma->ino, qname);
+    Ino qp = child_ino(t.get(), dev->qdma->ino, qname);
     ASSERT_NE(qp, 0u);
 
     std::vector<uint8_t> data(64, 0xC3), got(64, 0);
-    ASSERT_EQ(emu_node_pwrite(t.get(), qp,
-                              reinterpret_cast<const char *>(data.data()),
-                              data.size(), static_cast<off_t>(SLASH_HBM_BASE)),
+    ASSERT_EQ(t.get().pwrite(qp,
+                             reinterpret_cast<const char *>(data.data()),
+                             data.size(), static_cast<off_t>(SLASH_HBM_BASE)),
               static_cast<ssize_t>(data.size()));
-    ASSERT_EQ(emu_node_pread(t.get(), qp,
-                             reinterpret_cast<char *>(got.data()), got.size(),
-                             static_cast<off_t>(SLASH_HBM_BASE)),
+    ASSERT_EQ(t.get().pread(qp,
+                            reinterpret_cast<char *>(got.data()), got.size(),
+                            static_cast<off_t>(SLASH_HBM_BASE)),
               static_cast<ssize_t>(got.size()));
     EXPECT_EQ(got, data);
 }
@@ -237,27 +240,22 @@ TEST(RescanRestore, Function1QdmaReappearsAndIsUsable)
 TEST(RescanRestore, Function2BarsReappearsAndIsUsable)
 {
     RescanTree t;
-    emu_device *dev = t.add_device("0000:61:00");
+    Device *dev = t.addDevice("0000:61:00");
 
-    ASSERT_EQ(emu_device_revoke_function(t.get(), "0000:61:00",
-                                         EMU_DEVICE_FUNCTION_BARS),
-              0);
+    ASSERT_EQ(t.get().revokeFunction("0000:61:00", DeviceFunction::Bars), 0);
     ASSERT_FALSE(resolves(t.get(), dev->dir->ino, "bars"));
     ASSERT_TRUE(resolves(t.get(), dev->dir->ino, "qdma"));
 
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_BARS));
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Bars));
 
     ASSERT_TRUE(resolves(t.get(), dev->dir->ino, "bars"));
-    emu_ino_t bar0 = child_ino(t.get(), dev->bars->ino, "bar0");
+    Ino bar0 = child_ino(t.get(), dev->bars->ino, "bar0");
     ASSERT_NE(bar0, 0u);
 
     uint32_t v = 0xdeadbeef, r = 0;
-    ASSERT_EQ(emu_node_pwrite(t.get(), bar0, reinterpret_cast<const char *>(&v),
-                              4, 0x20),
+    ASSERT_EQ(t.get().pwrite(bar0, reinterpret_cast<const char *>(&v), 4, 0x20),
               4);
-    ASSERT_EQ(emu_node_pread(t.get(), bar0, reinterpret_cast<char *>(&r), 4,
-                             0x20),
-              4);
+    ASSERT_EQ(t.get().pread(bar0, reinterpret_cast<char *>(&r), 4, 0x20), 4);
     EXPECT_EQ(r, v);
 }
 
@@ -266,12 +264,10 @@ TEST(RescanRestore, Function2BarsReappearsAndIsUsable)
 TEST(RescanRestore, RebuiltSubtreeHasExactlyTheEndpointChildren)
 {
     RescanTree t;
-    emu_device *dev = t.add_device("0000:61:00");
+    Device *dev = t.addDevice("0000:61:00");
 
-    ASSERT_EQ(emu_device_revoke_function(t.get(), "0000:61:00",
-                                         EMU_DEVICE_FUNCTION_BARS),
-              0);
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_BARS));
+    ASSERT_EQ(t.get().revokeFunction("0000:61:00", DeviceFunction::Bars), 0);
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Bars));
 
     EXPECT_EQ(live_children(t.get(), dev->dir->ino, "bars"), 3)
         << "exactly bar0/bar2/bar4 after restore";
@@ -284,16 +280,16 @@ TEST(RescanRestore, RebuiltSubtreeHasExactlyTheEndpointChildren)
 TEST(RescanRestore, NoOpWhenFunctionNotRemoved)
 {
     RescanTree t;
-    emu_device *dev = t.add_device("0000:61:00");
+    Device *dev = t.addDevice("0000:61:00");
 
     // Nothing removed: restore reports "not rebuilt" and does not double-attach.
     bool rebuilt = true;
-    ASSERT_EQ(emu_device_restore_function(t.get(), "0000:61:00",
-                                          EMU_DEVICE_FUNCTION_QDMA, &rebuilt),
+    ASSERT_EQ(t.get().restoreFunction("0000:61:00", DeviceFunction::Qdma,
+                                      &rebuilt),
               0);
     EXPECT_FALSE(rebuilt);
-    ASSERT_EQ(emu_device_restore_function(t.get(), "0000:61:00",
-                                          EMU_DEVICE_FUNCTION_BARS, &rebuilt),
+    ASSERT_EQ(t.get().restoreFunction("0000:61:00", DeviceFunction::Bars,
+                                      &rebuilt),
               0);
     EXPECT_FALSE(rebuilt);
 
@@ -311,13 +307,13 @@ TEST(RescanRestore, NoOpWhenFunctionNotRemoved)
 TEST(RescanRestore, AbsentDeviceIsNoopSuccess)
 {
     RescanTree t;
-    t.add_device("0000:61:00");
+    t.addDevice("0000:61:00");
 
     // RESCAN rediscovery never config-reconciles: an absent BDF is a no-op
-    // success here (config-driven re-add is the select_new pass's job).
+    // success here (config-driven re-add is the selectNew pass's job).
     bool rebuilt = true;
-    EXPECT_EQ(emu_device_restore_function(t.get(), "0000:99:00",
-                                          EMU_DEVICE_FUNCTION_QDMA, &rebuilt),
+    EXPECT_EQ(t.get().restoreFunction("0000:99:00", DeviceFunction::Qdma,
+                                      &rebuilt),
               0);
     EXPECT_FALSE(rebuilt);
 }
@@ -325,11 +321,10 @@ TEST(RescanRestore, AbsentDeviceIsNoopSuccess)
 TEST(RescanRestore, BadFunctionRejected)
 {
     RescanTree t;
-    t.add_device("0000:61:00");
+    t.addDevice("0000:61:00");
     bool rebuilt = true;
-    EXPECT_EQ(emu_device_restore_function(t.get(), "0000:61:00",
-                                          static_cast<emu_device_function>(7),
-                                          &rebuilt),
+    EXPECT_EQ(t.get().restoreFunction("0000:61:00",
+                                      static_cast<DeviceFunction>(7), &rebuilt),
               -1);
     EXPECT_FALSE(rebuilt);
 }
@@ -341,17 +336,14 @@ TEST(RescanRestore, BadFunctionRejected)
 TEST(RescanRestore, RemoveRestoreRemoveRestoreCycle)
 {
     RescanTree t;
-    emu_device *dev = t.add_device("0000:61:00");
+    Device *dev = t.addDevice("0000:61:00");
 
     for (int i = 0; i < 3; i++) {
-        ASSERT_EQ(emu_device_revoke_function(t.get(), "0000:61:00",
-                                             EMU_DEVICE_FUNCTION_QDMA),
-                  0)
+        ASSERT_EQ(t.get().revokeFunction("0000:61:00", DeviceFunction::Qdma), 0)
             << "iteration " << i;
         EXPECT_FALSE(resolves(t.get(), dev->dir->ino, "qdma"));
 
-        ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_QDMA))
-            << "iteration " << i;
+        ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma)) << "iteration " << i;
         EXPECT_TRUE(resolves(t.get(), dev->dir->ino, "qdma"));
 
         // The freshly-restored qdma is functional each time.
@@ -367,27 +359,23 @@ TEST(RescanRestore, RemoveRestoreRemoveRestoreCycle)
 TEST(RescanRestore, RemovedAfterRestoreEnodevOnOpenHandle)
 {
     RescanTree t;
-    emu_device *dev = t.add_device("0000:61:00");
+    Device *dev = t.addDevice("0000:61:00");
 
-    ASSERT_EQ(emu_device_revoke_function(t.get(), "0000:61:00",
-                                         EMU_DEVICE_FUNCTION_BARS),
-              0);
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_BARS));
+    ASSERT_EQ(t.get().revokeFunction("0000:61:00", DeviceFunction::Bars), 0);
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Bars));
 
     // "Open" bar0 (bump lookup so it survives the next revoke as a dead orphan).
-    emu_ino_t bar0 = child_ino(t.get(), dev->bars->ino, "bar0");
+    Ino bar0 = child_ino(t.get(), dev->bars->ino, "bar0");
     ASSERT_NE(bar0, 0u);
-    EXPECT_EQ(emu_node_is_live(t.get(), bar0), 0);
+    EXPECT_EQ(t.get().isLive(bar0), 0);
 
     // Remove fn2 again: the open handle is -ENODEV, a reopen misses.
-    ASSERT_EQ(emu_device_revoke_function(t.get(), "0000:61:00",
-                                         EMU_DEVICE_FUNCTION_BARS),
-              0);
-    EXPECT_EQ(emu_node_is_live(t.get(), bar0), -ENODEV);
+    ASSERT_EQ(t.get().revokeFunction("0000:61:00", DeviceFunction::Bars), 0);
+    EXPECT_EQ(t.get().isLive(bar0), -ENODEV);
     EXPECT_FALSE(resolves(t.get(), dev->dir->ino, "bars"));
 
     // ...and it can be restored once more.
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_BARS));
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Bars));
     EXPECT_TRUE(resolves(t.get(), dev->dir->ino, "bars"));
 }
 
@@ -399,35 +387,30 @@ TEST(RescanModelShutdownRearm, RemoveBothRestoreRemoveBothFiresTwice)
 {
     ShutdownState sd;
     RescanTree t;
-    emu_device *dev = t.add_device("0000:61:00", stub_model_shutdown, &sd);
+    Device *dev = t.addDevice("0000:61:00", [&sd](Device &d) {
+        stub_model_shutdown_fn(sd, d);
+    });
 
     // Remove both functions -> seam fires once.
-    ASSERT_EQ(emu_device_revoke_function(t.get(), "0000:61:00",
-                                         EMU_DEVICE_FUNCTION_QDMA),
-              0);
+    ASSERT_EQ(t.get().revokeFunction("0000:61:00", DeviceFunction::Qdma), 0);
     EXPECT_EQ(sd.calls.load(), 0);
-    ASSERT_EQ(emu_device_revoke_function(t.get(), "0000:61:00",
-                                         EMU_DEVICE_FUNCTION_BARS),
-              0);
+    ASSERT_EQ(t.get().revokeFunction("0000:61:00", DeviceFunction::Bars), 0);
     EXPECT_EQ(sd.calls.load(), 1) << "seam fires once both gone";
 
     // Restore both (rediscovery).  The seam is re-armed.
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_QDMA));
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_BARS));
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma));
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Bars));
 
     // Re-wire the seam (a fresh qdma attach does not carry it; the daemon's
     // bridge reattach re-installs the seam wiring -- here we restore it directly).
-    ASSERT_EQ(emu_device_set_model_shutdown(t.get(), "0000:61:00",
-                                            stub_model_shutdown, &sd),
+    ASSERT_EQ(t.get().setModelShutdown("0000:61:00", [&sd](Device &d) {
+                  stub_model_shutdown_fn(sd, d);
+              }),
               0);
 
     // Remove both again -> the re-armed seam fires a SECOND time.
-    ASSERT_EQ(emu_device_revoke_function(t.get(), "0000:61:00",
-                                         EMU_DEVICE_FUNCTION_QDMA),
-              0);
-    ASSERT_EQ(emu_device_revoke_function(t.get(), "0000:61:00",
-                                         EMU_DEVICE_FUNCTION_BARS),
-              0);
+    ASSERT_EQ(t.get().revokeFunction("0000:61:00", DeviceFunction::Qdma), 0);
+    ASSERT_EQ(t.get().revokeFunction("0000:61:00", DeviceFunction::Bars), 0);
     EXPECT_EQ(sd.calls.load(), 2)
         << "model_shutdown must re-arm and fire again after restore";
 }
@@ -438,26 +421,23 @@ TEST(RescanModelShutdownRearm, RestoreOneReArmsSeam)
 {
     ShutdownState sd;
     RescanTree t;
-    emu_device *dev = t.add_device("0000:61:00", stub_model_shutdown, &sd);
+    Device *dev = t.addDevice("0000:61:00", [&sd](Device &d) {
+        stub_model_shutdown_fn(sd, d);
+    });
 
-    ASSERT_EQ(emu_device_revoke_function(t.get(), "0000:61:00",
-                                         EMU_DEVICE_FUNCTION_QDMA),
-              0);
-    ASSERT_EQ(emu_device_revoke_function(t.get(), "0000:61:00",
-                                         EMU_DEVICE_FUNCTION_BARS),
-              0);
+    ASSERT_EQ(t.get().revokeFunction("0000:61:00", DeviceFunction::Qdma), 0);
+    ASSERT_EQ(t.get().revokeFunction("0000:61:00", DeviceFunction::Bars), 0);
     EXPECT_EQ(sd.calls.load(), 1);
 
     // Restore only fn1.  bars is still removed, but the seam is re-armed.
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_QDMA));
-    ASSERT_EQ(emu_device_set_model_shutdown(t.get(), "0000:61:00",
-                                            stub_model_shutdown, &sd),
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma));
+    ASSERT_EQ(t.get().setModelShutdown("0000:61:00", [&sd](Device &d) {
+                  stub_model_shutdown_fn(sd, d);
+              }),
               0);
 
     // Remove fn1 again -> both gone again -> fires a second time.
-    ASSERT_EQ(emu_device_revoke_function(t.get(), "0000:61:00",
-                                         EMU_DEVICE_FUNCTION_QDMA),
-              0);
+    ASSERT_EQ(t.get().revokeFunction("0000:61:00", DeviceFunction::Qdma), 0);
     EXPECT_EQ(sd.calls.load(), 2) << "restore re-arms even a single function";
 }
 
@@ -468,44 +448,33 @@ TEST(RescanModelShutdownRearm, RestoreOneReArmsSeam)
 TEST(RescanRestore, LiveBdfStillCollectedAfterRestore)
 {
     RescanTree t;
-    emu_device *dev = t.add_device("0000:61:00");
-    ASSERT_EQ(emu_device_revoke_function(t.get(), "0000:61:00",
-                                         EMU_DEVICE_FUNCTION_QDMA),
-              0);
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_QDMA));
+    Device *dev = t.addDevice("0000:61:00");
+    ASSERT_EQ(t.get().revokeFunction("0000:61:00", DeviceFunction::Qdma), 0);
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma));
 
-    // The device is (still) live, so the config-driven select_new pass keeps
-    // skipping it -- collect_live_bdfs reports it, exactly as before the restore.
-    str_array live = str_array_init();
-    ASSERT_EQ(emu_node_tree_collect_live_bdfs(t.get(), &live), 0);
-    ASSERT_EQ(live.len, 1u);
-    EXPECT_STREQ(live.d[0], "0000:61:00");
-    str_array_free(&live);
+    // The device is (still) live, so the config-driven selectNew pass keeps
+    // skipping it -- collectLiveBdfs reports it, exactly as before the restore.
+    std::vector<std::string> live = t.get().collectLiveBdfs();
+    ASSERT_EQ(live.size(), 1u);
+    EXPECT_EQ(live[0], "0000:61:00");
 }
 
-// emu_bridge_reattach_function with no bridge for the device is a safe no-op
+// BridgeRegistry::reattachFunction with no bridge for the device is a safe no-op
 // (the unit harness never attaches a bridge): it wires the reconfig handler for
 // fn1 and leaves fn2 as a bare in-memory endpoint, both valid restore states.
 TEST(RescanRestore, BridgeReattachNoBridgeIsNoop)
 {
     RescanTree t;
-    emu_device *dev = t.add_device("0000:61:00");
+    Device *dev = t.addDevice("0000:61:00");
 
-    emu_bridge_registry *reg = nullptr;
-    ASSERT_EQ(emu_bridge_registry_new(&reg), 0);
+    BridgeRegistry reg;
 
-    ASSERT_EQ(emu_device_revoke_function(t.get(), "0000:61:00",
-                                         EMU_DEVICE_FUNCTION_QDMA),
-              0);
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_QDMA));
+    ASSERT_EQ(t.get().revokeFunction("0000:61:00", DeviceFunction::Qdma), 0);
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma));
 
     // No bridge registered for this device -> a safe no-op success.
-    EXPECT_EQ(
-        emu_bridge_reattach_function(reg, dev, EMU_DEVICE_FUNCTION_QDMA), 0);
-    EXPECT_EQ(
-        emu_bridge_reattach_function(reg, dev, EMU_DEVICE_FUNCTION_BARS), 0);
-
-    emu_bridge_registry_free(reg);
+    EXPECT_EQ(reg.reattachFunction(*dev, DeviceFunction::Qdma), 0);
+    EXPECT_EQ(reg.reattachFunction(*dev, DeviceFunction::Bars), 0);
 }
 
 // ===========================================================================

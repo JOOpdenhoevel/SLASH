@@ -27,16 +27,16 @@ set(SLASH_EMU_WARNING_FLAGS -Wall -Wextra -Werror)
 # Static library with all daemon logic except main(), so tests can link against
 # it directly (mirrors vrtd's vrtd_core split).
 add_library(slash_emu_core STATIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/bars.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/bridge.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/config.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/fs.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/hotplug.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/info.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/model_client.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/node.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/qdma.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/vbin.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/bars.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/bridge.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/config.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/fs.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/hotplug.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/info.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/model_client.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/node.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/qdma.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/vbin.cpp
 )
 
 target_compile_options(slash_emu_core PRIVATE ${SLASH_EMU_WARNING_FLAGS})
@@ -57,12 +57,15 @@ target_link_libraries(slash_emu_core
     Threads::Threads
   PRIVATE
     PkgConfig::INIH
-    # libzmq (C API): the SIM bridge's REQ client to the vpp_sim model (T10).
+    # libzmq (via the header-only cppzmq C++ API): the SIM bridge's REQ client to
+    # the vpp_sim model.
     PkgConfig::ZMQ
+    # jsoncpp: SIM-dialect wire protocol build/parse in model_client.
+    PkgConfig::JSONCPP
 )
 
 # Daemon executable.
-add_executable(slash-emud ${CMAKE_CURRENT_SOURCE_DIR}/main.c)
+add_executable(slash-emud ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
 
 target_compile_options(slash-emud PRIVATE ${SLASH_EMU_WARNING_FLAGS})
 

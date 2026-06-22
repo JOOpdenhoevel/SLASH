@@ -67,15 +67,31 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "bars.hpp"
+#include "hotplug.hpp"
+#include "info.hpp"
+#include "node.hpp"
+#include "qdma.hpp"
+
 extern "C" {
-#include "bars.h"
-#include "config.h"
-#include "hotplug.h"
-#include "info.h"
-#include "node.h"
-#include "qdma.h"
 #include "slash/uapi/slash_abi.h"
 }
+
+using slash::emu::Device;
+using slash::emu::DeviceFunction;
+using slash::emu::Ino;
+using slash::emu::ModelShutdownFn;
+using slash::emu::Node;
+using slash::emu::NodeTree;
+using slash::emu::NodeType;
+using slash::emu::ReloadFn;
+using slash::emu::barsAttach;
+using slash::emu::infoAttach;
+using slash::emu::qdmaAttach;
+using slash::emu::kRootIno;
+using slash::emu::hotplugAttach;
+using slash::emu::hotplugParseBdf;
+using slash::emu::hotplugSetSbrSleepUs;
 
 namespace {
 
@@ -89,84 +105,68 @@ struct ReloadState {
     int rc{0};
 };
 
-int stub_reload(void *ctx)
-{
-    auto *s = static_cast<ReloadState *>(ctx);
-    s->calls++;
-    return s->rc;
-}
-
 struct ShutdownState {
     std::atomic<int> calls{0};
-    emu_device *last{nullptr};
+    Device *last{nullptr};
 };
-
-void stub_model_shutdown(emu_device *dev, void *ctx)
-{
-    auto *s = static_cast<ShutdownState *>(ctx);
-    s->calls++;
-    s->last = dev;
-}
 
 class HotplugTree {
 public:
-    explicit HotplugTree(emu_hotplug_reload_fn reload = nullptr,
-                         void *ctx = nullptr)
+    explicit HotplugTree(ReloadFn reload = {})
+        : tree_()
     {
-        EXPECT_EQ(emu_node_tree_new(&tree_, nullptr), 0);
-        EXPECT_EQ(emu_hotplug_attach(tree_, reload, ctx), 0);
+        EXPECT_EQ(hotplugAttach(tree_, std::move(reload)), 0);
     }
-    ~HotplugTree() { cleanup_node_tree(tree_); }
-    emu_node_tree *get() { return tree_; }
+    NodeTree &get() { return tree_; }
 
-    emu_device *add_device(const char *bdf, emu_model_shutdown_fn sd = nullptr,
-                           void *sd_ctx = nullptr)
+    Device *addDevice(const std::string &bdf, ModelShutdownFn sd = {})
     {
-        emu_device *dev = nullptr;
-        EXPECT_EQ(emu_node_tree_add_device(tree_, bdf, &dev), 0);
+        Device *dev = tree_.addDevice(bdf);
         EXPECT_NE(dev, nullptr);
-        EXPECT_EQ(emu_info_attach(dev), 0);
-        EXPECT_EQ(emu_bars_attach(dev), 0);
-        EXPECT_EQ(emu_qdma_attach(dev), 0);
-        if (sd != nullptr) {
-            EXPECT_EQ(emu_device_set_model_shutdown(tree_, bdf, sd, sd_ctx), 0);
+        if (dev == nullptr) {
+            return nullptr;
+        }
+        EXPECT_EQ(infoAttach(*dev), 0);
+        EXPECT_EQ(barsAttach(*dev), 0);
+        EXPECT_EQ(qdmaAttach(*dev), 0);
+        if (sd) {
+            EXPECT_EQ(tree_.setModelShutdown(bdf, std::move(sd)), 0);
         }
         return dev;
     }
 
-    emu_ino_t hotplug_ino()
+    Ino hotplugIno()
     {
-        emu_node *child = nullptr;
-        EXPECT_EQ(emu_node_lookup_child(tree_, EMU_ROOT_INO, "hotplug", &child),
-                  0);
-        emu_ino_t ino = child != nullptr ? child->ino : 0;
-        // lookup_child bumped the count; drop it so the node is not held looked-up
+        Node *child = nullptr;
+        EXPECT_EQ(tree_.lookupChild(kRootIno, "hotplug", &child), 0);
+        Ino ino = child != nullptr ? child->ino : 0;
+        // lookupChild bumped the count; drop it so the node is not held looked-up
         // (mirrors a getattr that the kernel immediately forgets).
         if (ino != 0) {
-            emu_node_forget(tree_, ino, 1);
+            tree_.forget(ino, 1);
         }
         return ino;
     }
 
 private:
-    emu_node_tree *tree_ = nullptr;
+    NodeTree tree_;
 };
 
-int hotplug_dev_ioctl(emu_node_tree *tree, emu_ino_t ino, unsigned int cmd,
-                      const char *bdf_with_func)
+int hotplugDevIoctl(NodeTree &tree, Ino ino, unsigned int cmd,
+                    const char *bdf_with_func)
 {
     struct slash_abi_hotplug_device_request req {};
     req.size = sizeof(req);
     std::snprintf(req.bdf, sizeof(req.bdf), "%s", bdf_with_func);
-    return emu_node_ioctl(tree, ino, cmd, &req, sizeof(req), &req, sizeof(req));
+    return tree.ioctl(ino, cmd, &req, sizeof(req), &req, sizeof(req));
 }
 
-bool resolves(emu_node_tree *tree, emu_ino_t parent, const char *name)
+bool resolves(NodeTree &tree, Ino parent, const char *name)
 {
-    emu_node *child = nullptr;
-    int rc = emu_node_lookup_child(tree, parent, name, &child);
+    Node *child = nullptr;
+    int rc = tree.lookupChild(parent, name, &child);
     if (rc == 0 && child != nullptr) {
-        emu_node_forget(tree, child->ino, 1);
+        tree.forget(child->ino, 1);
         return true;
     }
     return false;
@@ -174,12 +174,11 @@ bool resolves(emu_node_tree *tree, emu_ino_t parent, const char *name)
 
 // Count live children of a directory node by name (for the no-double-attach
 // assertion: a re-attach would create a SECOND child of the same name).
-int count_children_named(emu_node *dir, const char *name)
+int count_children_named(Node *dir, const char *name)
 {
     int n = 0;
-    for (size_t i = 0; i < dir->children.len; i++) {
-        emu_node *c = dir->children.d[i];
-        if (!c->unlinked && std::strcmp(c->name, name) == 0) {
+    for (Node *c : dir->children) {
+        if (!c->unlinked && c->name == name) {
             n++;
         }
     }
@@ -191,18 +190,12 @@ int count_children_named(emu_node *dir, const char *name)
 // ===========================================================================
 
 // (b) Only the hotplug file is ioctl_unlocked; the device-endpoint ioctls
-// (qdma QPAIR_ADD) must still run LOCKED.  We cannot read the private flag, so
-// we assert behaviourally: a qdma QPAIR_ADD that ITSELF re-enters the spine's
-// self-locking public API from inside its hook would deadlock IF it ran
-// unlocked-then-relocking the way hotplug does -- but the real proof here is
-// structural: the qdma node never gets emu_node_set_ioctl_unlocked, so its hook
-// runs under the held lock.  We pin the contract by confirming QPAIR_ADD works
-// (it would self-deadlock if it had been mis-marked unlocked AND its hook
-// re-locked).  A ctest TIMEOUT backstops a regression that deadlocks.
+// (qdma QPAIR_ADD) must still run LOCKED.  A ctest TIMEOUT backstops a
+// regression that deadlocks.
 TEST(HotplugUnlockedSafety, QdmaIoctlStillRunsLocked)
 {
     HotplugTree t;
-    emu_device *dev = t.add_device("0000:61:00");
+    Device *dev = t.addDevice("0000:61:00");
 
     struct slash_abi_qdma_qpair_add qreq {};
     qreq.size = sizeof(qreq);
@@ -210,86 +203,82 @@ TEST(HotplugUnlockedSafety, QdmaIoctlStillRunsLocked)
     qreq.dir_mask = 0x1;
     struct slash_abi_qdma_qpair_add qout = qreq;
     // Runs the qdma hook under the held lock and returns; no deadlock, no hang.
-    ASSERT_EQ(emu_node_ioctl(t.get(), dev->qdma->ino,
-                             SLASH_ABI_QDMA_IOCTL_QPAIR_ADD, &qreq, sizeof(qreq),
-                             &qout, sizeof(qout)),
+    ASSERT_EQ(t.get().ioctl(dev->qdma->ino, SLASH_ABI_QDMA_IOCTL_QPAIR_ADD,
+                            &qreq, sizeof(qreq), &qout, sizeof(qout)),
               0);
 }
 
 // (d) Reentrancy: the unlocked hotplug hook calls the self-locking
 // revoke/reload spine API.  If the hook ran LOCKED, those calls would re-lock a
-// non-recursive mutex and self-deadlock.  Exercising every command that calls
-// the spine API (REMOVE -> revoke_function, TOGGLE_SBR/HOTPLUG -> revoke +
-// reload, RESCAN -> reload) and returning proves the lock was dropped first.
+// non-recursive mutex and self-deadlock.  Exercising every command and returning
+// proves the lock was dropped first.
 TEST(HotplugUnlockedSafety, EveryCommandReentersSpineWithoutDeadlock)
 {
     ReloadState rs;
-    HotplugTree t(stub_reload, &rs);
-    t.add_device("0000:61:00");
-    t.add_device("0000:62:00");
-    emu_ino_t hp = t.hotplug_ino();
-    ASSERT_EQ(emu_hotplug_set_sbr_sleep_us(t.get(), 0), 0);
+    HotplugTree t([&rs]() -> int {
+        rs.calls++;
+        return rs.rc;
+    });
+    t.addDevice("0000:61:00");
+    t.addDevice("0000:62:00");
+    Ino hp = t.hotplugIno();
+    ASSERT_EQ(hotplugSetSbrSleepUs(t.get(), 0), 0);
 
     // RESCAN -> reload (re-locks materialize internally).
-    ASSERT_EQ(emu_node_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_RESCAN, nullptr,
-                             0, nullptr, 0),
+    ASSERT_EQ(t.get().ioctl(hp, SLASH_ABI_HOTPLUG_IOCTL_RESCAN, nullptr, 0,
+                            nullptr, 0),
               0);
-    // REMOVE -> revoke_function (re-locks).
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.1"),
+    // REMOVE -> revokeFunction (re-locks).
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.1"),
               0);
-    // TOGGLE_SBR -> revoke + reload (two separately-locked phases).
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_TOGGLE_SBR,
-                                "0000:61:00.2"),
+    // TOGGLE_SBR -> revokeDevice + reload (two separately-locked phases).
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_TOGGLE_SBR,
+                              "0000:61:00.2"),
               0);
-    // HOTPLUG -> revoke + reload.
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_HOTPLUG,
-                                "0000:62:00.1"),
+    // HOTPLUG -> revokeDevice + reload.
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_HOTPLUG,
+                              "0000:62:00.1"),
               0);
 }
 
 // (a)/(c) The documented invariant backing the dropped-lock pointer is
-// "the hotplug file is never unlinked".  PROBE it: FUSE exposes the hotplug node
-// as a regular FILE at the root, and emu_node_unlink_child unlinks any file
-// child.  This test pins the CURRENT behaviour of unlinking the hotplug node so
-// a regression (or a fix) is visible.  If unlink is rejected, the invariant is
-// truly enforced; if it succeeds, the control surface can be destroyed.
+// "the hotplug file is never unlinked".  PROBE it: the spine creates the hotplug
+// node NON-unlinkable, so unlinkChild must reject it with -EPERM.
 TEST(HotplugUnlockedSafety, UnlinkOfHotplugNodeBehaviour)
 {
     HotplugTree t;
-    t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
+    t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
     ASSERT_NE(hp, 0u);
 
     // The "hotplug file is never unlinked" precondition the ioctl_unlocked
     // dropped-lock path relies on is now ENFORCED by the spine: the hotplug node
     // is created non-unlinkable, so the FUSE unlink op rejects it with -EPERM.
-    int rc = emu_node_unlink_child(t.get(), EMU_ROOT_INO, "hotplug");
+    int rc = t.get().unlinkChild(kRootIno, "hotplug");
     EXPECT_EQ(rc, -EPERM)
         << "unlink of the global /hotplug control surface must be refused";
 
-    // The control surface survives intact: it still resolves and still services
-    // ioctls (RESCAN here has no reload seam wired, so it is a 0-return no-op).
-    EXPECT_TRUE(resolves(t.get(), EMU_ROOT_INO, "hotplug"))
+    // The control surface survives intact.
+    EXPECT_TRUE(resolves(t.get(), kRootIno, "hotplug"))
         << "hotplug file must still resolve after a refused unlink";
-    EXPECT_EQ(emu_node_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_RESCAN,
-                             nullptr, 0, nullptr, 0),
+    EXPECT_EQ(t.get().ioctl(hp, SLASH_ABI_HOTPLUG_IOCTL_RESCAN, nullptr, 0,
+                            nullptr, 0),
               0)
         << "hotplug ioctl must still work after a refused unlink";
 }
 
-// Unit-level guard for the opt-in unlinkability contract (the spine path,
-// without a mount): info and bar<M> files are NOT user-unlinkable (-EPERM and
-// intact), whereas a qpair<Q> file IS (the fix must not over-rotate).
+// Unit-level guard for the opt-in unlinkability contract: info and bar<M> files
+// are NOT user-unlinkable (-EPERM and intact), whereas a qpair<Q> file IS.
 TEST(HotplugUnlockedSafety, OnlyQpairFilesAreUnlinkable)
 {
     HotplugTree t;
-    emu_device *dev = t.add_device("0000:61:00");
+    Device *dev = t.addDevice("0000:61:00");
 
     // info (under <BDF>/) and bar0 (under bars/) are non-unlinkable.
-    EXPECT_EQ(emu_node_unlink_child(t.get(), dev->dir->ino, "info"), -EPERM);
+    EXPECT_EQ(t.get().unlinkChild(dev->dir->ino, "info"), -EPERM);
     EXPECT_TRUE(resolves(t.get(), dev->dir->ino, "info"));
-    EXPECT_EQ(emu_node_unlink_child(t.get(), dev->bars->ino, "bar0"), -EPERM);
+    EXPECT_EQ(t.get().unlinkChild(dev->bars->ino, "bar0"), -EPERM);
     EXPECT_TRUE(resolves(t.get(), dev->bars->ino, "bar0"));
 
     // A qpair<Q> file stays unlinkable.
@@ -298,55 +287,51 @@ TEST(HotplugUnlockedSafety, OnlyQpairFilesAreUnlinkable)
     req.mode = 0;       // MM
     req.dir_mask = 0x1; // H2C
     struct slash_abi_qdma_qpair_add out = req;
-    ASSERT_EQ(emu_node_ioctl(t.get(), dev->qdma->ino,
-                             SLASH_ABI_QDMA_IOCTL_QPAIR_ADD, &req, sizeof(req),
-                             &out, sizeof(out)),
+    ASSERT_EQ(t.get().ioctl(dev->qdma->ino, SLASH_ABI_QDMA_IOCTL_QPAIR_ADD,
+                            &req, sizeof(req), &out, sizeof(out)),
               0);
     char qname[32];
     std::snprintf(qname, sizeof(qname), "qpair%u", out.qid);
-    EXPECT_EQ(emu_node_unlink_child(t.get(), dev->qdma->ino, qname), 0)
+    EXPECT_EQ(t.get().unlinkChild(dev->qdma->ino, qname), 0)
         << "qpair<Q> must remain user-unlinkable";
     EXPECT_FALSE(resolves(t.get(), dev->qdma->ino, qname));
 }
 
 // ASan UAF probe for the dropped-lock pointer when the hotplug node is held
 // looked-up (so unlink orphans it rather than freeing it), then an ioctl runs
-// on the surviving orphan, then it is forgotten (freed).  Under ASan a
-// use-after-free in the unlocked hook's backing access would trip here.
+// on the surviving orphan, then it is forgotten (freed).
 TEST(HotplugUnlockedSafety, UnlinkedButLookedUpOrphanIoctlIsCleanUnderAsan)
 {
     HotplugTree t;
-    t.add_device("0000:61:00");
+    t.addDevice("0000:61:00");
 
     // Hold a lookup ref so unlink orphans (does not free) the node.
-    emu_node *hpnode = nullptr;
-    ASSERT_EQ(emu_node_lookup_child(t.get(), EMU_ROOT_INO, "hotplug", &hpnode),
-              0);
+    Node *hpnode = nullptr;
+    ASSERT_EQ(t.get().lookupChild(kRootIno, "hotplug", &hpnode), 0);
     ASSERT_NE(hpnode, nullptr);
-    emu_ino_t hp = hpnode->ino;
+    Ino hp = hpnode->ino;
 
-    int rc = emu_node_unlink_child(t.get(), EMU_ROOT_INO, "hotplug");
+    int rc = t.get().unlinkChild(kRootIno, "hotplug");
     if (rc != 0) {
         // Invariant enforced (unlink refused): nothing more to probe.
-        emu_node_forget(t.get(), hp, 1);
+        t.get().forget(hp, 1);
         SUCCEED();
         return;
     }
 
-    // The node survives as an orphan (lookup_count > 0). emu_node_unlink_locked
-    // does NOT set live=false, so an ioctl by the orphan's inode still runs the
-    // unlocked hook -- on a backing that is still alive (not yet destroyed).
-    // RESCAN with no reload wired is a safe no-op that still dereferences the
-    // backing. Under ASan this must not be a use-after-free.
-    EXPECT_EQ(emu_node_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_RESCAN, nullptr,
-                             0, nullptr, 0),
+    // The node survives as an orphan (lookup_count > 0). An ioctl on the
+    // orphan's inode still runs the unlocked hook -- on a backing that is still
+    // alive (not yet destroyed).  RESCAN with no reload wired is a safe no-op
+    // that still dereferences the backing.  Under ASan this must not be a UAF.
+    EXPECT_EQ(t.get().ioctl(hp, SLASH_ABI_HOTPLUG_IOCTL_RESCAN, nullptr, 0,
+                            nullptr, 0),
               0);
 
     // Final forget destroys the orphan + frees the backing.  A later ioctl by
     // the now-dead inode must miss, not touch freed memory.
-    emu_node_forget(t.get(), hp, 1);
-    EXPECT_EQ(emu_node_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_RESCAN, nullptr,
-                             0, nullptr, 0),
+    t.get().forget(hp, 1);
+    EXPECT_EQ(t.get().ioctl(hp, SLASH_ABI_HOTPLUG_IOCTL_RESCAN, nullptr, 0,
+                            nullptr, 0),
               -ENOENT);
 }
 
@@ -354,43 +339,41 @@ TEST(HotplugUnlockedSafety, UnlinkedButLookedUpOrphanIoctlIsCleanUnderAsan)
 // PER-FUNCTION REVOKE -- surviving function fully usable, both orders
 // ===========================================================================
 
-// After REMOVE .1 (qdma), bars must remain FULLY usable: a fresh bar register
-// read/write round-trips, and the device is still found (not marked dead), so a
-// later REMOVE .2 succeeds.
+// After REMOVE .1 (qdma), bars must remain FULLY usable.
 TEST(HotplugPerFunction, RemoveQdmaLeavesBarsFullyLive)
 {
     HotplugTree t;
-    emu_device *dev = t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
+    Device *dev = t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
 
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.1"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.1"),
               0);
 
     // bars/ subtree still live and a register read/write round-trips.
-    emu_node *bar0 = nullptr;
-    ASSERT_EQ(emu_node_lookup_child(t.get(), dev->bars->ino, "bar0", &bar0), 0);
+    Node *bar0 = nullptr;
+    ASSERT_EQ(t.get().lookupChild(dev->bars->ino, "bar0", &bar0), 0);
     ASSERT_NE(bar0, nullptr);
-    emu_ino_t bar0_ino = bar0->ino;
-    EXPECT_EQ(emu_node_is_live(t.get(), bar0_ino), 0);
+    Ino bar0_ino = bar0->ino;
+    EXPECT_EQ(t.get().isLive(bar0_ino), 0);
 
     uint32_t val = 0xdeadbeef;
-    ASSERT_EQ(emu_node_pwrite(t.get(), bar0_ino,
-                              reinterpret_cast<const char *>(&val), sizeof(val),
-                              0),
+    ASSERT_EQ(t.get().pwrite(bar0_ino,
+                             reinterpret_cast<const char *>(&val), sizeof(val),
+                             0),
               static_cast<ssize_t>(sizeof(val)));
     uint32_t got = 0;
-    ASSERT_EQ(emu_node_pread(t.get(), bar0_ino, reinterpret_cast<char *>(&got),
-                             sizeof(got), 0),
+    ASSERT_EQ(t.get().pread(bar0_ino, reinterpret_cast<char *>(&got),
+                            sizeof(got), 0),
               static_cast<ssize_t>(sizeof(got)));
     EXPECT_EQ(got, val);
 
     // The device is still found (not dead): the second REMOVE then succeeds.
-    EXPECT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.2"),
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.2"),
               0);
     EXPECT_FALSE(resolves(t.get(), dev->dir->ino, "bars"));
-    emu_node_forget(t.get(), bar0_ino, 1);
+    t.get().forget(bar0_ino, 1);
 }
 
 // After REMOVE .2 (bars), qdma must remain usable: QPAIR_ADD still works and the
@@ -398,11 +381,11 @@ TEST(HotplugPerFunction, RemoveQdmaLeavesBarsFullyLive)
 TEST(HotplugPerFunction, RemoveBarsLeavesQdmaFullyLive)
 {
     HotplugTree t;
-    emu_device *dev = t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
+    Device *dev = t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
 
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.2"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.2"),
               0);
 
     // qdma/ still accepts QPAIR_ADD and the qpair round-trips.
@@ -411,30 +394,29 @@ TEST(HotplugPerFunction, RemoveBarsLeavesQdmaFullyLive)
     qreq.mode = 0;
     qreq.dir_mask = 0x1;
     struct slash_abi_qdma_qpair_add qout = qreq;
-    ASSERT_EQ(emu_node_ioctl(t.get(), dev->qdma->ino,
-                             SLASH_ABI_QDMA_IOCTL_QPAIR_ADD, &qreq, sizeof(qreq),
-                             &qout, sizeof(qout)),
+    ASSERT_EQ(t.get().ioctl(dev->qdma->ino, SLASH_ABI_QDMA_IOCTL_QPAIR_ADD,
+                            &qreq, sizeof(qreq), &qout, sizeof(qout)),
               0);
-    emu_node *qp = nullptr;
+    Node *qp = nullptr;
     char qname[32];
     std::snprintf(qname, sizeof(qname), "qpair%u", qout.qid);
-    ASSERT_EQ(emu_node_lookup_child(t.get(), dev->qdma->ino, qname, &qp), 0);
-    emu_ino_t qp_ino = qp->ino;
+    ASSERT_EQ(t.get().lookupChild(dev->qdma->ino, qname, &qp), 0);
+    Ino qp_ino = qp->ino;
     std::vector<uint8_t> data(16, 0x5a);
-    ASSERT_EQ(emu_node_pwrite(t.get(), qp_ino,
-                              reinterpret_cast<const char *>(data.data()),
-                              data.size(), static_cast<off_t>(SLASH_HBM_BASE)),
+    ASSERT_EQ(t.get().pwrite(qp_ino,
+                             reinterpret_cast<const char *>(data.data()),
+                             data.size(), static_cast<off_t>(SLASH_HBM_BASE)),
               static_cast<ssize_t>(data.size()));
 
     // REMOVE .1 then succeeds and tears the qpair down (-ENODEV on the handle).
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.1"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.1"),
               0);
-    EXPECT_EQ(emu_node_pread(t.get(), qp_ino,
-                             reinterpret_cast<char *>(data.data()), data.size(),
-                             static_cast<off_t>(SLASH_HBM_BASE)),
+    EXPECT_EQ(t.get().pread(qp_ino,
+                            reinterpret_cast<char *>(data.data()), data.size(),
+                            static_cast<off_t>(SLASH_HBM_BASE)),
               -ENODEV);
-    emu_node_forget(t.get(), qp_ino, 1);
+    t.get().forget(qp_ino, 1);
 }
 
 // REMOVE of an absent device, and a re-REMOVE of an already-removed function,
@@ -442,19 +424,19 @@ TEST(HotplugPerFunction, RemoveBarsLeavesQdmaFullyLive)
 TEST(HotplugPerFunction, AbsentAndRepeatNoops)
 {
     HotplugTree t;
-    t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
+    t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
 
     // Absent device.
-    EXPECT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:ab:00.1"),
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:ab:00.1"),
               0);
     // Remove .2 twice.
-    EXPECT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.2"),
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.2"),
               0);
-    EXPECT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.2"),
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.2"),
               0);
 }
 
@@ -462,31 +444,33 @@ TEST(HotplugPerFunction, AbsentAndRepeatNoops)
 // MODEL-SHUTDOWN exactly-once (the double-fire guard)
 // ===========================================================================
 
-// REMOVE both functions (seam fires once), then TOGGLE_SBR the same BDF: the
-// whole-device revoke path marks both functions removed again, but
+// REMOVE both functions (seam fires once), then TOGGLE_SBR the same BDF:
 // model_shutdown_fired must prevent a second fire.
 TEST(HotplugModelShutdownOnce, RemoveBothThenSbrDoesNotRefire)
 {
     ShutdownState sd;
-    HotplugTree t(nullptr, nullptr);
-    t.add_device("0000:61:00", stub_model_shutdown, &sd);
-    emu_ino_t hp = t.hotplug_ino();
-    ASSERT_EQ(emu_hotplug_set_sbr_sleep_us(t.get(), 0), 0);
+    HotplugTree t;
+    t.addDevice("0000:61:00", [&sd](Device &d) {
+        sd.calls++;
+        sd.last = &d;
+    });
+    Ino hp = t.hotplugIno();
+    ASSERT_EQ(hotplugSetSbrSleepUs(t.get(), 0), 0);
 
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.1"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.1"),
               0);
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.2"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.2"),
               0);
     EXPECT_EQ(sd.calls.load(), 1) << "seam must fire once both functions gone";
 
     // Whole-device revoke (TOGGLE_SBR) on the now-fully-removed device: the
-    // device is still in the registry (revoke_function does not mark it dead),
-    // so emu_device_revoke finds it, re-marks both functions, but the
+    // device is still in the registry (revokeFunction does not mark it dead),
+    // so revokeDevice finds it, re-marks both functions, but the
     // already-fired guard must hold.
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_TOGGLE_SBR,
-                                "0000:61:00.1"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_TOGGLE_SBR,
+                              "0000:61:00.1"),
               0);
     EXPECT_EQ(sd.calls.load(), 1)
         << "model_shutdown_fired must prevent a double fire across REMOVE+SBR";
@@ -497,11 +481,14 @@ TEST(HotplugModelShutdownOnce, SingleFunctionDoesNotFire)
 {
     ShutdownState sd;
     HotplugTree t;
-    t.add_device("0000:61:00", stub_model_shutdown, &sd);
-    emu_ino_t hp = t.hotplug_ino();
+    t.addDevice("0000:61:00", [&sd](Device &d) {
+        sd.calls++;
+        sd.last = &d;
+    });
+    Ino hp = t.hotplugIno();
 
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.1"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.1"),
               0);
     EXPECT_EQ(sd.calls.load(), 0);
 }
@@ -512,13 +499,16 @@ TEST(HotplugModelShutdownOnce, DoubleWholeDeviceRevokeFiresOnce)
 {
     ShutdownState sd;
     HotplugTree t;
-    t.add_device("0000:61:00", stub_model_shutdown, &sd);
+    t.addDevice("0000:61:00", [&sd](Device &d) {
+        sd.calls++;
+        sd.last = &d;
+    });
 
-    ASSERT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);
+    ASSERT_EQ(t.get().revokeDevice("0000:61:00"), 0);
     EXPECT_EQ(sd.calls.load(), 1);
-    // Device is now dead -> find_device_locked skips it -> idempotent no-op, no
+    // Device is now dead -> findDeviceLocked skips it -> idempotent no-op, no
     // second fire.
-    ASSERT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);
+    ASSERT_EQ(t.get().revokeDevice("0000:61:00"), 0);
     EXPECT_EQ(sd.calls.load(), 1);
 }
 
@@ -527,13 +517,11 @@ TEST(HotplugModelShutdownOnce, DoubleWholeDeviceRevokeFiresOnce)
 // ===========================================================================
 
 // Repeated reloads via a real materialize-style seed: a surviving device must
-// gain NO duplicate info/bars/qdma children.  We drive the actual collision
-// skip primitive (collect_live_bdfs + running_set + select_new) the way fs.c
-// does, and assert the device dir has exactly one of each endpoint after.
+// gain NO duplicate info/bars/qdma children.
 TEST(HotplugNoDoubleAttach, RepeatedSeedSelectsNothingForLiveDevice)
 {
     HotplugTree t;
-    emu_device *dev = t.add_device("0000:61:00");
+    Device *dev = t.addDevice("0000:61:00");
 
     // Baseline: exactly one of each endpoint child.
     ASSERT_EQ(count_children_named(dev->dir, "info"), 1);
@@ -541,21 +529,12 @@ TEST(HotplugNoDoubleAttach, RepeatedSeedSelectsNothingForLiveDevice)
     ASSERT_EQ(count_children_named(dev->dir, "qdma"), 1);
 
     // Emulate three RESCAN re-invocations of the seed+select primitive.  Each
-    // time the live device must be in the running-set, so select_new returns it
+    // time the live device must be in the running-set, so selectNew returns it
     // as NOT-selected (skip), so nothing is re-attached.
     for (int iter = 0; iter < 3; iter++) {
-        str_array live = str_array_init();
-        ASSERT_EQ(emu_node_tree_collect_live_bdfs(t.get(), &live), 0);
-        ASSERT_EQ(live.len, 1u);
-
-        emu_running_set *running = nullptr;
-        ASSERT_EQ(emu_running_set_new(&running), 0);
-        for (size_t i = 0; i < live.len; i++) {
-            ASSERT_EQ(emu_running_set_add(running, live.d[i]), 0);
-        }
-        EXPECT_TRUE(emu_running_set_contains(running, "0000:61:00"));
-        cleanup_running_set(running);
-        str_array_free(&live);
+        std::vector<std::string> live = t.get().collectLiveBdfs();
+        ASSERT_EQ(live.size(), 1u);
+        EXPECT_EQ(live[0], "0000:61:00");
 
         // The endpoint children count must stay exactly one (no double-attach).
         EXPECT_EQ(count_children_named(dev->dir, "info"), 1) << "iter " << iter;
@@ -568,49 +547,34 @@ TEST(HotplugNoDoubleAttach, RepeatedSeedSelectsNothingForLiveDevice)
 // BDF-with-function parsing -- adversarial edges beyond the base suite
 // ===========================================================================
 
-TEST(HotplugParseBdfAdversarial, EmptyAndNullAndNoDot)
+TEST(HotplugParseBdfAdversarial, EmptyAndNoDot)
 {
-    char bdf[EMU_BDF_LEN];
-    emu_device_function func;
-    EXPECT_EQ(emu_hotplug_parse_bdf(nullptr, bdf, sizeof(bdf), &func), -EINVAL);
-    EXPECT_EQ(emu_hotplug_parse_bdf("", bdf, sizeof(bdf), &func), -EINVAL);
+    std::string bdf;
+    DeviceFunction func;
+    EXPECT_EQ(hotplugParseBdf("", bdf, func), -EINVAL);
     // Leading dot only.
-    EXPECT_EQ(emu_hotplug_parse_bdf(".", bdf, sizeof(bdf), &func), -EINVAL);
+    EXPECT_EQ(hotplugParseBdf(".", bdf, func), -EINVAL);
     // No function dot at all is rejected (board-only).
-    EXPECT_EQ(emu_hotplug_parse_bdf("0000:61:00", bdf, sizeof(bdf), &func),
-              -EINVAL);
-}
-
-TEST(HotplugParseBdfAdversarial, NullOutPointers)
-{
-    char bdf[EMU_BDF_LEN];
-    emu_device_function func;
-    EXPECT_EQ(emu_hotplug_parse_bdf("0000:61:00.1", nullptr, sizeof(bdf), &func),
-              -EINVAL);
-    EXPECT_EQ(emu_hotplug_parse_bdf("0000:61:00.1", bdf, sizeof(bdf), nullptr),
-              -EINVAL);
+    EXPECT_EQ(hotplugParseBdf("0000:61:00", bdf, func), -EINVAL);
 }
 
 TEST(HotplugParseBdfAdversarial, OverlongBoardPrefixRejected)
 {
-    char bdf[EMU_BDF_LEN];
-    emu_device_function func;
+    std::string bdf;
+    DeviceFunction func;
     // A board prefix far longer than any valid BDF, with a valid function suffix.
     std::string huge(200, '0');
     huge += ".1";
-    EXPECT_EQ(emu_hotplug_parse_bdf(huge.c_str(), bdf, sizeof(bdf), &func),
-              -EINVAL);
+    EXPECT_EQ(hotplugParseBdf(huge, bdf, func), -EINVAL);
 }
 
 TEST(HotplugParseBdfAdversarial, FunctionWithTrailingGarbage)
 {
-    char bdf[EMU_BDF_LEN];
-    emu_device_function func;
-    // Digit followed by garbage: dot[2] != '\0' -> -EINVAL.
-    EXPECT_EQ(emu_hotplug_parse_bdf("0000:61:00.1x", bdf, sizeof(bdf), &func),
-              -EINVAL);
-    EXPECT_EQ(emu_hotplug_parse_bdf("0000:61:00.1 ", bdf, sizeof(bdf), &func),
-              -EINVAL);
+    std::string bdf;
+    DeviceFunction func;
+    // Digit followed by garbage: more than one char after the dot -> -EINVAL.
+    EXPECT_EQ(hotplugParseBdf("0000:61:00.1x", bdf, func), -EINVAL);
+    EXPECT_EQ(hotplugParseBdf("0000:61:00.1 ", bdf, func), -EINVAL);
 }
 
 // REMOVE/SBR with a syntactically valid but unsupported function (.0/.3) must be
@@ -618,13 +582,13 @@ TEST(HotplugParseBdfAdversarial, FunctionWithTrailingGarbage)
 TEST(HotplugParseBdfAdversarial, IoctlUnsupportedFunctionPropagates)
 {
     HotplugTree t;
-    t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
-    EXPECT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.3"),
+    t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.3"),
               -EOPNOTSUPP);
-    EXPECT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_TOGGLE_SBR,
-                                "0000:61:00.0"),
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_TOGGLE_SBR,
+                              "0000:61:00.0"),
               -EOPNOTSUPP);
 }
 
@@ -637,16 +601,16 @@ TEST(HotplugParseBdfAdversarial, IoctlUnsupportedFunctionPropagates)
 TEST(HotplugIoctlMatrix, OversizedRequestAccepted)
 {
     HotplugTree t;
-    t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
+    t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
 
     // A buffer larger than the struct, with a valid prefix.
     std::vector<uint8_t> buf(sizeof(slash_abi_hotplug_device_request) + 64, 0);
     auto *req = reinterpret_cast<slash_abi_hotplug_device_request *>(buf.data());
     req->size = sizeof(*req);
     std::snprintf(req->bdf, sizeof(req->bdf), "0000:61:00.1");
-    EXPECT_EQ(emu_node_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                             buf.data(), buf.size(), buf.data(), buf.size()),
+    EXPECT_EQ(t.get().ioctl(hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE, buf.data(),
+                            buf.size(), buf.data(), buf.size()),
               0);
 }
 
@@ -655,11 +619,14 @@ TEST(HotplugIoctlMatrix, OversizedRequestAccepted)
 TEST(HotplugIoctlMatrix, RescanIgnoresPayload)
 {
     ReloadState rs;
-    HotplugTree t(stub_reload, &rs);
-    emu_ino_t hp = t.hotplug_ino();
+    HotplugTree t([&rs]() -> int {
+        rs.calls++;
+        return rs.rc;
+    });
+    Ino hp = t.hotplugIno();
     char junk[16] = {1, 2, 3};
-    EXPECT_EQ(emu_node_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_RESCAN, junk,
-                             sizeof(junk), junk, sizeof(junk)),
+    EXPECT_EQ(t.get().ioctl(hp, SLASH_ABI_HOTPLUG_IOCTL_RESCAN, junk,
+                            sizeof(junk), junk, sizeof(junk)),
               0);
     EXPECT_EQ(rs.calls.load(), 1);
 }
@@ -669,10 +636,10 @@ TEST(HotplugIoctlMatrix, RescanIgnoresPayload)
 TEST(HotplugIoctlMatrix, NullInRejectedForDeviceRequest)
 {
     HotplugTree t;
-    t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
-    EXPECT_EQ(emu_node_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE, nullptr,
-                             0, nullptr, 0),
+    t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
+    EXPECT_EQ(t.get().ioctl(hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE, nullptr, 0,
+                            nullptr, 0),
               -EINVAL);
 }
 
@@ -785,10 +752,8 @@ bool path_exists(const std::string &p)
 }
 
 // The user-reachable form of the invariant violation: a plain unlink(2) of the
-// global /hotplug file over the FUSE mount.  If the invariant ("never unlinked")
-// held, the unlink would be refused (e.g. EPERM/EISDIR) and the control surface
-// would survive.  Today it succeeds and the surface is destroyed: a fresh open
-// of /hotplug then misses with ENOENT and no further hotplug command can run.
+// global /hotplug file over the FUSE mount.  The unlink must be refused (EPERM)
+// and the control surface must survive.
 TEST(HotplugMountUnlink, HotplugFileUnlinkIsRefusedSurfaceSurvives)
 {
     with_mounted_daemon([](const std::string &mnt) {

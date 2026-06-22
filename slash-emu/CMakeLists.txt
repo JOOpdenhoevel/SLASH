@@ -24,10 +24,13 @@ project(slash-emu
   LANGUAGES C CXX
 )
 
-# C11 with GNU extensions throughout, per vrt/vrtd/STYLE.md.
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_C_EXTENSIONS ON)
+# The daemon and its tests are C++20 (see README "Build and test").  C is still
+# enabled because the shared ABI conformance suite is a kselftest that must build
+# unchanged against the future kernel module, so it stays C (it sets its own
+# C_STANDARD per-target in conformance/CMakeLists.txt).
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(SLASH_EMU_BUILD_TESTS "Build slash-emu tests" OFF)
 
@@ -58,9 +61,14 @@ pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
 # silently ignored (see config.h and conf/slash-emu.conf).
 pkg_check_modules(INIH REQUIRED IMPORTED_TARGET inih)
 
-# libzmq (C API, zmq.h): the SIM bridge's daemon-side REQ client to the running
-# vpp_sim model (T10).  The daemon is C11, so we use the C API, not cppzmq.
+# libzmq: the SIM bridge's daemon-side REQ client to the running vpp_sim model.
+# The daemon is C++20, so the model client uses the header-only cppzmq C++ API
+# (<zmq.hpp>, RAII context/socket) layered over this libzmq link.
 pkg_check_modules(ZMQ REQUIRED IMPORTED_TARGET libzmq)
+
+# jsoncpp: the SIM-dialect wire protocol (model_client + the stub_model test
+# stand-in) is built and parsed with JsonCpp rather than a hand-rolled parser.
+pkg_check_modules(JSONCPP REQUIRED IMPORTED_TARGET jsoncpp)
 
 # enable_testing() at the top level so ctest discovers tests from the
 # top-level build dir (slash-emu/build).

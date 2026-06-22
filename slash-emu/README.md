@@ -10,7 +10,8 @@ hardware or the emulator unchanged.
 
 This directory holds the **step-1 MVP**. It stands up the full daemon lifecycle
 (CLI parsing, config load, FUSE mount, sd-event loop, signal handling, clean
-teardown) in the vrtd house style, materializes the per-device node tree over the
+teardown) in idiomatic C++20 (`namespace slash::emu`, RAII throughout),
+materializes the per-device node tree over the
 FUSE mount, and implements the full step-1 endpoint set plus a **SIM-only**
 data-plane bridge that spawns and talks to a `vpp_sim` model.
 
@@ -52,7 +53,7 @@ running model. See `docs/bridge-design.md` and `docs/bridge-protocol.md`.
 
 ```
 slash-emu/
-├── CMakeLists.txt            # top-level: finds fuse3 + libsystemd + libzmq, enable_testing()
+├── CMakeLists.txt            # top-level: finds fuse3 + libsystemd + libzmq + jsoncpp, enable_testing()
 ├── README.md                 # this file
 ├── conf/
 │   └── slash-emu.conf        # sample config (one [accelerator:<BDF>] section per device)
@@ -61,22 +62,21 @@ slash-emu/
 │   └── bridge-protocol.md    # the address-keyed SIM-dialect wire protocol + VBIN format
 ├── scripts/
 │   └── emud-scratch.sh       # spin up a throwaway daemon over a real mount for hand-probing
-├── src/
+├── src/                      # C++20, namespace slash::emu (one class/area per .hpp/.cpp)
 │   ├── CMakeLists.txt        # slash_emu_core static lib + slash-emud executable
-│   ├── utils.h               # PROPAGATE_ERROR family, _cleanup_, LOG (ported from vrtd)
-│   ├── array.h               # type-safe dynamic arrays (ported from vrtd)
-│   ├── config.h / config.c   # config parser + persistent accelerator model
-│   ├── node.h / node.c       # spine: node tree, per-device registry, refcounted
-│   │                         #   resources, revocation, model-shutdown seam (thread-safe)
-│   ├── fs.h / fs.c           # libfuse3 LOW-LEVEL session: ops adapt to the node tree
-│   ├── info.h / info.c       # info endpoint (read-only struct slash_info)
-│   ├── bars.h / bars.c       # bars/bar<M> endpoint + BAR access validation + shadow + backend seam
-│   ├── qdma.h / qdma.c       # qdma/ + qpair<Q> endpoint, QPAIR_ADD, sparse store + mem backend seam
-│   ├── hotplug.h / hotplug.c # global hotplug endpoint (RESCAN/REMOVE/TOGGLE_SBR/HOTPLUG)
-│   ├── vbin.h / vbin.c       # minimal ustar VBIN unpacker + chunk-stream classifier
-│   ├── model_client.h / .c   # ZeroMQ client for the SIM-dialect model protocol
-│   ├── bridge.h / bridge.c   # SIM data-plane bridge: spawn/teardown, reconfig, backend routing
-│   └── main.c                # CLI args, sd-event loop, signals, mount/teardown
+│   ├── utils.hpp             # LOG (journald) shim + SystemError (control-plane errno bridge)
+│   ├── config.hpp / .cpp     # Config/Accelerator/RunningSet: parser + persistent model
+│   ├── node.hpp / .cpp       # spine: NodeTree/Node/Device, shared_ptr-refcounted Resource,
+│   │                         #   polymorphic NodeOps, revocation, model-shutdown seam (mutex-guarded)
+│   ├── fs.hpp / .cpp         # Fs: libfuse3 LOW-LEVEL session (RAII) adapting ops to the node tree
+│   ├── info.hpp / .cpp       # info endpoint (read-only struct slash_info)
+│   ├── bars.hpp / .cpp       # bars/bar<M> endpoint + BAR access validation + shadow + BarBackend seam
+│   ├── qdma.hpp / .cpp       # qdma/ + qpair<Q> endpoint, QPAIR_ADD, sparse store + QdmaMemBackend seam
+│   ├── hotplug.hpp / .cpp    # global hotplug endpoint (RESCAN/REMOVE/TOGGLE_SBR/HOTPLUG)
+│   ├── vbin.hpp / .cpp       # minimal ustar VBIN unpacker + chunk-stream classifier
+│   ├── model_client.hpp/.cpp # ModelClient: cppzmq REQ client + JsonCpp for the SIM-dialect protocol
+│   ├── bridge.hpp / .cpp     # Bridge/BridgeRegistry: spawn/teardown, reconfig, backend routing
+│   └── main.cpp              # CLI args, sd-event loop, signals, mount/teardown
 ├── systemd/
 │   └── slash-emu.service     # privileged unit (mounts /run/slash_emu)
 ├── sysusers/
@@ -92,15 +92,17 @@ slash-emu/
     ├── bars_test.cpp / bars_adversarial_test.cpp / bars_oom_test.cpp   # bars endpoint
     ├── qdma_test.cpp / qdma_adversarial_test.cpp  # qdma endpoint
     ├── hotplug_test.cpp / hotplug_adversarial_test.cpp                 # hotplug endpoint
-    ├── stub_model.c          # CI stand-in for vpp_sim (the daemon's bridge is tested against it)
+    ├── stub_model.cpp        # CI stand-in for vpp_sim (cppzmq + JsonCpp; bridge is tested against it)
     ├── bridge_test.cpp / bridge_integration_test.cpp / bridge_adversarial_test.cpp  # SIM bridge
     └── rescan_test.cpp / rescan_adversarial_test.cpp                   # RESCAN rediscovery
 ```
 
 ## Build and test
 
-All building and testing goes through **CMake + CTest**. The build directory is
-`slash-emu/build/`. Scratch/temp output lives in the repo's `.tmp/` dir.
+The daemon is **C++20**. It depends on libfuse3, libsystemd, libinih, libzmq
+(via the header-only **cppzmq** API), and **JsonCpp** (the SIM-dialect wire
+protocol is built/parsed with JsonCpp). All building and testing goes through
+**CMake + CTest**.
 
 ```sh
 cmake -S slash-emu -B slash-emu/build -DSLASH_EMU_BUILD_TESTS=ON
@@ -149,19 +151,20 @@ scripts/emud-scratch.sh -- ls -l "$MNT"/0000:61:00/bars
   the sd-event loop as an I/O source (rather than `fuse_session_loop`) so FUSE
   and daemon events share one loop.
 - **Node tree (the spine).** The filesystem is a generic tree of inodes
-  (`struct emu_node` in `node.h`), owned by an `emu_node_tree`. The FUSE ops in
-  `fs.c` are thin adapters over the node model (`emu_node_lookup_child` /
-  `_forget` / `_stat` / `_readdir` / `_pread` / `_pwrite` / ioctl dispatch); no
+  (the `Node` class in `node.hpp`), owned by a `NodeTree`. The FUSE ops in
+  `fs.cpp` are thin adapters over the node model (`NodeTree::lookupChild` /
+  `forget` / `stat` / `readdir` / `pread` / `pwrite` / `ioctl` dispatch); no
   op hard-codes an inode. Endpoints (info/bars/qdma/hotplug) attach their files
-  and per-node read/write/ioctl hooks via the node API without touching the
-  session plumbing. The tree, per-device registry, and resource refcounts are
-  mutex-guarded so the data model is safe for a multi-threaded session. See
-  `node.h` for the full design and locking model.
+  and behaviour as polymorphic `NodeOps` subclasses via the node API without
+  touching the session plumbing. The tree, per-device registry, and resource
+  refcounts are `std::mutex`-guarded so the data model is safe for a
+  multi-threaded session. See `node.hpp` for the full design and locking model.
 - **Revocation & nameless qpairs.** Each device tracks live communication
   resources — including QDMA qpairs unlinked-while-open (nameless, unreachable by
-  walking `qdma/`). A qpair is a refcounted resource whose lifetime is decoupled
-  from its inode (registry ref + inode ref, freed when both drop), with
-  idempotent teardown on cooperative inode eviction or forced removal. Forced
+  walking `qdma/`). A qpair is a `std::shared_ptr`-refcounted `Resource` whose
+  lifetime is decoupled from its inode (a registry ref + an inode ref, freed when
+  both drop), with idempotent teardown on cooperative inode eviction or forced
+  removal. Forced
   removal eagerly revokes: new lookups get `-ENOENT`, ops on already-open fds get
   `-ENODEV`, names are invalidated via `fuse_lowlevel_notify_delete`, and `close`
   always succeeds. A per-device **model-shutdown seam** fires when both functions
@@ -178,7 +181,7 @@ scripts/emud-scratch.sh -- ls -l "$MNT"/0000:61:00/bars
 - **No watchdog yet (known later item).** slash-emud deliberately does not enable
   the systemd watchdog yet; it is to be wired (`sd_event_set_watchdog` +
   `WatchdogSec=`) when a streaming/work loop that could hang lands. See the
-  `TODO` near the event loop in `main.c`.
+  `TODO` near the event loop in `main.cpp`.
 - **Readiness ordering.** `READY=1` is signalled only after the FUSE mount is
   established, so `Type=notify` consumers and VRTD discovery can trust the
   emulated tree is browsable the moment the service reports started.

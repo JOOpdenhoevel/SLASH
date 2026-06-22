@@ -29,12 +29,11 @@
  *     seam after each restore (the real daemon never re-installs it -- it relies
  *     on the fn/ctx surviving a per-function revoke).  Exhaustive remove/restore
  *     sequences against a counting seam, asserting the seam fires EXACTLY on each
- *     both-removed transition and never spuriously, plus direct inspection of
- *     dev->removed_functions / dev->model_shutdown_fired after each step.
- *   - the seam-preservation invariant the re-arm depends on (revoke_function does
- *     not clear dev->model_shutdown / _ctx).
- *   - removed_functions bit integrity: a restore-of-not-removed must not clear the
- *     OTHER function's removed bit nor reset the fire-once guard.
+ *     both-removed transition and never spuriously -- verified through observable
+ *     call counts (the C++20 Device private fields are not inspectable; the public
+ *     contract is the count and usability, which is what the spec cares about).
+ *   - removed_functions bit integrity: verified through behavioral invariants
+ *     (which ioctls succeed/fail, which nodes resolve) rather than internal state.
  *   - leak/UAF across many remove/restore cycles (ASan): fresh store/handler each
  *     time, no double-install, old store freed.
  *   - integration over the real FUSE mount: the real-daemon double-teardown (both
@@ -69,162 +68,141 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "bars.hpp"
+#include "info.hpp"
+#include "node.hpp"
+#include "qdma.hpp"
+
 extern "C" {
-#include "bars.h"
-#include "bridge.h"
-#include "hotplug.h"
-#include "info.h"
-#include "node.h"
-#include "qdma.h"
 #include "slash/uapi/slash_abi.h"
 }
+
+using slash::emu::Device;
+using slash::emu::DeviceFunction;
+using slash::emu::Ino;
+using slash::emu::ModelShutdownFn;
+using slash::emu::Node;
+using slash::emu::NodeTree;
+using slash::emu::barsAttach;
+using slash::emu::infoAttach;
+using slash::emu::kRootIno;
+using slash::emu::qdmaAttach;
 
 namespace {
 
 // ===========================================================================
 // Unit harness (mirrors rescan_test.cpp's RescanTree but with no manual seam
-// re-install: the seam is wired ONCE at add_device and we assert the restore
+// re-install: the seam is wired ONCE at addDevice and we assert the restore
 // path re-arms it on its own, exactly as the real daemon relies on).
 // ===========================================================================
 
 struct ShutdownCounter {
     std::atomic<int> calls{0};
     std::atomic<int> ctx_mismatches{0};
-    emu_device *expect_dev{nullptr};
+    Device *expect_dev{nullptr};
 };
-
-void counting_shutdown(emu_device *dev, void *ctx)
-{
-    auto *s = static_cast<ShutdownCounter *>(ctx);
-    s->calls++;
-    if (s->expect_dev != nullptr && dev != s->expect_dev) {
-        s->ctx_mismatches++;
-    }
-}
 
 class AdvTree {
 public:
-    AdvTree() { EXPECT_EQ(emu_node_tree_new(&tree_, nullptr), 0); }
-    ~AdvTree() { cleanup_node_tree(tree_); }
-    emu_node_tree *get() { return tree_; }
+    AdvTree() : tree_() {}
+    NodeTree &get() { return tree_; }
 
-    emu_device *add_device(const char *bdf, emu_model_shutdown_fn sd = nullptr,
-                           void *sd_ctx = nullptr)
+    Device *addDevice(const std::string &bdf, ModelShutdownFn sd = {})
     {
-        emu_device *dev = nullptr;
-        EXPECT_EQ(emu_node_tree_add_device(tree_, bdf, &dev), 0);
+        Device *dev = tree_.addDevice(bdf);
         EXPECT_NE(dev, nullptr);
-        EXPECT_EQ(emu_info_attach(dev), 0);
-        EXPECT_EQ(emu_bars_attach(dev), 0);
-        EXPECT_EQ(emu_qdma_attach(dev), 0);
-        if (sd != nullptr) {
-            EXPECT_EQ(emu_device_set_model_shutdown(tree_, bdf, sd, sd_ctx), 0);
+        if (dev == nullptr) {
+            return nullptr;
+        }
+        EXPECT_EQ(infoAttach(*dev), 0);
+        EXPECT_EQ(barsAttach(*dev), 0);
+        EXPECT_EQ(qdmaAttach(*dev), 0);
+        if (sd) {
+            EXPECT_EQ(tree_.setModelShutdown(bdf, std::move(sd)), 0);
         }
         return dev;
     }
 
-    void remove(emu_device *dev, emu_device_function func)
+    void remove(const std::string &bdf, DeviceFunction func)
     {
-        ASSERT_EQ(emu_device_revoke_function(tree_, dev->bdf, func), 0);
+        ASSERT_EQ(tree_.revokeFunction(bdf, func), 0);
     }
 
     // Restore exactly as the daemon would (rebuild + re-attach endpoint), but
     // DELIBERATELY do NOT re-install the model_shutdown seam -- the real daemon
     // does not, so this is the honest re-arm test.
-    bool restore(emu_device *dev, emu_device_function func)
+    bool restore(Device *dev, DeviceFunction func)
     {
         bool rebuilt = false;
-        EXPECT_EQ(
-            emu_device_restore_function(tree_, dev->bdf, func, &rebuilt), 0);
+        EXPECT_EQ(tree_.restoreFunction(dev->bdf(), func, &rebuilt), 0);
         if (rebuilt) {
-            int aret = func == EMU_DEVICE_FUNCTION_QDMA ? emu_qdma_attach(dev)
-                                                        : emu_bars_attach(dev);
+            int aret = func == DeviceFunction::Qdma ? qdmaAttach(*dev)
+                                                    : barsAttach(*dev);
             EXPECT_EQ(aret, 0);
         }
         return rebuilt;
     }
 
 private:
-    emu_node_tree *tree_ = nullptr;
+    NodeTree tree_;
 };
 
-bool resolves(emu_node_tree *tree, emu_ino_t parent, const char *name)
+bool resolves(NodeTree &tree, Ino parent, const char *name)
 {
-    emu_node *child = nullptr;
-    int rc = emu_node_lookup_child(tree, parent, name, &child);
+    Node *child = nullptr;
+    int rc = tree.lookupChild(parent, name, &child);
     return rc == 0 && child != nullptr;
 }
 
-uint32_t add_qpair(emu_node_tree *tree, emu_device *dev)
+uint32_t add_qpair(NodeTree &tree, Device *dev)
 {
     struct slash_abi_qdma_qpair_add req {};
     req.size = sizeof(req);
     req.mode = 0;
     req.dir_mask = 0x3;
     struct slash_abi_qdma_qpair_add out = req;
-    EXPECT_EQ(emu_node_ioctl(tree, dev->qdma->ino,
-                             SLASH_ABI_QDMA_IOCTL_QPAIR_ADD, &req, sizeof(req),
-                             &out, sizeof(out)),
+    EXPECT_EQ(tree.ioctl(dev->qdma->ino, SLASH_ABI_QDMA_IOCTL_QPAIR_ADD, &req,
+                         sizeof(req), &out, sizeof(out)),
               0);
     return out.qid;
 }
 
-// emu_device_function_mask(func) == (1u << func); QDMA=1, BARS=2 (node.h).
-constexpr unsigned kQdma = 1u << EMU_DEVICE_FUNCTION_QDMA; // == 2
-constexpr unsigned kBars = 1u << EMU_DEVICE_FUNCTION_BARS; // == 4
-
 // ===========================================================================
-// HAMMER 3: model_shutdown re-arm bookkeeping, NO manual re-install.
+// SEAM WIRING INVARIANT: model_shutdown re-arm bookkeeping, NO manual re-install.
 //
-// The real daemon's reattach does NOT call emu_device_set_model_shutdown.  It
-// relies on the seam fn/ctx surviving a per-function revoke and on restore
-// re-arming model_shutdown_fired.  These tests drive the brief's exact sequences
-// against a seam wired ONCE and assert exactly-once-per-both-removed.
+// The real daemon's reattach does NOT call setModelShutdown again.  It relies
+// on the seam lambda surviving a per-function revoke and on restoreFunction
+// re-arming the guard.  These tests drive the brief's exact sequences against a
+// seam wired ONCE and assert exactly-once-per-both-removed through call counts.
 // ===========================================================================
-
-// First: the load-bearing invariant -- a per-function revoke must NOT clear the
-// seam fn/ctx (otherwise the daemon could never fire it a second time).
-TEST(RescanAdvSeam, RevokeFunctionPreservesSeamWiring)
-{
-    ShutdownCounter c;
-    AdvTree t;
-    emu_device *dev = t.add_device("0000:61:00", counting_shutdown, &c);
-    c.expect_dev = dev;
-
-    t.remove(dev, EMU_DEVICE_FUNCTION_QDMA);
-    EXPECT_EQ(dev->model_shutdown, &counting_shutdown)
-        << "seam fn cleared by per-function revoke";
-    EXPECT_EQ(dev->model_shutdown_ctx, &c) << "seam ctx cleared";
-    EXPECT_EQ(dev->removed_functions, kQdma);
-    EXPECT_FALSE(dev->model_shutdown_fired);
-
-    t.remove(dev, EMU_DEVICE_FUNCTION_BARS);
-    EXPECT_EQ(c.calls.load(), 1);
-    EXPECT_TRUE(dev->model_shutdown_fired);
-    // Seam STILL wired after firing (so a re-arm can fire it again).
-    EXPECT_EQ(dev->model_shutdown, &counting_shutdown);
-    EXPECT_EQ(dev->model_shutdown_ctx, &c);
-}
 
 // {rm1, rm2(fires), restore1, rm1(fires again)} -- WITHOUT re-installing.
 TEST(RescanAdvSeam, Rm1Rm2Restore1Rm1FiresTwiceNoReinstall)
 {
     ShutdownCounter c;
     AdvTree t;
-    emu_device *dev = t.add_device("0000:61:00", counting_shutdown, &c);
+    Device *dev = t.addDevice("0000:61:00", [&c](Device &d) {
+        c.calls++;
+        if (c.expect_dev != nullptr && &d != c.expect_dev) {
+            c.ctx_mismatches++;
+        }
+    });
     c.expect_dev = dev;
 
-    t.remove(dev, EMU_DEVICE_FUNCTION_QDMA);
-    t.remove(dev, EMU_DEVICE_FUNCTION_BARS);
-    ASSERT_EQ(c.calls.load(), 1);
-    ASSERT_EQ(dev->removed_functions, kQdma | kBars);
+    t.remove("0000:61:00", DeviceFunction::Qdma);
+    EXPECT_EQ(c.calls.load(), 0) << "qdma alone must not fire the seam";
+    t.remove("0000:61:00", DeviceFunction::Bars);
+    ASSERT_EQ(c.calls.load(), 1) << "seam must fire on both-removed transition";
 
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_QDMA));
-    EXPECT_FALSE(dev->model_shutdown_fired) << "restore must re-arm the guard";
-    EXPECT_EQ(dev->removed_functions, kBars) << "only qdma bit cleared";
+    // Restore fn1 (qdma) -- DO NOT re-install the seam.
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma));
+    // The seam is re-armed; fn2 (bars) is still removed.
+    // qdma resolves, bars does not.
+    EXPECT_TRUE(resolves(t.get(), dev->dir->ino, "qdma"));
+    EXPECT_FALSE(resolves(t.get(), dev->dir->ino, "bars"));
 
-    // Remove qdma again -> both gone again -> fires WITHOUT a manual re-install.
-    t.remove(dev, EMU_DEVICE_FUNCTION_QDMA);
+    // Remove fn1 again -> both gone again -> fires through the surviving seam.
+    t.remove("0000:61:00", DeviceFunction::Qdma);
     EXPECT_EQ(c.calls.load(), 2)
         << "re-arm must fire through the surviving seam, no re-install";
     EXPECT_EQ(c.ctx_mismatches.load(), 0);
@@ -236,17 +214,23 @@ TEST(RescanAdvSeam, Rm1Restore1Rm1Rm2FiresExactlyOnce)
 {
     ShutdownCounter c;
     AdvTree t;
-    emu_device *dev = t.add_device("0000:61:00", counting_shutdown, &c);
+    Device *dev = t.addDevice("0000:61:00", [&c](Device &d) {
+        c.calls++;
+        if (c.expect_dev != nullptr && &d != c.expect_dev) {
+            c.ctx_mismatches++;
+        }
+    });
     c.expect_dev = dev;
 
-    t.remove(dev, EMU_DEVICE_FUNCTION_QDMA);
+    t.remove("0000:61:00", DeviceFunction::Qdma);
     EXPECT_EQ(c.calls.load(), 0);
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_QDMA));
-    EXPECT_EQ(c.calls.load(), 0);
-    t.remove(dev, EMU_DEVICE_FUNCTION_QDMA);
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma));
+    EXPECT_EQ(c.calls.load(), 0) << "restore must not spuriously fire seam";
+    t.remove("0000:61:00", DeviceFunction::Qdma);
     EXPECT_EQ(c.calls.load(), 0) << "qdma alone is not both-removed";
-    t.remove(dev, EMU_DEVICE_FUNCTION_BARS);
+    t.remove("0000:61:00", DeviceFunction::Bars);
     EXPECT_EQ(c.calls.load(), 1) << "fires exactly once at the both-removed edge";
+    EXPECT_EQ(c.ctx_mismatches.load(), 0);
 }
 
 // {rm1, rm2(fires), restore1, restore2, rm2, rm1(fires)} -- restoring BOTH then
@@ -255,118 +239,160 @@ TEST(RescanAdvSeam, RestoreBothThenRemoveReverseOrderFiresAgain)
 {
     ShutdownCounter c;
     AdvTree t;
-    emu_device *dev = t.add_device("0000:61:00", counting_shutdown, &c);
+    Device *dev = t.addDevice("0000:61:00", [&c](Device &d) {
+        c.calls++;
+        if (c.expect_dev != nullptr && &d != c.expect_dev) {
+            c.ctx_mismatches++;
+        }
+    });
     c.expect_dev = dev;
 
-    t.remove(dev, EMU_DEVICE_FUNCTION_QDMA);
-    t.remove(dev, EMU_DEVICE_FUNCTION_BARS);
-    ASSERT_EQ(c.calls.load(), 1);
+    t.remove("0000:61:00", DeviceFunction::Qdma);
+    t.remove("0000:61:00", DeviceFunction::Bars);
+    ASSERT_EQ(c.calls.load(), 1) << "first both-removed fires";
 
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_QDMA));
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_BARS));
-    EXPECT_EQ(dev->removed_functions, 0u);
-    EXPECT_FALSE(dev->model_shutdown_fired);
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma));
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Bars));
+    // Both restored: both resolve, guard re-armed.
+    EXPECT_TRUE(resolves(t.get(), dev->dir->ino, "qdma"));
+    EXPECT_TRUE(resolves(t.get(), dev->dir->ino, "bars"));
 
-    t.remove(dev, EMU_DEVICE_FUNCTION_BARS);
-    EXPECT_EQ(c.calls.load(), 1);
-    t.remove(dev, EMU_DEVICE_FUNCTION_QDMA);
+    // Remove in REVERSE order (bars first, then qdma).
+    t.remove("0000:61:00", DeviceFunction::Bars);
+    EXPECT_EQ(c.calls.load(), 1) << "one function alone must not fire";
+    t.remove("0000:61:00", DeviceFunction::Qdma);
     EXPECT_EQ(c.calls.load(), 2) << "second both-removed (reverse order) fires";
     EXPECT_EQ(c.ctx_mismatches.load(), 0);
 }
 
 // A restore of a NOT-removed function must not reset state in a way that causes a
 // missed or double fire: with only fn1 removed, restoring fn2 (a no-op rebuild)
-// must NOT reset model_shutdown_fired nor clear fn1's removed bit.
+// must NOT prevent the seam from firing when fn1 is finally removed too.
 TEST(RescanAdvSeam, RestoreOfNotRemovedDoesNotPerturbBookkeeping)
 {
     ShutdownCounter c;
     AdvTree t;
-    emu_device *dev = t.add_device("0000:61:00", counting_shutdown, &c);
+    Device *dev = t.addDevice("0000:61:00", [&c](Device &d) {
+        c.calls++;
+        if (c.expect_dev != nullptr && &d != c.expect_dev) {
+            c.ctx_mismatches++;
+        }
+    });
     c.expect_dev = dev;
 
     // Remove both -> fired. Then restore fn1 only (fn2 stays removed).
-    t.remove(dev, EMU_DEVICE_FUNCTION_QDMA);
-    t.remove(dev, EMU_DEVICE_FUNCTION_BARS);
+    t.remove("0000:61:00", DeviceFunction::Qdma);
+    t.remove("0000:61:00", DeviceFunction::Bars);
     ASSERT_EQ(c.calls.load(), 1);
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_QDMA));
-    ASSERT_EQ(dev->removed_functions, kBars);
-    ASSERT_FALSE(dev->model_shutdown_fired);
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma));
+    // fn2 (bars) is still removed; fn1 (qdma) is live again.
+    EXPECT_TRUE(resolves(t.get(), dev->dir->ino, "qdma"));
+    EXPECT_FALSE(resolves(t.get(), dev->dir->ino, "bars"));
 
     // Now "restore" fn1 AGAIN (already restored => no-op): must not perturb the
-    // fn2 removed bit nor the (re-armed) guard, so a later rm1 fires correctly.
+    // fn2 removed bit nor the (re-armed) guard.
     bool rebuilt = true;
-    ASSERT_EQ(emu_device_restore_function(t.get(), "0000:61:00",
-                                          EMU_DEVICE_FUNCTION_QDMA, &rebuilt),
+    ASSERT_EQ(t.get().restoreFunction("0000:61:00", DeviceFunction::Qdma,
+                                      &rebuilt),
               0);
     EXPECT_FALSE(rebuilt) << "restore of already-live function is a no-op";
-    EXPECT_EQ(dev->removed_functions, kBars) << "fn2 bit must be untouched";
-    EXPECT_FALSE(dev->model_shutdown_fired);
+    // fn2 is still removed (no-op on fn1 must not touch fn2's state).
+    EXPECT_FALSE(resolves(t.get(), dev->dir->ino, "bars"))
+        << "fn2's removed state must be untouched by no-op restore of fn1";
 
-    // And "restore" fn2's sibling state is intact: removing fn1 now completes the
-    // set and fires exactly once more.
-    t.remove(dev, EMU_DEVICE_FUNCTION_QDMA);
-    EXPECT_EQ(c.calls.load(), 2);
+    // The guard is still re-armed: removing fn1 now completes the set and fires.
+    t.remove("0000:61:00", DeviceFunction::Qdma);
+    EXPECT_EQ(c.calls.load(), 2)
+        << "no-op restore must not prevent the seam from re-firing";
+    EXPECT_EQ(c.ctx_mismatches.load(), 0);
 }
 
-// Restore of a function on an INTACT device (nothing ever removed) must not touch
-// model_shutdown_fired (it is already false) and must report not-rebuilt.  Guards
-// against a restore that unconditionally clears the guard and masks a real fire.
+// Restore of a function on an INTACT device (nothing ever removed) must not
+// spuriously fire the seam.  Guards against a restore that unconditionally
+// clears the guard and masks a real fire.
 TEST(RescanAdvSeam, RestoreNoOpOnIntactDeviceLeavesGuardClear)
 {
     ShutdownCounter c;
     AdvTree t;
-    emu_device *dev = t.add_device("0000:61:00", counting_shutdown, &c);
+    Device *dev = t.addDevice("0000:61:00", [&c](Device &d) {
+        c.calls++;
+        if (c.expect_dev != nullptr && &d != c.expect_dev) {
+            c.ctx_mismatches++;
+        }
+    });
     c.expect_dev = dev;
 
     bool rebuilt = true;
-    ASSERT_EQ(emu_device_restore_function(t.get(), "0000:61:00",
-                                          EMU_DEVICE_FUNCTION_BARS, &rebuilt),
+    ASSERT_EQ(t.get().restoreFunction("0000:61:00", DeviceFunction::Bars,
+                                      &rebuilt),
               0);
     EXPECT_FALSE(rebuilt);
-    EXPECT_FALSE(dev->model_shutdown_fired);
-    EXPECT_EQ(dev->removed_functions, 0u);
+    EXPECT_EQ(c.calls.load(), 0) << "no-op restore must not fire the seam";
 
     // Sanity: the seam still fires exactly once when both are genuinely removed.
-    t.remove(dev, EMU_DEVICE_FUNCTION_BARS);
-    t.remove(dev, EMU_DEVICE_FUNCTION_QDMA);
+    t.remove("0000:61:00", DeviceFunction::Bars);
+    t.remove("0000:61:00", DeviceFunction::Qdma);
     EXPECT_EQ(c.calls.load(), 1);
+    EXPECT_EQ(c.ctx_mismatches.load(), 0);
 }
 
 // Exhaustive small-depth fuzz: drive every reachable remove/restore sequence up
 // to a bounded depth against a model of the spec, asserting the counting seam
-// matches the model's "fires on each 0b11 transition" at every step.  This is the
-// most-likely-bug-site brief item, mechanized.
+// matches the model's "fires on each 0b11 transition" at every step.
+//
+// The C++20 Device private fields (removed_functions, model_shutdown_fired) are
+// not accessible; we assert only the OBSERVABLE contract:
+//   - cumulative call count matches the model's total_fires at each step, and
+//   - the qdma/bars subtrees resolve exactly when the model says they are live.
 TEST(RescanAdvSeam, ExhaustiveSequenceFuzzMatchesModel)
 {
-    // Reference model: a 2-bit removed mask + a fire-once guard, mirroring
-    // device_mark_function_removed_locked + the restore re-arm.
     struct Model {
-        unsigned removed = 0;
+        bool qdma_removed = false;
+        bool bars_removed = false;
         bool fired = false;
         int total_fires = 0;
-        void rm(unsigned bit)
+
+        void rm_qdma()
         {
-            if (removed & bit) {
-                return; // idempotent
+            if (qdma_removed) {
+                return;
             }
-            removed |= bit;
-            if (removed == (kQdma | kBars) && !fired) {
+            qdma_removed = true;
+            if (bars_removed && !fired) {
                 fired = true;
                 total_fires++;
             }
         }
-        void restore(unsigned bit)
+        void rm_bars()
         {
-            if ((removed & bit) == 0) {
-                return; // not removed: no-op, no re-arm
+            if (bars_removed) {
+                return;
             }
-            removed &= ~bit;
+            bars_removed = true;
+            if (qdma_removed && !fired) {
+                fired = true;
+                total_fires++;
+            }
+        }
+        void restore_qdma()
+        {
+            if (!qdma_removed) {
+                return; // no-op: guard stays as-is
+            }
+            qdma_removed = false;
+            fired = false; // re-arm
+        }
+        void restore_bars()
+        {
+            if (!bars_removed) {
+                return; // no-op: guard stays as-is
+            }
+            bars_removed = false;
             fired = false; // re-arm
         }
     };
 
-    // Enumerate all action strings of length <= 6 over {rm1,rm2,re1,re2}.
-    const int kActions = 4; // 0=rm1 1=rm2 2=re1 3=re2
+    const int kActions = 4; // 0=rm_qdma 1=rm_bars 2=re_qdma 3=re_bars
     const int kMaxLen = 6;
     int sequences = 0;
     for (int len = 1; len <= kMaxLen; len++) {
@@ -374,42 +400,53 @@ TEST(RescanAdvSeam, ExhaustiveSequenceFuzzMatchesModel)
         for (;;) {
             ShutdownCounter c;
             AdvTree t;
-            emu_device *dev =
-                t.add_device("0000:61:00", counting_shutdown, &c);
+            Device *dev = t.addDevice("0000:61:00", [&c](Device &d) {
+                c.calls++;
+                if (c.expect_dev != nullptr && &d != c.expect_dev) {
+                    c.ctx_mismatches++;
+                }
+            });
             c.expect_dev = dev;
             Model m;
 
             for (int step = 0; step < len; step++) {
                 switch (idx[step]) {
                 case 0:
-                    t.remove(dev, EMU_DEVICE_FUNCTION_QDMA);
-                    m.rm(kQdma);
+                    t.remove("0000:61:00", DeviceFunction::Qdma);
+                    m.rm_qdma();
                     break;
                 case 1:
-                    t.remove(dev, EMU_DEVICE_FUNCTION_BARS);
-                    m.rm(kBars);
+                    t.remove("0000:61:00", DeviceFunction::Bars);
+                    m.rm_bars();
                     break;
                 case 2:
-                    t.restore(dev, EMU_DEVICE_FUNCTION_QDMA);
-                    m.restore(kQdma);
+                    t.restore(dev, DeviceFunction::Qdma);
+                    m.restore_qdma();
                     break;
                 case 3:
-                    t.restore(dev, EMU_DEVICE_FUNCTION_BARS);
-                    m.restore(kBars);
+                    t.restore(dev, DeviceFunction::Bars);
+                    m.restore_bars();
                     break;
                 }
-                // Per-step invariant: state + cumulative fires track the model.
-                ASSERT_EQ(dev->removed_functions, m.removed)
-                    << "len=" << len << " step=" << step;
-                ASSERT_EQ(dev->model_shutdown_fired, m.fired)
-                    << "len=" << len << " step=" << step;
+
+                // Observable contract: cumulative seam fires match the model.
                 ASSERT_EQ(c.calls.load(), m.total_fires)
+                    << "len=" << len << " step=" << step
+                    << " action=" << idx[step];
+
+                // Observable contract: qdma/bars subtrees resolve iff the model
+                // says they are live.
+                ASSERT_EQ(resolves(t.get(), dev->dir->ino, "qdma"),
+                          !m.qdma_removed)
+                    << "len=" << len << " step=" << step;
+                ASSERT_EQ(resolves(t.get(), dev->dir->ino, "bars"),
+                          !m.bars_removed)
                     << "len=" << len << " step=" << step;
             }
             ASSERT_EQ(c.ctx_mismatches.load(), 0);
             sequences++;
 
-            // odometer increment
+            // Odometer increment
             int p = len - 1;
             while (p >= 0 && ++idx[p] == kActions) {
                 idx[p] = 0;
@@ -425,43 +462,41 @@ TEST(RescanAdvSeam, ExhaustiveSequenceFuzzMatchesModel)
 }
 
 // ===========================================================================
-// HAMMER 1/4: many remove/restore cycles -- no leak/UAF, fresh usable endpoints
+// LIFECYCLE: many remove/restore cycles -- no leak/UAF, fresh usable endpoints
 // each time, no duplicate children.  (ASan does the heavy lifting here.)
 // ===========================================================================
 
 TEST(RescanAdvLifecycle, ManyQdmaCyclesNoLeakStaysUsable)
 {
     AdvTree t;
-    emu_device *dev = t.add_device("0000:61:00");
+    Device *dev = t.addDevice("0000:61:00");
 
     for (int i = 0; i < 25; i++) {
         // Add a qpair, then remove the function (tears down the qpair + store),
         // then restore (fresh store) and round-trip on a brand-new qpair.
-        uint32_t qid = add_qpair(t.get(), dev);
-        (void) qid;
-        t.remove(dev, EMU_DEVICE_FUNCTION_QDMA);
+        (void) add_qpair(t.get(), dev);
+        t.remove("0000:61:00", DeviceFunction::Qdma);
         EXPECT_FALSE(resolves(t.get(), dev->dir->ino, "qdma")) << "i=" << i;
 
-        ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_QDMA)) << "i=" << i;
+        ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma)) << "i=" << i;
         ASSERT_TRUE(resolves(t.get(), dev->dir->ino, "qdma")) << "i=" << i;
 
         uint32_t q2 = add_qpair(t.get(), dev);
         char qname[32];
         std::snprintf(qname, sizeof(qname), "qpair%u", q2);
-        emu_node *qp = nullptr;
-        ASSERT_EQ(emu_node_lookup_child(t.get(), dev->qdma->ino, qname, &qp), 0)
-            << "i=" << i;
-        ASSERT_NE(qp, nullptr);
+        Node *qp = nullptr;
+        ASSERT_EQ(t.get().lookupChild(dev->qdma->ino, qname, &qp), 0) << "i=" << i;
+        ASSERT_NE(qp, nullptr) << "i=" << i;
 
         std::vector<uint8_t> w(48, (uint8_t) (i + 1)), r(48, 0);
-        ASSERT_EQ(emu_node_pwrite(t.get(), qp->ino,
-                                  reinterpret_cast<const char *>(w.data()),
-                                  w.size(), (off_t) SLASH_HBM_BASE),
+        ASSERT_EQ(t.get().pwrite(qp->ino,
+                                 reinterpret_cast<const char *>(w.data()),
+                                 w.size(), (off_t) SLASH_HBM_BASE),
                   (ssize_t) w.size())
             << "i=" << i;
-        ASSERT_EQ(emu_node_pread(t.get(), qp->ino,
-                                 reinterpret_cast<char *>(r.data()), r.size(),
-                                 (off_t) SLASH_HBM_BASE),
+        ASSERT_EQ(t.get().pread(qp->ino,
+                                reinterpret_cast<char *>(r.data()), r.size(),
+                                (off_t) SLASH_HBM_BASE),
                   (ssize_t) r.size())
             << "i=" << i;
         EXPECT_EQ(r, w) << "i=" << i;
@@ -471,66 +506,62 @@ TEST(RescanAdvLifecycle, ManyQdmaCyclesNoLeakStaysUsable)
 TEST(RescanAdvLifecycle, ManyBarsCyclesNoLeakStaysUsable)
 {
     AdvTree t;
-    emu_device *dev = t.add_device("0000:61:00");
+    Device *dev = t.addDevice("0000:61:00");
 
     for (int i = 0; i < 25; i++) {
-        t.remove(dev, EMU_DEVICE_FUNCTION_BARS);
+        t.remove("0000:61:00", DeviceFunction::Bars);
         EXPECT_FALSE(resolves(t.get(), dev->dir->ino, "bars")) << "i=" << i;
 
-        ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_BARS)) << "i=" << i;
-        emu_node *bar0 = nullptr;
-        ASSERT_EQ(emu_node_lookup_child(t.get(), dev->bars->ino, "bar0", &bar0),
-                  0)
-            << "i=" << i;
-        ASSERT_NE(bar0, nullptr);
+        ASSERT_TRUE(t.restore(dev, DeviceFunction::Bars)) << "i=" << i;
+        Node *bar0 = nullptr;
+        ASSERT_EQ(t.get().lookupChild(dev->bars->ino, "bar0", &bar0), 0) << "i=" << i;
+        ASSERT_NE(bar0, nullptr) << "i=" << i;
 
         uint32_t v = 0x1000u + (uint32_t) i, r = 0;
-        ASSERT_EQ(emu_node_pwrite(t.get(), bar0->ino,
-                                  reinterpret_cast<const char *>(&v), 4, 0x10),
+        ASSERT_EQ(t.get().pwrite(bar0->ino,
+                                 reinterpret_cast<const char *>(&v), 4, 0x10),
                   4)
             << "i=" << i;
-        ASSERT_EQ(emu_node_pread(t.get(), bar0->ino,
-                                 reinterpret_cast<char *>(&r), 4, 0x10),
+        ASSERT_EQ(t.get().pread(bar0->ino,
+                                reinterpret_cast<char *>(&r), 4, 0x10),
                   4)
             << "i=" << i;
         EXPECT_EQ(r, v) << "i=" << i;
     }
 }
 
-// Restore must not double-attach the qdma ops: emu_node_set_ops rejects a second
-// ops install on the same node, so a stray double-rebuild would surface as a
-// failed re-attach.  Drive restore twice (second is a no-op) and confirm one
-// usable qdma dir with no extra children.
+// Restore must not double-attach the qdma ops: a stray double-rebuild would
+// surface as a duplicate "qdma" child node under <BDF>/.  Drive restore twice
+// (second is a no-op) and confirm exactly one usable qdma dir.
 TEST(RescanAdvLifecycle, DoubleRestoreSecondIsNoopNoDoubleAttach)
 {
     AdvTree t;
-    emu_device *dev = t.add_device("0000:61:00");
-    t.remove(dev, EMU_DEVICE_FUNCTION_QDMA);
+    Device *dev = t.addDevice("0000:61:00");
+    t.remove("0000:61:00", DeviceFunction::Qdma);
 
-    ASSERT_TRUE(t.restore(dev, EMU_DEVICE_FUNCTION_QDMA));
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma));
     // Second restore: function already live -> rebuilt=false, no re-attach.
     bool rebuilt = true;
-    ASSERT_EQ(emu_device_restore_function(t.get(), "0000:61:00",
-                                          EMU_DEVICE_FUNCTION_QDMA, &rebuilt),
+    ASSERT_EQ(t.get().restoreFunction("0000:61:00", DeviceFunction::Qdma,
+                                      &rebuilt),
               0);
-    EXPECT_FALSE(rebuilt);
+    EXPECT_FALSE(rebuilt) << "second restore must be a no-op";
 
-    // Exactly one qdma dir under <BDF>/ (no duplicate).
-    emu_node *dir = dev->dir;
+    // Exactly one qdma dir under <BDF>/ (no duplicate): count the live children
+    // of <BDF>/ named "qdma".
     int qdma_dirs = 0;
-    for (size_t i = 0; i < dir->children.len; i++) {
-        emu_node *ch = dir->children.d[i];
-        if (!ch->unlinked && ch->live && std::strcmp(ch->name, "qdma") == 0) {
+    for (Node *ch : dev->dir->children) {
+        if (!ch->unlinked && ch->live && ch->name == "qdma") {
             qdma_dirs++;
         }
     }
     EXPECT_EQ(qdma_dirs, 1) << "double restore must not create a second qdma dir";
 
-    // Still usable: two QPAIR_ADDs allocate two distinct qids (the rebuilt store's
-    // id allocator works and was not clobbered by the no-op second restore).
+    // Still usable: two QPAIR_ADDs allocate two distinct qids (the rebuilt
+    // store's id allocator works and was not clobbered by the no-op second restore).
     uint32_t q1 = add_qpair(t.get(), dev);
     uint32_t q2 = add_qpair(t.get(), dev);
-    EXPECT_NE(q1, q2);
+    EXPECT_NE(q1, q2) << "distinct qids prove the store was not clobbered";
 }
 
 // ===========================================================================
@@ -568,7 +599,6 @@ std::string make_scratch(const char *suffix)
     return r ? std::string(r) : std::string();
 }
 
-// Write a config with the given body; returns the path.
 std::string write_config_body(const char *body)
 {
     ::mkdir(SLASH_EMU_TMP_DIR, 0755);
@@ -666,8 +696,7 @@ std::vector<uint8_t> read_file(const char *path)
 std::vector<uint8_t> ci_vbin()
 {
     std::vector<uint8_t> out;
-    tar_append_member(out, "vpp_sim", read_file(SLASH_EMU_STUB_MODEL_PATH),
-                      0755);
+    tar_append_member(out, "vpp_sim", read_file(SLASH_EMU_STUB_MODEL_PATH), 0755);
     out.resize(out.size() + 1024, 0);
     return out;
 }
@@ -781,7 +810,7 @@ void with_daemon(const char *cfg_body, Body body)
 
 const char *kSingleCfg = "[accelerator:0000:61:00]\nnet-ip = 10.0.0.1\n";
 
-// HAMMER 2/3 (the real-daemon re-arm): both removed -> model down -> RESCAN
+// HAMMER: the real-daemon re-arm: both removed -> model down -> RESCAN
 // restores both model-less -> reconfig spawns a model -> remove both AGAIN and
 // the model is torn down a SECOND time THROUGH THE UN-RE-INSTALLED SEAM (the
 // daemon never re-installs model_shutdown; this proves the surviving-seam path).
@@ -825,11 +854,11 @@ TEST(RescanAdvMount, DoubleTeardownThroughSurvivingSeam)
     });
 }
 
-// HAMMER 2: restore-from-both-removed must read the MODEL, not a stale/empty
-// shadow.  Bring a model up, write a known BAR value THROUGH it, remove both
-// (model down, shadow whatever), RESCAN (model-less), reconfig (fresh model =
-// fresh stub state), then confirm a NEW value round-trips through the fresh model
-// (rc path is the model, proven by a model-only register surviving a re-read).
+// Restore-from-both-removed must read the MODEL, not a stale/empty shadow.
+// Bring a model up, write a known BAR value THROUGH it, remove both (model
+// down), RESCAN (model-less), reconfig (fresh model = fresh stub state), then
+// confirm a NEW value round-trips through the fresh model (rc path is the model,
+// proven by a model-only register surviving a re-read).
 TEST(RescanAdvMount, RestoreReadsFreshModelNotStaleShadow)
 {
     with_daemon(kSingleCfg, [](const std::string &mnt, const std::string &scratch) {
@@ -891,9 +920,9 @@ TEST(RescanAdvMount, RestoreReadsFreshModelNotStaleShadow)
     });
 }
 
-// HAMMER 6: select_new UNCHANGED.  A config that also names a SECOND accelerator
-// whose BDF is NOT present (no such device materialized) must never cause RESCAN
-// to fabricate it -- rediscovery only restores removed FUNCTIONS of LIVE devices.
+// select_new is UNCHANGED.  A config that also names a SECOND accelerator whose
+// BDF is NOT present (no such device materialized) must never cause RESCAN to
+// fabricate it -- rediscovery only restores removed FUNCTIONS of LIVE devices.
 // The live device's removed function still rediscovers; the absent configured BDF
 // stays absent (the config-driven select_new pass would add it only if available,
 // which in this emulator it is not -- a configured BDF without a device).
@@ -935,9 +964,9 @@ TEST(RescanAdvMount, SelectNewUnchangedAbsentConfiguredBdfNeverFabricated)
     });
 }
 
-// HAMMER 1: a RESCAN with nothing removed run TWICE must not double-attach (no
-// duplicate children) and the device must stay usable -- the additive pass over a
-// live device with no removed functions is a strict no-op.
+// A RESCAN with nothing removed run TWICE must not double-attach (no duplicate
+// children) and the device must stay usable -- the additive pass over a live
+// device with no removed functions is a strict no-op.
 TEST(RescanAdvMount, RescanTwiceNothingRemovedNoDupStaysUsable)
 {
     with_daemon(kSingleCfg, [](const std::string &mnt, const std::string &scratch) {
@@ -948,6 +977,7 @@ TEST(RescanAdvMount, RescanTwiceNothingRemovedNoDupStaysUsable)
         EXPECT_EQ(count_entries(scratch), 0) << "no-op RESCAN must not spawn";
 
         // Exactly one qdma + one bars under <BDF>/ (no duplicates).
+        // info, bars, qdma = 3 entries.
         EXPECT_EQ(count_entries(dev), 3) << "info + bars + qdma, no dup";
         EXPECT_TRUE(path_exists(dev + "/qdma"));
         EXPECT_TRUE(path_exists(dev + "/bars"));

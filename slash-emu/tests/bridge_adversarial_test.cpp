@@ -66,6 +66,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -81,12 +83,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-extern "C" {
-#include "model_client.h"
-#include "qdma.h"
+#include "model_client.hpp"
+#include "qdma.hpp"
+#include "vbin.hpp"
+
 #include "slash/uapi/slash_abi.h"
-#include "vbin.h"
-}
+
+using namespace slash::emu;
 
 namespace {
 
@@ -259,6 +262,12 @@ std::vector<uint8_t> read_stub_binary()
     return data;
 }
 
+// Span helper: wrap a uint8_t vector as const std::byte span.
+static std::span<const std::byte> asSpan(const std::vector<uint8_t> &v)
+{
+    return {reinterpret_cast<const std::byte *>(v.data()), v.size()};
+}
+
 // Spawn the stub bound to `endpoint` with extra env (key=value).
 pid_t spawn_stub(const std::string &endpoint,
                  const std::vector<std::string> &extra_env = {})
@@ -315,10 +324,8 @@ protected:
 TEST_F(VbinSafety, AbsolutePathMemberRejected)
 {
     auto tar = make_tar_entry("/etc/slash_pwn", '0', {'x'}, 0644);
-    char exec[4096];
-    EXPECT_EQ(emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                       sizeof(exec)),
-              -EINVAL);
+    std::string execPath;
+    EXPECT_EQ(vbinUnpackFindSim(asSpan(tar), dir, execPath), -EINVAL);
     // Nothing escaped to the absolute path (we obviously can't write /etc here,
     // but assert the parser refused rather than even trying).
     struct stat st {};
@@ -328,10 +335,8 @@ TEST_F(VbinSafety, AbsolutePathMemberRejected)
 TEST_F(VbinSafety, DotDotTraversalRejected)
 {
     auto tar = make_tar_entry("../../escape", '0', {'x'}, 0644);
-    char exec[4096];
-    EXPECT_EQ(emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                       sizeof(exec)),
-              -EINVAL);
+    std::string execPath;
+    EXPECT_EQ(vbinUnpackFindSim(asSpan(tar), dir, execPath), -EINVAL);
     // The parent of dir must not have gained an "escape" file.
     std::string parent = dir.substr(0, dir.find_last_of('/'));
     struct stat st {};
@@ -343,10 +348,8 @@ TEST_F(VbinSafety, DotDotTraversalRejected)
 TEST_F(VbinSafety, DotDotInMiddleRejected)
 {
     auto tar = make_tar_entry("sub/../../escape", '0', {'x'}, 0644);
-    char exec[4096];
-    EXPECT_EQ(emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                       sizeof(exec)),
-              -EINVAL);
+    std::string execPath;
+    EXPECT_EQ(vbinUnpackFindSim(asSpan(tar), dir, execPath), -EINVAL);
 }
 
 TEST_F(VbinSafety, LongnameTraversalRejected)
@@ -354,10 +357,8 @@ TEST_F(VbinSafety, LongnameTraversalRejected)
     // Smuggle a "../" traversal via a GNU long-name record.
     std::string evil = "../../../../tmp/slash_longname_pwn";
     auto tar = make_longname_tar(evil, '0', {'x'});
-    char exec[4096];
-    EXPECT_EQ(emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                       sizeof(exec)),
-              -EINVAL);
+    std::string execPath;
+    EXPECT_EQ(vbinUnpackFindSim(asSpan(tar), dir, execPath), -EINVAL);
     struct stat st {};
     EXPECT_NE(::stat("/tmp/slash_longname_pwn", &st), 0);
 }
@@ -369,9 +370,8 @@ TEST_F(VbinSafety, SymlinkEntryDoesNotEscape)
     // parser must NOT create the symlink (it ignores non-reg/dir typeflags), so
     // no dangling link and no escape; and since there's no real vpp_sim, -ENOENT.
     auto tar = make_tar_entry("link", '2', {}, 0777, "/etc");
-    char exec[4096];
-    int rc = emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                      sizeof(exec));
+    std::string execPath;
+    int rc = vbinUnpackFindSim(asSpan(tar), dir, execPath);
     EXPECT_EQ(rc, -ENOENT) << "expected no vpp_sim; symlink must be ignored";
     // The symlink must NOT have been materialised in dir.
     struct stat st {};
@@ -382,10 +382,8 @@ TEST_F(VbinSafety, SymlinkEntryDoesNotEscape)
 TEST_F(VbinSafety, HardlinkEntryIgnored)
 {
     auto tar = make_tar_entry("hard", '1', {}, 0644, "/etc/passwd");
-    char exec[4096];
-    EXPECT_EQ(emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                       sizeof(exec)),
-              -ENOENT);
+    std::string execPath;
+    EXPECT_EQ(vbinUnpackFindSim(asSpan(tar), dir, execPath), -ENOENT);
     struct stat st {};
     EXPECT_NE(::lstat((dir + "/hard").c_str(), &st), 0);
 }
@@ -394,10 +392,8 @@ TEST_F(VbinSafety, CharDeviceEntryIgnored)
 {
     // Char-device entry (typeflag '3'): must not be mknod'd.
     auto tar = make_tar_entry("dev", '3', {}, 0644);
-    char exec[4096];
-    EXPECT_EQ(emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                       sizeof(exec)),
-              -ENOENT);
+    std::string execPath;
+    EXPECT_EQ(vbinUnpackFindSim(asSpan(tar), dir, execPath), -ENOENT);
     struct stat st {};
     EXPECT_NE(::lstat((dir + "/dev").c_str(), &st), 0);
 }
@@ -408,19 +404,15 @@ TEST_F(VbinSafety, TruncatedArchiveRejected)
     auto tar = make_tar_entry("vpp_sim", '0',
                               std::vector<uint8_t>(4096, 'A'), 0755);
     tar.resize(512); // chop off the data blocks -> size field outruns the buffer
-    char exec[4096];
-    EXPECT_EQ(emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                       sizeof(exec)),
-              -EINVAL);
+    std::string execPath;
+    EXPECT_EQ(vbinUnpackFindSim(asSpan(tar), dir, execPath), -EINVAL);
 }
 
 TEST_F(VbinSafety, NonBlockAlignedRejected)
 {
     std::vector<uint8_t> junk(513, 0xAB); // not a multiple of 512
-    char exec[4096];
-    EXPECT_EQ(emu_vbin_unpack_find_sim(junk.data(), junk.size(), dir.c_str(),
-                                       exec, sizeof(exec)),
-              -EINVAL);
+    std::string execPath;
+    EXPECT_EQ(vbinUnpackFindSim(asSpan(junk), dir, execPath), -EINVAL);
 }
 
 TEST_F(VbinSafety, BadOctalSizeRejected)
@@ -428,20 +420,16 @@ TEST_F(VbinSafety, BadOctalSizeRejected)
     auto tar = make_tar_entry("vpp_sim", '0', {'x'}, 0755);
     // Corrupt the size field with a non-octal digit.
     std::memcpy(tar.data() + 124, "99999999", 8);
-    char exec[4096];
-    EXPECT_EQ(emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                       sizeof(exec)),
-              -EINVAL);
+    std::string execPath;
+    EXPECT_EQ(vbinUnpackFindSim(asSpan(tar), dir, execPath), -EINVAL);
 }
 
 TEST_F(VbinSafety, ZeroSizeVppSimRejectedNotExecutable)
 {
     // A zero-byte vpp_sim with no exec bit: located but not runnable -> -EACCES.
     auto tar = make_tar_entry("vpp_sim", '0', {}, 0644);
-    char exec[4096];
-    EXPECT_EQ(emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                       sizeof(exec)),
-              -EACCES);
+    std::string execPath;
+    EXPECT_EQ(vbinUnpackFindSim(asSpan(tar), dir, execPath), -EACCES);
 }
 
 TEST_F(VbinSafety, NameLengthBoundaryHandled)
@@ -450,9 +438,8 @@ TEST_F(VbinSafety, NameLengthBoundaryHandled)
     // without overrun -- it's a single deep component, no vpp_sim -> -ENOENT.
     std::string name(100, 'a');
     auto tar = make_tar_entry(name, '0', {'x'}, 0644);
-    char exec[4096];
-    int rc = emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                      sizeof(exec));
+    std::string execPath;
+    int rc = vbinUnpackFindSim(asSpan(tar), dir, execPath);
     EXPECT_EQ(rc, -ENOENT);
 }
 
@@ -464,27 +451,26 @@ TEST_F(VbinSafety, DuplicateVppSimLocatesOne)
     auto a = make_tar_entry("a/vpp_sim", '0', stub, 0755, "", false);
     auto b = make_tar_entry("b/vpp_sim", '0', stub, 0755, "", true);
     a.insert(a.end(), b.begin(), b.end());
-    char exec[4096];
-    ASSERT_EQ(emu_vbin_unpack_find_sim(a.data(), a.size(), dir.c_str(), exec,
-                                       sizeof(exec)),
-              0);
-    EXPECT_EQ(::access(exec, X_OK), 0);
+    std::string execPath;
+    ASSERT_EQ(vbinUnpackFindSim(asSpan(a), dir, execPath), 0);
+    EXPECT_EQ(::access(execPath.c_str(), X_OK), 0);
 }
 
-TEST_F(VbinSafety, ExecOutBufferTooSmall)
+TEST_F(VbinSafety, DeepNestedPathReturnsFullPath)
 {
-    // A located vpp_sim whose path does not fit the caller's exec buffer must
-    // yield -ENAMETOOLONG, not a buffer overrun.
+    // In the C++ API, vbinUnpackFindSim writes the path into a std::string with
+    // no fixed-size limit -- verify a deeply nested sim is located correctly.
     auto stub = read_stub_binary();
     auto tar = make_tar_entry("deep/nested/vpp_sim", '0', stub, 0755);
-    char exec[8]; // far too small
-    int rc = emu_vbin_unpack_find_sim(tar.data(), tar.size(), dir.c_str(), exec,
-                                      sizeof(exec));
-    EXPECT_EQ(rc, -ENAMETOOLONG);
+    std::string execPath;
+    int rc = vbinUnpackFindSim(asSpan(tar), dir, execPath);
+    ASSERT_EQ(rc, 0);
+    EXPECT_FALSE(execPath.empty());
+    EXPECT_EQ(::access(execPath.c_str(), X_OK), 0);
 }
 
 // ===========================================================================
-// (2) emu_vbin_classify: NO false-COMPLETE.  The classifier MUST skip member
+// (2) vbinClassify: NO false-COMPLETE.  The classifier MUST skip member
 // CONTENT by the header size (not scan it for zero blocks), and only report
 // COMPLETE at a true zero block sitting at a 512-aligned header position.  These
 // are the load-bearing checks for chunk reassembly safety.
@@ -508,17 +494,19 @@ TEST(VbinClassify, ZeroContentMemberNotMistakenForTerminator)
     // Up to and through the all-zero content, the archive is NOT complete (the
     // content blocks belong to the member, skipped via the header size).
     // header(512) + 4 zero blocks = 2560 bytes, still mid-archive (no terminator).
-    EXPECT_EQ(emu_vbin_classify(tar.data(), tar.size()), EMU_VBIN_INCOMPLETE)
+    EXPECT_EQ(vbinClassify(asSpan(tar)), VbinStatus::Incomplete)
         << "zero-content member mis-detected as terminator (false COMPLETE)";
 
     // Now append the real terminator: classify must finally report COMPLETE, and
     // crucially at the TRUE end, not at the first content zero block.
     tar.resize(tar.size() + 1024, 0); // two zero trailer blocks
-    EXPECT_EQ(emu_vbin_classify(tar.data(), tar.size()), EMU_VBIN_COMPLETE);
+    EXPECT_EQ(vbinClassify(asSpan(tar)), VbinStatus::Complete);
 
     // And a prefix that ends exactly at the first content zero block is still
     // INCOMPLETE (we are inside the member, by size).
-    EXPECT_EQ(emu_vbin_classify(tar.data(), 512 + 512), EMU_VBIN_INCOMPLETE)
+    auto sp = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(tar.data()), 512 + 512);
+    EXPECT_EQ(vbinClassify(sp), VbinStatus::Incomplete)
         << "first content zero block falsely treated as terminator";
 }
 
@@ -531,9 +519,9 @@ TEST(VbinClassify, ZeroContentMemberFollowedByMoreMembers)
     auto b = make_tar_entry("vpp_sim", '0', {'x', 'y', 'z'}, 0755, "", false);
     a.insert(a.end(), b.begin(), b.end());
     // Before the terminator: INCOMPLETE (must keep accumulating past the zeros).
-    EXPECT_EQ(emu_vbin_classify(a.data(), a.size()), EMU_VBIN_INCOMPLETE);
+    EXPECT_EQ(vbinClassify(asSpan(a)), VbinStatus::Incomplete);
     a.resize(a.size() + 1024, 0);
-    EXPECT_EQ(emu_vbin_classify(a.data(), a.size()), EMU_VBIN_COMPLETE);
+    EXPECT_EQ(vbinClassify(asSpan(a)), VbinStatus::Complete);
 }
 
 TEST(VbinClassify, TerminatorExactlyOnChunkBoundary)
@@ -548,17 +536,21 @@ TEST(VbinClassify, TerminatorExactlyOnChunkBoundary)
     tar.resize(end_of_member + 1024, 0); // two zero terminator blocks
 
     // Exactly at the member end (no terminator yet): INCOMPLETE.
-    EXPECT_EQ(emu_vbin_classify(tar.data(), end_of_member), EMU_VBIN_INCOMPLETE);
+    auto spMember = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(tar.data()), end_of_member);
+    EXPECT_EQ(vbinClassify(spMember), VbinStatus::Incomplete);
     // Including exactly the first terminator block (chunk boundary == 512-aligned
     // terminator): COMPLETE.
-    EXPECT_EQ(emu_vbin_classify(tar.data(), end_of_member + 512),
-              EMU_VBIN_COMPLETE);
+    auto spFirst = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(tar.data()), end_of_member + 512);
+    EXPECT_EQ(vbinClassify(spFirst), VbinStatus::Complete);
     // One byte short of the terminator block: INCOMPLETE (need the whole block).
-    EXPECT_EQ(emu_vbin_classify(tar.data(), end_of_member + 511),
-              EMU_VBIN_INCOMPLETE);
+    auto spShort = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(tar.data()), end_of_member + 511);
+    EXPECT_EQ(vbinClassify(spShort), VbinStatus::Incomplete);
 }
 
-// classify and emu_vbin_unpack_find_sim must AGREE on a non-512-aligned tail.
+// classify and vbinUnpackFindSim must AGREE on a non-512-aligned tail.
 // A complete archive (member + terminator block) with a few stray trailing bytes
 // is not a clean block-aligned tar: unpack rejects it with -EINVAL, so classify
 // must NOT report COMPLETE for it (else the bridge would hand a doomed buffer to
@@ -572,28 +564,26 @@ TEST(VbinClassify, NonAlignedTailNotCompleteAgreesWithUnpack)
                                "", /*trailer=*/false);
     base.resize(base.size() + 512, 0);  // single zero terminator block
     ASSERT_EQ(base.size() % 512u, 0u);
-    EXPECT_EQ(emu_vbin_classify(base.data(), base.size()), EMU_VBIN_COMPLETE);
+    EXPECT_EQ(vbinClassify(asSpan(base)), VbinStatus::Complete);
 
     // Now append a non-512-aligned tail of stray bytes.  classify must report
     // INCOMPLETE (not COMPLETE), matching unpack's -EINVAL on the same buffer.
     auto tail = base;
     tail.insert(tail.end(), {0x01, 0x02, 0x03});  // 3 stray bytes
     ASSERT_NE(tail.size() % 512u, 0u);
-    EXPECT_EQ(emu_vbin_classify(tail.data(), tail.size()), EMU_VBIN_INCOMPLETE)
+    EXPECT_EQ(vbinClassify(asSpan(tail)), VbinStatus::Incomplete)
         << "non-512-aligned tail must not be reported COMPLETE";
 
     std::string dir = make_scratch_dir("vbin_align");
-    char exec[4096];
-    EXPECT_EQ(emu_vbin_unpack_find_sim(tail.data(), tail.size(), dir.c_str(),
-                                       exec, sizeof(exec)),
-              -EINVAL)
+    std::string execPath;
+    EXPECT_EQ(vbinUnpackFindSim(asSpan(tail), dir, execPath), -EINVAL)
         << "unpack must reject the same non-aligned buffer (the divergence)";
     rm_rf(dir);
 
     // Rounding the tail back up to a block boundary makes both agree again.
     tail.resize(((tail.size() + 511) / 512) * 512, 0);
     ASSERT_EQ(tail.size() % 512u, 0u);
-    EXPECT_EQ(emu_vbin_classify(tail.data(), tail.size()), EMU_VBIN_COMPLETE);
+    EXPECT_EQ(vbinClassify(asSpan(tail)), VbinStatus::Complete);
 }
 
 TEST(VbinClassify, ChunkEndingMidHeaderIsIncompleteThenCompletes)
@@ -602,12 +592,16 @@ TEST(VbinClassify, ChunkEndingMidHeaderIsIncompleteThenCompletes)
     // INCOMPLETE (cannot decide without the whole header), and once the rest
     // arrives it completes.
     auto tar = make_tar_entry("vpp_sim", '0', {'q'}, 0755, "", true);
+    auto sp200 = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(tar.data()), 200);
     // Mid-first-header (offset 200 of the 512-byte header): INCOMPLETE.
-    EXPECT_EQ(emu_vbin_classify(tar.data(), 200), EMU_VBIN_INCOMPLETE);
+    EXPECT_EQ(vbinClassify(sp200), VbinStatus::Incomplete);
     // Mid-second (data) region: INCOMPLETE.
-    EXPECT_EQ(emu_vbin_classify(tar.data(), 512 + 1), EMU_VBIN_INCOMPLETE);
+    auto sp513 = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(tar.data()), 512 + 1);
+    EXPECT_EQ(vbinClassify(sp513), VbinStatus::Incomplete);
     // Whole archive: COMPLETE.
-    EXPECT_EQ(emu_vbin_classify(tar.data(), tar.size()), EMU_VBIN_COMPLETE);
+    EXPECT_EQ(vbinClassify(asSpan(tar)), VbinStatus::Complete);
 }
 
 TEST(VbinClassify, HostileHugeSizeFieldIsInvalidNotOverflow)
@@ -625,8 +619,8 @@ TEST(VbinClassify, HostileHugeSizeFieldIsInvalidNotOverflow)
     std::snprintf((char *) (tar.data() + 148), 8, "%06o", sum);
     tar[154] = '\0';
     tar[155] = ' ';
-    enum emu_vbin_status st = emu_vbin_classify(tar.data(), tar.size());
-    EXPECT_TRUE(st == EMU_VBIN_INCOMPLETE || st == EMU_VBIN_INVALID)
+    VbinStatus st = vbinClassify(asSpan(tar));
+    EXPECT_TRUE(st == VbinStatus::Incomplete || st == VbinStatus::Invalid)
         << "hostile huge size field produced a false terminal status";
 }
 
@@ -639,7 +633,7 @@ protected:
     std::string dir;
     std::string endpoint;
     pid_t pid = -1;
-    emu_model_client *client = nullptr;
+    std::unique_ptr<ModelClient> client;
     void SetUp() override
     {
         dir = make_scratch_dir("cli");
@@ -647,9 +641,7 @@ protected:
     }
     void TearDown() override
     {
-        if (client != nullptr) {
-            emu_model_client_close(client);
-        }
+        client.reset(); /* RAII: closes the socket */
         reap(pid);
         rm_rf(dir);
     }
@@ -660,14 +652,14 @@ TEST_F(ClientHostile, GarbageReplyIsEprotoNotUb)
     Watchdog wd(20);
     pid = spawn_stub(endpoint, {"SLASH_EMU_STUB_GARBAGE=1"});
     ASSERT_GT(pid, 0);
-    ASSERT_EQ(emu_model_client_connect(endpoint.c_str(), 1000, &client), 0);
-    ASSERT_EQ(emu_model_client_start(client), 0); // start still replies OK
+    ASSERT_EQ(ModelClient::connect(endpoint, 1000, client), 0);
+    ASSERT_EQ(client->start(), 0); // start still replies OK
 
     // A scalar fetch gets ~300 bytes of 'Z': the bare-uint parser must reject it.
     uint32_t v = 0;
-    EXPECT_EQ(emu_model_scalar_read(client, 0x10, &v), -EPROTO);
+    EXPECT_EQ(client->scalarRead(0x10, v), -EPROTO);
     // Latched dead: a subsequent call fails fast, no desync reuse.
-    EXPECT_EQ(emu_model_scalar_read(client, 0x10, &v), -ENODEV);
+    EXPECT_EQ(client->scalarRead(0x10, v), -ENODEV);
 }
 
 TEST_F(ClientHostile, GarbageBufferReplyIsEprotoNotUb)
@@ -675,12 +667,13 @@ TEST_F(ClientHostile, GarbageBufferReplyIsEprotoNotUb)
     Watchdog wd(20);
     pid = spawn_stub(endpoint, {"SLASH_EMU_STUB_GARBAGE=1"});
     ASSERT_GT(pid, 0);
-    ASSERT_EQ(emu_model_client_connect(endpoint.c_str(), 1000, &client), 0);
-    ASSERT_EQ(emu_model_client_start(client), 0);
+    ASSERT_EQ(ModelClient::connect(endpoint, 1000, client), 0);
+    ASSERT_EQ(client->start(), 0);
 
-    uint8_t buf[64];
-    EXPECT_EQ(emu_model_fetch(client, 0x40, buf, sizeof(buf)), -EPROTO);
-    EXPECT_EQ(emu_model_fetch(client, 0x40, buf, sizeof(buf)), -ENODEV);
+    std::vector<std::byte> buf(64);
+    auto sp = std::span<std::byte>(buf);
+    EXPECT_EQ(client->fetch(0x40, sp), -EPROTO);
+    EXPECT_EQ(client->fetch(0x40, sp), -ENODEV);
 }
 
 TEST_F(ClientHostile, ModelDiesBetweenRequestAndReplyLatchesDead)
@@ -691,15 +684,15 @@ TEST_F(ClientHostile, ModelDiesBetweenRequestAndReplyLatchesDead)
     // and refuse to reuse the half-consumed socket.
     pid = spawn_stub(endpoint, {"SLASH_EMU_STUB_EXIT_AFTER_START=1"});
     ASSERT_GT(pid, 0);
-    ASSERT_EQ(emu_model_client_connect(endpoint.c_str(), 500, &client), 0);
-    ASSERT_EQ(emu_model_client_start(client), 0);
+    ASSERT_EQ(ModelClient::connect(endpoint, 500, client), 0);
+    ASSERT_EQ(client->start(), 0);
 
     uint32_t v = 0;
-    int rc = emu_model_scalar_read(client, 0x10, &v);
+    int rc = client->scalarRead(0x10, v);
     EXPECT_LT(rc, 0); // timeout/transport failure, NOT a hang
     // Subsequent calls fail fast (-ENODEV), never block or desync-reuse.
-    EXPECT_EQ(emu_model_reg_write(client, 0x10, 1), -ENODEV);
-    EXPECT_EQ(emu_model_scalar_read(client, 0x10, &v), -ENODEV);
+    EXPECT_EQ(client->regWrite(0x10, 1), -ENODEV);
+    EXPECT_EQ(client->scalarRead(0x10, v), -ENODEV);
 }
 
 TEST_F(ClientHostile, ModelCrashesAfterConnectNoHang)
@@ -707,13 +700,13 @@ TEST_F(ClientHostile, ModelCrashesAfterConnectNoHang)
     Watchdog wd(20);
     pid = spawn_stub(endpoint, {"SLASH_EMU_STUB_CRASH_AFTER_START=1"});
     ASSERT_GT(pid, 0);
-    ASSERT_EQ(emu_model_client_connect(endpoint.c_str(), 500, &client), 0);
-    ASSERT_EQ(emu_model_client_start(client), 0);
+    ASSERT_EQ(ModelClient::connect(endpoint, 500, client), 0);
+    ASSERT_EQ(client->start(), 0);
 
     uint32_t v = 0;
-    int rc = emu_model_scalar_read(client, 0x10, &v);
+    int rc = client->scalarRead(0x10, v);
     EXPECT_LT(rc, 0);
-    EXPECT_EQ(emu_model_scalar_read(client, 0x10, &v), -ENODEV);
+    EXPECT_EQ(client->scalarRead(0x10, v), -ENODEV);
 
     // The crashed child is reaped here (TearDown); confirm it died by signal.
     int status = 0;
@@ -730,13 +723,12 @@ TEST_F(ClientHostile, PopulateAfterDeadFailsFast)
     Watchdog wd(20);
     pid = spawn_stub(endpoint, {"SLASH_EMU_STUB_HANG=1"});
     ASSERT_GT(pid, 0);
-    ASSERT_EQ(emu_model_client_connect(endpoint.c_str(), 300, &client), 0);
+    ASSERT_EQ(ModelClient::connect(endpoint, 300, client), 0);
     // start hangs -> times out -> dead.
-    EXPECT_EQ(emu_model_client_start(client), -ETIMEDOUT);
-    std::vector<uint8_t> payload(128, 0xAB);
-    EXPECT_EQ(emu_model_populate(client, 0x40'0000'0000ULL, payload.data(),
-                                 payload.size()),
-              -ENODEV);
+    EXPECT_EQ(client->start(), -ETIMEDOUT);
+    std::vector<std::byte> payload(128, std::byte{0xAB});
+    auto sp = std::span<const std::byte>(payload);
+    EXPECT_EQ(client->populate(0x40'0000'0000ULL, sp), -ENODEV);
 }
 
 // ===========================================================================
@@ -1296,9 +1288,9 @@ TEST(BridgeReconfigAdversarial, AbandonedPartialBufferFreedOnShutdown)
     EXPECT_EQ(daemon_children(h.pid), 0);
 
     ::close(qfd);
-    // Tear down WITHOUT completing the transfer: emu_bridge_free_one must free
-    // b->acc (ASan would flag a leak otherwise).  scratch stays empty (no run dir
-    // was ever created for an incomplete transfer).
+    // Tear down WITHOUT completing the transfer: the bridge's destructor must free
+    // the acc vector (ASan would flag a leak otherwise).  scratch stays empty (no
+    // run dir was ever created for an incomplete transfer).
     stop_daemon(h);
 }
 

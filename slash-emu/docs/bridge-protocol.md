@@ -13,8 +13,10 @@ under the privileged daemon (the hardened systemd transient unit is step 5).
 
 ## 1. Transport
 
-* **Library:** ZeroMQ 4.3.5, the C API (`zmq.h`) — the daemon is C11.  The model
-  side may be C or C++; the CI stub is C using the same C API.
+* **Library:** ZeroMQ 4.3.5.  The daemon is C++20 and uses the header-only
+  **cppzmq** API (`zmq.hpp`) on the client side; JSON is built/parsed with
+  **JsonCpp**.  The model side may be C or C++; the CI stub (`stub_model.cpp`)
+  is C++ using cppzmq + JsonCpp, and the wire bytes are identical either way.
 * **Pattern:** `ZMQ_REQ` (daemon, client) ↔ `ZMQ_REP` (model, server).  Strict
   lock-step: one request, one reply, one in flight.  This matches the real
   `vpp_sim` (`sim.cpp` binds `ZMQ_REP`) and VRT's `ZmqServer` (`ZMQ_REQ`).

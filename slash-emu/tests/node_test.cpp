@@ -20,13 +20,14 @@
 
 /**
  * @file node_test.cpp
- * @brief Unit tests for the slash-emu spine (node.h): the node tree, the
+ * @brief Unit tests for the slash-emu spine (node.hpp): the node tree, the
  *        per-device registry, refcounted resources, and the revocation state
  *        machine.
  *
- * These exercise the pure C data structures directly against slash_emu_core --
- * no FUSE session is needed because node.c never touches one.  The kernel-dentry
- * notifier is replaced by a recording stub so name-invalidation can be asserted.
+ * These exercise the C++ data model directly against slash_emu_core -- no FUSE
+ * session is needed because node.cpp never touches one.  The kernel-dentry
+ * notifier is replaced by a recording lambda so name-invalidation can be
+ * asserted.
  *
  * Coverage:
  *   - Node-tree lookup / readdir over a materialized multi-accelerator tree.
@@ -36,106 +37,101 @@
  *   - The revocation state machine: live -> removed yields ENOENT on lookup,
  *     ENODEV on ops against an already-open handle, idempotent close/teardown,
  *     and name-invalidation invoked.
+ *
+ * Port note (refcount model): the resource object is destroyed when BOTH the
+ * registry @c shared_ptr and the inode @c shared_ptr drop.  The test counts that
+ * "free" via a custom deleter installed on the resource's @c backing shared_ptr
+ * (it fires exactly when the Resource object is destroyed), and counts the
+ * idempotent "teardown" via the @ref slash::emu::ResourceTeardownFn.
  */
 
 #include <gtest/gtest.h>
 
 #include <cerrno>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
-extern "C" {
-#include "node.h"
-}
+#include "node.hpp"
+
+using namespace slash::emu;
 
 namespace {
 
 // ---------------------------------------------------------------------------
-// Recording notifier: captures every notify_delete the spine fires.
+// Recording notifier: captures every notify the spine fires.
 // ---------------------------------------------------------------------------
 struct NotifyRecord {
-    emu_ino_t parent;
-    emu_ino_t child;
+    Ino parent;
+    Ino child;
     std::string name;
 };
 
 std::vector<NotifyRecord> g_notifications;
 
-void recording_notify_delete(void *ctx, emu_ino_t parent, emu_ino_t child,
-                             const char *name)
-{
-    (void) ctx;
-    g_notifications.push_back({parent, child, std::string(name)});
-}
-
-emu_notifier make_recording_notifier()
+Notifier make_recording_notifier()
 {
     g_notifications.clear();
-    emu_notifier n{};
-    n.notify_delete = recording_notify_delete;
-    n.ctx = nullptr;
-    return n;
+    return [](Ino parent, Ino child, const std::string &name) {
+        g_notifications.push_back({parent, child, name});
+    };
 }
 
 // ---------------------------------------------------------------------------
 // Recording resource callbacks: count teardown and free events per resource.
+//
+// teardown is the idempotent ResourceTeardownFn; free is the destruction of the
+// Resource object, observed via a custom deleter on its `backing` shared_ptr.
 // ---------------------------------------------------------------------------
 struct ResourceProbe {
     int teardown_calls = 0;
     int free_calls = 0;
 };
 
-void probe_teardown(struct emu_resource *res, void *backing)
+// Register a resource whose teardown / free both land on `probe`.  Returns the
+// resource (non-owning); the inode/registry shared_ptrs are held by the spine.
+Resource *register_probed(Device *dev, uint32_t id, ResourceProbe *probe)
 {
-    (void) res;
-    static_cast<ResourceProbe *>(backing)->teardown_calls++;
-}
-
-void probe_free(void *backing)
-{
-    static_cast<ResourceProbe *>(backing)->free_calls++;
+    Resource *res = dev->registerResource(
+        id, probe != nullptr ? [probe](Resource &) { probe->teardown_calls++; }
+                             : ResourceTeardownFn{});
+    if (res != nullptr && probe != nullptr) {
+        // The custom deleter fires when the Resource object is destroyed (both
+        // refs dropped) -- our "free" event.  The void payload is unused.
+        res->backing = std::shared_ptr<void>(
+            probe, [](void *p) { static_cast<ResourceProbe *>(p)->free_calls++; });
+    }
+    return res;
 }
 
 // RAII wrapper around a tree so each test cleans up.
 class Tree {
 public:
     explicit Tree(bool with_notifier = false)
+        : tree_(with_notifier ? make_recording_notifier() : Notifier{})
     {
-        emu_notifier n = with_notifier ? make_recording_notifier()
-                                       : emu_notifier{};
-        EXPECT_EQ(emu_node_tree_new(&tree_, &n), 0);
     }
-    ~Tree() { cleanup_node_tree(tree_); }
 
-    emu_node_tree *get() { return tree_; }
+    NodeTree *get() { return &tree_; }
 
 private:
-    emu_node_tree *tree_ = nullptr;
+    NodeTree tree_;
 };
 
 // Collect a directory's child names (excluding "." / "..") via readdir.
-struct NameCollector {
+std::set<std::string> readdir_names(NodeTree *tree, Ino ino)
+{
     std::set<std::string> names;
-};
-
-bool collect_names(void *ctx, const char *name, emu_ino_t ino,
-                   enum emu_node_type type)
-{
-    (void) ino;
-    (void) type;
-    auto *c = static_cast<NameCollector *>(ctx);
-    if (std::string(name) != "." && std::string(name) != "..") {
-        c->names.insert(name);
-    }
-    return true;
-}
-
-std::set<std::string> readdir_names(emu_node_tree *tree, emu_ino_t ino)
-{
-    NameCollector c;
-    EXPECT_EQ(emu_node_readdir(tree, ino, collect_names, &c), 0);
-    return c.names;
+    EXPECT_EQ(tree->readdir(ino,
+                            [&](const std::string &name, Ino, NodeType) {
+                                if (name != "." && name != "..") {
+                                    names.insert(name);
+                                }
+                                return true;
+                            }),
+              0);
+    return names;
 }
 
 }  // namespace
@@ -148,25 +144,24 @@ TEST(NodeTree, RootExistsAndIsEmptyInitially)
 {
     Tree t;
     struct stat st{};
-    ASSERT_EQ(emu_node_stat(t.get(), EMU_ROOT_INO, &st), 0);
+    ASSERT_EQ(t.get()->stat(kRootIno, &st), 0);
     EXPECT_TRUE(S_ISDIR(st.st_mode));
-    EXPECT_TRUE(readdir_names(t.get(), EMU_ROOT_INO).empty());
+    EXPECT_TRUE(readdir_names(t.get(), kRootIno).empty());
 }
 
 TEST(NodeTree, AddDeviceMaterializesBarsAndQdma)
 {
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
+    Device *dev = t.get()->addDevice("0000:61:00");
     ASSERT_NE(dev, nullptr);
 
     // Root now lists the BDF dir.
-    auto root_kids = readdir_names(t.get(), EMU_ROOT_INO);
+    auto root_kids = readdir_names(t.get(), kRootIno);
     EXPECT_EQ(root_kids.count("0000:61:00"), 1u);
 
     // <BDF>/ lists bars and qdma.
     struct stat dir_st{};
-    ASSERT_EQ(emu_node_stat(t.get(), dev->dir->ino, &dir_st), 0);
+    ASSERT_EQ(t.get()->stat(dev->dir->ino, &dir_st), 0);
     EXPECT_TRUE(S_ISDIR(dir_st.st_mode));
 
     auto dev_kids = readdir_names(t.get(), dev->dir->ino);
@@ -178,22 +173,20 @@ TEST(NodeTree, AddDeviceMaterializesBarsAndQdma)
 TEST(NodeTree, AddDeviceIsIdempotentPerBdf)
 {
     Tree t;
-    emu_device *a = nullptr;
-    emu_device *b = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &a), 0);
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &b), 0);
+    Device *a = t.get()->addDevice("0000:61:00");
+    Device *b = t.get()->addDevice("0000:61:00");
     EXPECT_EQ(a, b);
-    EXPECT_EQ(readdir_names(t.get(), EMU_ROOT_INO).size(), 1u);
+    EXPECT_EQ(readdir_names(t.get(), kRootIno).size(), 1u);
 }
 
 TEST(NodeTree, MultipleAcceleratorsCoexist)
 {
     Tree t;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", nullptr), 0);
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:62:00", nullptr), 0);
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:63:00", nullptr), 0);
+    ASSERT_NE(t.get()->addDevice("0000:61:00"), nullptr);
+    ASSERT_NE(t.get()->addDevice("0000:62:00"), nullptr);
+    ASSERT_NE(t.get()->addDevice("0000:63:00"), nullptr);
 
-    auto kids = readdir_names(t.get(), EMU_ROOT_INO);
+    auto kids = readdir_names(t.get(), kRootIno);
     EXPECT_EQ(kids.size(), 3u);
     EXPECT_EQ(kids.count("0000:61:00"), 1u);
     EXPECT_EQ(kids.count("0000:62:00"), 1u);
@@ -203,64 +196,100 @@ TEST(NodeTree, MultipleAcceleratorsCoexist)
 TEST(NodeTree, LookupResolvesChildAndBumpsLookupCount)
 {
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
 
-    emu_node *child = nullptr;
-    ASSERT_EQ(emu_node_lookup_child(t.get(), EMU_ROOT_INO, "0000:61:00", &child),
-              0);
+    Node *child = nullptr;
+    ASSERT_EQ(t.get()->lookupChild(kRootIno, "0000:61:00", &child), 0);
     ASSERT_NE(child, nullptr);
     EXPECT_EQ(child->ino, dev->dir->ino);
 
     // bars under the device.
-    emu_node *bars = nullptr;
-    ASSERT_EQ(emu_node_lookup_child(t.get(), dev->dir->ino, "bars", &bars), 0);
+    Node *bars = nullptr;
+    ASSERT_EQ(t.get()->lookupChild(dev->dir->ino, "bars", &bars), 0);
     EXPECT_EQ(bars->ino, dev->bars->ino);
 }
 
 TEST(NodeTree, LookupMissReturnsEnoent)
 {
     Tree t;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", nullptr), 0);
-    emu_node *child = nullptr;
-    EXPECT_EQ(emu_node_lookup_child(t.get(), EMU_ROOT_INO, "nope", &child),
-              -ENOENT);
+    ASSERT_NE(t.get()->addDevice("0000:61:00"), nullptr);
+    Node *child = nullptr;
+    EXPECT_EQ(t.get()->lookupChild(kRootIno, "nope", &child), -ENOENT);
 }
 
 TEST(NodeTree, LookupUnderFileReturnsEnotdir)
 {
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
 
     // Attach a file under <BDF>/ and try to look up inside it.
-    emu_node *file = nullptr;
-    ASSERT_EQ(emu_node_create_child(t.get(), dev->dir, "info", EMU_NODE_FILE,
-                                    0444, nullptr, nullptr, &file),
-              0);
-    emu_node *child = nullptr;
-    EXPECT_EQ(emu_node_lookup_child(t.get(), file->ino, "x", &child), -ENOTDIR);
+    Node *file = t.get()->createChild(dev->dir, "info", NodeType::File, 0444);
+    ASSERT_NE(file, nullptr);
+    Node *child = nullptr;
+    EXPECT_EQ(t.get()->lookupChild(file->ino, "x", &child), -ENOTDIR);
 }
 
 TEST(NodeTree, CreateChildFileReportsSize)
 {
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
 
-    static const emu_node_ops kOps = {
-        /* size */ [](const emu_node *, void *) -> off_t { return 4242; },
-        /* destroy */ nullptr,
+    class SizeOps : public NodeOps {
+    public:
+        off_t size(const Node &) const override { return 4242; }
     };
-    emu_node *file = nullptr;
-    ASSERT_EQ(emu_node_create_child(t.get(), dev->dir, "info", EMU_NODE_FILE,
-                                    0444, &kOps, nullptr, &file),
-              0);
+    Node *file = t.get()->createChild(dev->dir, "info", NodeType::File, 0444,
+                                      std::make_unique<SizeOps>());
+    ASSERT_NE(file, nullptr);
 
     struct stat st{};
-    ASSERT_EQ(emu_node_stat(t.get(), file->ino, &st), 0);
+    ASSERT_EQ(t.get()->stat(file->ino, &st), 0);
     EXPECT_TRUE(S_ISREG(st.st_mode));
     EXPECT_EQ(st.st_size, 4242);
+}
+
+TEST(NodeTree, SetOpsAttachesToBareNodeAndRejectsDoubleAttach)
+{
+    // The qdma endpoint attaches an ioctl handler onto the EXISTING qdma/ dir
+    // node (materialized by addDevice without ops), exactly like the C
+    // emu_node_set_ops did.  Attaching once succeeds; a second attach is rejected
+    // (one owner only).
+    Tree t;
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_NE(dev->qdma, nullptr);
+
+    // A handler whose ioctl is observable so we can prove dispatch reaches it.
+    class CmdOps : public NodeOps {
+    public:
+        int ioctl(Node &, unsigned int, const void *, size_t, void *,
+                  size_t) override
+        {
+            return 0;
+        }
+    };
+
+    // The bare qdma/ dir node has no ops yet: dispatch yields -ENOTTY.
+    Node *qd = nullptr;
+    ASSERT_EQ(t.get()->lookupChild(dev->dir->ino, "qdma", &qd), 0);
+    EXPECT_EQ(t.get()->ioctl(qd->ino, 0, nullptr, 0, nullptr, 0), -ENOTTY);
+
+    // Attach succeeds, and the handler now serves the ioctl.
+    ASSERT_EQ(t.get()->setOps(dev->qdma, std::make_unique<CmdOps>()), 0);
+    EXPECT_EQ(t.get()->ioctl(qd->ino, 0, nullptr, 0, nullptr, 0), 0);
+
+    // A second attach is rejected (the node already owns ops) and does not
+    // disturb the installed handler.
+    EXPECT_EQ(t.get()->setOps(dev->qdma, std::make_unique<CmdOps>()), -1);
+    EXPECT_EQ(t.get()->ioctl(qd->ino, 0, nullptr, 0, nullptr, 0), 0);
+
+    // A null node is a clean error, not a crash.
+    EXPECT_EQ(t.get()->setOps(nullptr, std::make_unique<CmdOps>()), -1);
+
+    t.get()->forget(qd->ino, 1);
 }
 
 // ===========================================================================
@@ -270,21 +299,17 @@ TEST(NodeTree, CreateChildFileReportsSize)
 TEST(Registry, RegisterAndFind)
 {
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
 
-    emu_resource *r0 = nullptr;
-    emu_resource *r1 = nullptr;
-    ASSERT_EQ(emu_device_register_resource(dev, 0, nullptr, nullptr, nullptr,
-                                           &r0),
-              0);
-    ASSERT_EQ(emu_device_register_resource(dev, 7, nullptr, nullptr, nullptr,
-                                           &r1),
-              0);
+    Resource *r0 = dev->registerResource(0, {});
+    Resource *r1 = dev->registerResource(7, {});
+    ASSERT_NE(r0, nullptr);
+    ASSERT_NE(r1, nullptr);
 
-    EXPECT_EQ(emu_device_find_resource(dev, 0), r0);
-    EXPECT_EQ(emu_device_find_resource(dev, 7), r1);
-    EXPECT_EQ(emu_device_find_resource(dev, 99), nullptr);
+    EXPECT_EQ(dev->findResource(0), r0);
+    EXPECT_EQ(dev->findResource(7), r1);
+    EXPECT_EQ(dev->findResource(99), nullptr);
 }
 
 TEST(Registry, FindsNamelessResourceNotInTree)
@@ -292,17 +317,15 @@ TEST(Registry, FindsNamelessResourceNotInTree)
     // A registered resource that is NOT attached to any tree node (the qpair is
     // unlinked-while-open and nameless) is still reachable via the registry.
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
 
-    emu_resource *r = nullptr;
-    ASSERT_EQ(emu_device_register_resource(dev, 3, nullptr, nullptr, nullptr,
-                                           &r),
-              0);
+    Resource *r = dev->registerResource(3, {});
+    ASSERT_NE(r, nullptr);
     // qdma/ has no child for it -> truly nameless.
     EXPECT_TRUE(readdir_names(t.get(), dev->qdma->ino).empty());
     // ... yet the registry finds it.
-    EXPECT_EQ(emu_device_find_resource(dev, 3), r);
+    EXPECT_EQ(dev->findResource(3), r);
 }
 
 TEST(Registry, TreeDestructionFreesLiveResources)
@@ -312,12 +335,9 @@ TEST(Registry, TreeDestructionFreesLiveResources)
     ResourceProbe probe;
     {
         Tree t;
-        emu_device *dev = nullptr;
-        ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-        emu_resource *res = nullptr;
-        ASSERT_EQ(emu_device_register_resource(dev, 0, probe_teardown,
-                                               probe_free, &probe, &res),
-                  0);
+        Device *dev = t.get()->addDevice("0000:61:00");
+        ASSERT_NE(dev, nullptr);
+        ASSERT_NE(register_probed(dev, 0, &probe), nullptr);
         // Leave it registered and open; t goes out of scope here.
     }
     EXPECT_EQ(probe.free_calls, 1) << "tree destruction must free the backing";
@@ -326,14 +346,11 @@ TEST(Registry, TreeDestructionFreesLiveResources)
 TEST(Registry, RegisterOnRevokedDeviceFails)
 {
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    ASSERT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    ASSERT_EQ(t.get()->revokeDevice("0000:61:00"), 0);
 
-    emu_resource *r = nullptr;
-    EXPECT_EQ(emu_device_register_resource(dev, 0, nullptr, nullptr, nullptr,
-                                           &r),
-              -1);
+    EXPECT_EQ(dev->registerResource(0, {}), nullptr);
 }
 
 // ===========================================================================
@@ -346,35 +363,29 @@ TEST(Refcount, FreedOnlyWhenBothRefsDrop_CooperativeLast)
     // -> freed exactly once on the second drop.
     ResourceProbe probe;
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
 
-    emu_resource *res = nullptr;
-    ASSERT_EQ(emu_device_register_resource(dev, 0, probe_teardown, probe_free,
-                                           &probe, &res),
-              0);
+    Resource *res = register_probed(dev, 0, &probe);
+    ASSERT_NE(res, nullptr);
 
-    // Attach to a qpair node and look it up (kernel ref), then unlink-while-open
-    // is modelled by leaving the node looked-up while we revoke.
-    emu_node *qp = nullptr;
-    ASSERT_EQ(emu_node_create_child(t.get(), dev->qdma, "qpair0", EMU_NODE_FILE,
-                                    0644, nullptr, nullptr, &qp),
-              0);
-    ASSERT_EQ(emu_node_attach_resource(t.get(), qp, res), 0);
+    // Attach to a qpair node and look it up (kernel ref); the still-looked-up
+    // node holds the inode ref across the revoke.
+    Node *qp = t.get()->createChild(dev->qdma, "qpair0", NodeType::File, 0644);
+    ASSERT_NE(qp, nullptr);
+    ASSERT_EQ(t.get()->attachResource(qp, res->shared_from_this()), 0);
 
-    // Kernel holds a lookup on the qpair node.
-    emu_node *looked = nullptr;
-    ASSERT_EQ(emu_node_lookup_child(t.get(), dev->qdma->ino, "qpair0", &looked),
-              0);
+    Node *looked = nullptr;
+    ASSERT_EQ(t.get()->lookupChild(dev->qdma->ino, "qpair0", &looked), 0);
 
     // Forced removal: drops the registry ref + tears down, but the inode ref
     // (held by the still-looked-up node) keeps the object alive.
-    ASSERT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);
+    ASSERT_EQ(t.get()->revokeDevice("0000:61:00"), 0);
     EXPECT_EQ(probe.teardown_calls, 1);
     EXPECT_EQ(probe.free_calls, 0) << "freed too early: inode ref still held";
 
     // The holder finally lets go (forget drops the inode ref) -> freed once.
-    emu_node_forget(t.get(), qp->ino, 1);
+    t.get()->forget(qp->ino, 1);
     EXPECT_EQ(probe.free_calls, 1);
     EXPECT_EQ(probe.teardown_calls, 1) << "teardown must not run twice";
 }
@@ -386,37 +397,26 @@ TEST(Refcount, FreedOnlyWhenBothRefsDrop_RegistryLast)
     // (cooperative), free happens when the registry ref also drops.
     ResourceProbe probe;
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
 
-    emu_resource *res = nullptr;
-    ASSERT_EQ(emu_device_register_resource(dev, 0, probe_teardown, probe_free,
-                                           &probe, &res),
-              0);
+    Resource *res = register_probed(dev, 0, &probe);
+    ASSERT_NE(res, nullptr);
 
-    emu_node *qp = nullptr;
-    ASSERT_EQ(emu_node_create_child(t.get(), dev->qdma, "qpair0", EMU_NODE_FILE,
-                                    0644, nullptr, nullptr, &qp),
-              0);
-    ASSERT_EQ(emu_node_attach_resource(t.get(), qp, res), 0);
+    Node *qp = t.get()->createChild(dev->qdma, "qpair0", NodeType::File, 0644);
+    ASSERT_NE(qp, nullptr);
+    ASSERT_EQ(t.get()->attachResource(qp, res->shared_from_this()), 0);
 
-    // Cooperative teardown path: node has no outstanding lookups, so creating it
-    // then forgetting/destroying it must run teardown AND unregister.
-    // First give it a lookup and unlink via revoke would conflate paths; instead
-    // simulate "last close of an undisturbed qpair": the node is reaped because
-    // lookup_count is 0 once we mark it unlinked.  We use forget on a node with
-    // count 0 after an explicit lookup+forget pair.
-    emu_node *looked = nullptr;
-    ASSERT_EQ(emu_node_lookup_child(t.get(), dev->qdma->ino, "qpair0", &looked),
-              0);
+    Node *looked = nullptr;
+    ASSERT_EQ(t.get()->lookupChild(dev->qdma->ino, "qpair0", &looked), 0);
     // Drop the kernel lookup; node is still linked, so it is NOT destroyed yet.
-    emu_node_forget(t.get(), qp->ino, 1);
+    t.get()->forget(qp->ino, 1);
     EXPECT_EQ(probe.teardown_calls, 0);
     EXPECT_EQ(probe.free_calls, 0);
 
     // Now forced removal drops both the inode ref (node destroyed) and the
     // registry ref -> teardown once, freed once.
-    ASSERT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);
+    ASSERT_EQ(t.get()->revokeDevice("0000:61:00"), 0);
     EXPECT_EQ(probe.teardown_calls, 1);
     EXPECT_EQ(probe.free_calls, 1);
 }
@@ -433,33 +433,28 @@ TEST(Teardown, CooperativeEvictionRunsTeardownOnce)
     // revoke involved.
     ResourceProbe probe;
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
 
-    emu_resource *res = nullptr;
-    ASSERT_EQ(emu_device_register_resource(dev, 0, probe_teardown, probe_free,
-                                           &probe, &res),
-              0);
-    emu_node *qp = nullptr;
-    ASSERT_EQ(emu_node_create_child(t.get(), dev->qdma, "qpair0", EMU_NODE_FILE,
-                                    0644, nullptr, nullptr, &qp),
-              0);
-    ASSERT_EQ(emu_node_attach_resource(t.get(), qp, res), 0);
+    Resource *res = register_probed(dev, 0, &probe);
+    ASSERT_NE(res, nullptr);
+    Node *qp = t.get()->createChild(dev->qdma, "qpair0", NodeType::File, 0644);
+    ASSERT_NE(qp, nullptr);
+    ASSERT_EQ(t.get()->attachResource(qp, res->shared_from_this()), 0);
 
     // Open it (kernel lookup), then unlink-while-open: it becomes nameless but
     // is still found via the registry, and is NOT yet torn down.
-    emu_node *looked = nullptr;
-    ASSERT_EQ(emu_node_lookup_child(t.get(), dev->qdma->ino, "qpair0", &looked),
-              0);
-    emu_ino_t qp_ino = qp->ino;
-    emu_node_unlink(t.get(), qp);
+    Node *looked = nullptr;
+    ASSERT_EQ(t.get()->lookupChild(dev->qdma->ino, "qpair0", &looked), 0);
+    Ino qp_ino = qp->ino;
+    t.get()->unlink(qp);
     EXPECT_TRUE(readdir_names(t.get(), dev->qdma->ino).empty());
-    EXPECT_EQ(emu_device_find_resource(dev, 0), res) << "still in registry";
+    EXPECT_EQ(dev->findResource(0), res) << "still in registry";
     EXPECT_EQ(probe.teardown_calls, 0);
     EXPECT_EQ(probe.free_calls, 0);
 
     // Last close -> cooperative teardown: once, then freed.
-    emu_node_forget(t.get(), qp_ino, 1);
+    t.get()->forget(qp_ino, 1);
     EXPECT_EQ(probe.teardown_calls, 1);
     EXPECT_EQ(probe.free_calls, 1);
 }
@@ -469,27 +464,22 @@ TEST(Teardown, UnlinkedQpairStaysLiveUntilClosed)
     // A normally-unlinked qpair (not revoked) keeps working until its fd closes:
     // ops still succeed (it is live), unlike the forced-revoke case.
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
 
-    emu_resource *res = nullptr;
-    ASSERT_EQ(emu_device_register_resource(dev, 0, nullptr, nullptr, nullptr,
-                                           &res),
-              0);
-    emu_node *qp = nullptr;
-    ASSERT_EQ(emu_node_create_child(t.get(), dev->qdma, "qpair0", EMU_NODE_FILE,
-                                    0644, nullptr, nullptr, &qp),
-              0);
-    ASSERT_EQ(emu_node_attach_resource(t.get(), qp, res), 0);
-    emu_node *looked = nullptr;
-    ASSERT_EQ(emu_node_lookup_child(t.get(), dev->qdma->ino, "qpair0", &looked),
-              0);
+    Resource *res = dev->registerResource(0, {});
+    ASSERT_NE(res, nullptr);
+    Node *qp = t.get()->createChild(dev->qdma, "qpair0", NodeType::File, 0644);
+    ASSERT_NE(qp, nullptr);
+    ASSERT_EQ(t.get()->attachResource(qp, res->shared_from_this()), 0);
+    Node *looked = nullptr;
+    ASSERT_EQ(t.get()->lookupChild(dev->qdma->ino, "qpair0", &looked), 0);
 
-    emu_node_unlink(t.get(), qp);
+    t.get()->unlink(qp);
     // Still live: a normal unlink is delete-on-last-close, not revocation.
-    EXPECT_EQ(emu_resource_check(t.get(), res), 0);
+    EXPECT_EQ(t.get()->resourceCheck(res), 0);
 
-    emu_node_forget(t.get(), qp->ino, 1);  // close -> freed
+    t.get()->forget(qp->ino, 1);  // close -> freed
 }
 
 TEST(Teardown, BothTriggersAreIdempotent)
@@ -500,24 +490,19 @@ TEST(Teardown, BothTriggersAreIdempotent)
     // exactly once.
     ResourceProbe probe;
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
 
-    emu_resource *res = nullptr;
-    ASSERT_EQ(emu_device_register_resource(dev, 0, probe_teardown, probe_free,
-                                           &probe, &res),
-              0);
-    emu_node *qp = nullptr;
-    ASSERT_EQ(emu_node_create_child(t.get(), dev->qdma, "qpair0", EMU_NODE_FILE,
-                                    0644, nullptr, nullptr, &qp),
-              0);
-    ASSERT_EQ(emu_node_attach_resource(t.get(), qp, res), 0);
+    Resource *res = register_probed(dev, 0, &probe);
+    ASSERT_NE(res, nullptr);
+    Node *qp = t.get()->createChild(dev->qdma, "qpair0", NodeType::File, 0644);
+    ASSERT_NE(qp, nullptr);
+    ASSERT_EQ(t.get()->attachResource(qp, res->shared_from_this()), 0);
 
-    emu_node *looked = nullptr;
-    ASSERT_EQ(emu_node_lookup_child(t.get(), dev->qdma->ino, "qpair0", &looked),
-              0);
-    ASSERT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);  // trigger 1 (forced)
-    emu_node_forget(t.get(), qp->ino, 1);                    // trigger 2 (coop)
+    Node *looked = nullptr;
+    ASSERT_EQ(t.get()->lookupChild(dev->qdma->ino, "qpair0", &looked), 0);
+    ASSERT_EQ(t.get()->revokeDevice("0000:61:00"), 0);  // trigger 1 (forced)
+    t.get()->forget(qp->ino, 1);                        // trigger 2 (coop)
     EXPECT_EQ(probe.teardown_calls, 1) << "teardown must be idempotent";
     EXPECT_EQ(probe.free_calls, 1);
 }
@@ -525,10 +510,10 @@ TEST(Teardown, BothTriggersAreIdempotent)
 TEST(Teardown, RevokeIsIdempotent)
 {
     Tree t;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", nullptr), 0);
-    EXPECT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);
-    EXPECT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);  // no-op
-    EXPECT_EQ(emu_device_revoke(t.get(), "0000:99:00"), 0);  // never existed
+    ASSERT_NE(t.get()->addDevice("0000:61:00"), nullptr);
+    EXPECT_EQ(t.get()->revokeDevice("0000:61:00"), 0);
+    EXPECT_EQ(t.get()->revokeDevice("0000:61:00"), 0);  // no-op
+    EXPECT_EQ(t.get()->revokeDevice("0000:99:00"), 0);  // never existed
 }
 
 // ===========================================================================
@@ -538,86 +523,76 @@ TEST(Teardown, RevokeIsIdempotent)
 TEST(Revocation, LookupOfRemovedEndpointReturnsEnoent)
 {
     Tree t;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", nullptr), 0);
+    ASSERT_NE(t.get()->addDevice("0000:61:00"), nullptr);
 
     // Present before revoke.
-    emu_node *child = nullptr;
-    ASSERT_EQ(emu_node_lookup_child(t.get(), EMU_ROOT_INO, "0000:61:00", &child),
-              0);
-    emu_node_forget(t.get(), child->ino, 1);
+    Node *child = nullptr;
+    ASSERT_EQ(t.get()->lookupChild(kRootIno, "0000:61:00", &child), 0);
+    t.get()->forget(child->ino, 1);
 
-    ASSERT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);
+    ASSERT_EQ(t.get()->revokeDevice("0000:61:00"), 0);
 
     // New lookup misses.
-    EXPECT_EQ(emu_node_lookup_child(t.get(), EMU_ROOT_INO, "0000:61:00", &child),
-              -ENOENT);
+    EXPECT_EQ(t.get()->lookupChild(kRootIno, "0000:61:00", &child), -ENOENT);
     // ... and it is gone from readdir.
-    EXPECT_TRUE(readdir_names(t.get(), EMU_ROOT_INO).empty());
+    EXPECT_TRUE(readdir_names(t.get(), kRootIno).empty());
 }
 
 TEST(Revocation, OpOnOpenHandleOfRemovedEndpointReturnsEnodev)
 {
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
 
     // A node-backed endpoint (e.g. bars/bar0) with an outstanding open handle.
-    emu_node *bar = nullptr;
-    ASSERT_EQ(emu_node_create_child(t.get(), dev->bars, "bar0", EMU_NODE_FILE,
-                                    0644, nullptr, nullptr, &bar),
-              0);
-    emu_node *opened = nullptr;
-    ASSERT_EQ(emu_node_lookup_child(t.get(), dev->bars->ino, "bar0", &opened),
-              0);
+    Node *bar = t.get()->createChild(dev->bars, "bar0", NodeType::File, 0644);
+    ASSERT_NE(bar, nullptr);
+    Node *opened = nullptr;
+    ASSERT_EQ(t.get()->lookupChild(dev->bars->ino, "bar0", &opened), 0);
     // Live before revoke.
-    EXPECT_EQ(emu_node_is_live(t.get(), bar->ino), 0);
+    EXPECT_EQ(t.get()->isLive(bar->ino), 0);
 
-    ASSERT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);
+    ASSERT_EQ(t.get()->revokeDevice("0000:61:00"), 0);
 
     // The fd is still open (lookup not yet forgotten): ops must see ENODEV.
-    EXPECT_EQ(emu_node_is_live(t.get(), bar->ino), -ENODEV);
+    EXPECT_EQ(t.get()->isLive(bar->ino), -ENODEV);
 }
 
 TEST(Revocation, ResourceOpReturnsEnodevAfterRevoke)
 {
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
 
-    emu_resource *res = nullptr;
-    ASSERT_EQ(emu_device_register_resource(dev, 0, nullptr, nullptr, nullptr,
-                                           &res),
-              0);
-    emu_node *qp = nullptr;
-    ASSERT_EQ(emu_node_create_child(t.get(), dev->qdma, "qpair0", EMU_NODE_FILE,
-                                    0644, nullptr, nullptr, &qp),
-              0);
-    ASSERT_EQ(emu_node_attach_resource(t.get(), qp, res), 0);
-    emu_node *looked = nullptr;
-    ASSERT_EQ(emu_node_lookup_child(t.get(), dev->qdma->ino, "qpair0", &looked),
-              0);
+    Resource *res = dev->registerResource(0, {});
+    ASSERT_NE(res, nullptr);
+    Node *qp = t.get()->createChild(dev->qdma, "qpair0", NodeType::File, 0644);
+    ASSERT_NE(qp, nullptr);
+    ASSERT_EQ(t.get()->attachResource(qp, res->shared_from_this()), 0);
+    Node *looked = nullptr;
+    ASSERT_EQ(t.get()->lookupChild(dev->qdma->ino, "qpair0", &looked), 0);
 
-    EXPECT_EQ(emu_resource_check(t.get(), res), 0);
-    ASSERT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);
+    EXPECT_EQ(t.get()->resourceCheck(res), 0);
+    ASSERT_EQ(t.get()->revokeDevice("0000:61:00"), 0);
     // res is still alive (inode ref) but dead -> ENODEV.
-    EXPECT_EQ(emu_resource_check(t.get(), res), -ENODEV);
+    EXPECT_EQ(t.get()->resourceCheck(res), -ENODEV);
 
-    emu_node_forget(t.get(), qp->ino, 1);  // release the orphan
+    t.get()->forget(qp->ino, 1);  // release the orphan
 }
 
 TEST(Revocation, NameInvalidationIsInvoked)
 {
     Tree t(/*with_notifier=*/true);
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    emu_ino_t bdf_ino = dev->dir->ino;
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    Ino bdf_ino = dev->dir->ino;
 
-    ASSERT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);
+    ASSERT_EQ(t.get()->revokeDevice("0000:61:00"), 0);
 
     // The <BDF> dir (and its bars/qdma children) must have been invalidated.
     bool saw_bdf = false;
     for (const auto &rec : g_notifications) {
-        if (rec.name == "0000:61:00" && rec.parent == EMU_ROOT_INO &&
+        if (rec.name == "0000:61:00" && rec.parent == kRootIno &&
             rec.child == bdf_ino) {
             saw_bdf = true;
         }
@@ -638,13 +613,12 @@ TEST(Revocation, StaleParentLookupReturnsEnoent)
     // parent must not crash; the inode may be gone -> ESTALE, mapped to ENOENT by
     // the FUSE layer.  Here we assert it does not resolve a live child.
     Tree t;
-    emu_device *dev = nullptr;
-    ASSERT_EQ(emu_node_tree_add_device(t.get(), "0000:61:00", &dev), 0);
-    emu_ino_t bars_ino = dev->bars->ino;
-    ASSERT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);
+    Device *dev = t.get()->addDevice("0000:61:00");
+    ASSERT_NE(dev, nullptr);
+    Ino bars_ino = dev->bars->ino;
+    ASSERT_EQ(t.get()->revokeDevice("0000:61:00"), 0);
 
-    emu_node *child = nullptr;
-    int ret = emu_node_lookup_child(t.get(), bars_ino, "bar0", &child);
-    EXPECT_TRUE(ret == -ESTALE || ret == -ENOENT)
-        << "unexpected ret=" << ret;
+    Node *child = nullptr;
+    int ret = t.get()->lookupChild(bars_ino, "bar0", &child);
+    EXPECT_TRUE(ret == -ESTALE || ret == -ENOENT) << "unexpected ret=" << ret;
 }

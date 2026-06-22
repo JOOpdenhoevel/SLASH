@@ -228,10 +228,14 @@ gtest_discover_tests(hotplug_adversarial_test PROPERTIES TIMEOUT 60)
 
 # CI stub model: the standalone address-keyed SIM-dialect server the daemon's
 # bridge is tested against (a real vpp_sim cannot run in CI).  Built as its own
-# executable and linked against libzmq's C API, exactly as the daemon client is.
-add_executable(stub_model stub_model.c)
-target_link_libraries(stub_model PRIVATE PkgConfig::ZMQ)
+# C++20 executable; uses cppzmq + JsonCpp (byte-exact with the original C stub).
+add_executable(stub_model stub_model.cpp)
+target_link_libraries(stub_model PRIVATE PkgConfig::ZMQ PkgConfig::JSONCPP)
 target_compile_options(stub_model PRIVATE -Wall -Wextra -Werror)
+set_target_properties(stub_model PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED YES
+)
 
 # bridge unit suite (T10): the model client protocol vs the stub, the reconfig-
 # region write predicate, the bar/qdma backend rc-contract end-to-end through a

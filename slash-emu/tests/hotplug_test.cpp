@@ -63,15 +63,33 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "bars.hpp"
+#include "config.hpp"
+#include "hotplug.hpp"
+#include "info.hpp"
+#include "node.hpp"
+#include "qdma.hpp"
+
 extern "C" {
-#include "bars.h"
-#include "config.h"
-#include "hotplug.h"
-#include "info.h"
-#include "node.h"
-#include "qdma.h"
 #include "slash/uapi/slash_abi.h"
 }
+
+using slash::emu::Config;
+using slash::emu::Device;
+using slash::emu::DeviceFunction;
+using slash::emu::Ino;
+using slash::emu::Node;
+using slash::emu::NodeTree;
+using slash::emu::NodeType;
+using slash::emu::ModelShutdownFn;
+using slash::emu::ReloadFn;
+using slash::emu::barsAttach;
+using slash::emu::infoAttach;
+using slash::emu::qdmaAttach;
+using slash::emu::kRootIno;
+using slash::emu::hotplugAttach;
+using slash::emu::hotplugParseBdf;
+using slash::emu::hotplugSetSbrSleepUs;
 
 namespace {
 
@@ -81,78 +99,71 @@ namespace {
 
 TEST(HotplugParseBdf, ValidFunctionsMap)
 {
-    char bdf[EMU_BDF_LEN];
-    emu_device_function func;
+    std::string bdf;
+    DeviceFunction func;
 
-    ASSERT_EQ(emu_hotplug_parse_bdf("0000:61:00.1", bdf, sizeof(bdf), &func), 0);
-    EXPECT_STREQ(bdf, "0000:61:00");
-    EXPECT_EQ(func, EMU_DEVICE_FUNCTION_QDMA);
+    ASSERT_EQ(hotplugParseBdf("0000:61:00.1", bdf, func), 0);
+    EXPECT_EQ(bdf, "0000:61:00");
+    EXPECT_EQ(func, DeviceFunction::Qdma);
 
-    ASSERT_EQ(emu_hotplug_parse_bdf("0000:61:00.2", bdf, sizeof(bdf), &func), 0);
-    EXPECT_STREQ(bdf, "0000:61:00");
-    EXPECT_EQ(func, EMU_DEVICE_FUNCTION_BARS);
+    ASSERT_EQ(hotplugParseBdf("0000:61:00.2", bdf, func), 0);
+    EXPECT_EQ(bdf, "0000:61:00");
+    EXPECT_EQ(func, DeviceFunction::Bars);
 }
 
 TEST(HotplugParseBdf, ShortFormExpandsDomain)
 {
-    char bdf[EMU_BDF_LEN];
-    emu_device_function func;
+    std::string bdf;
+    DeviceFunction func;
 
     // "BB:DD.F" -> implicit domain 0000.
-    ASSERT_EQ(emu_hotplug_parse_bdf("61:00.1", bdf, sizeof(bdf), &func), 0);
-    EXPECT_STREQ(bdf, "0000:61:00");
-    EXPECT_EQ(func, EMU_DEVICE_FUNCTION_QDMA);
+    ASSERT_EQ(hotplugParseBdf("61:00.1", bdf, func), 0);
+    EXPECT_EQ(bdf, "0000:61:00");
+    EXPECT_EQ(func, DeviceFunction::Qdma);
 }
 
 TEST(HotplugParseBdf, UppercaseLowercased)
 {
-    char bdf[EMU_BDF_LEN];
-    emu_device_function func;
-    ASSERT_EQ(emu_hotplug_parse_bdf("0000:AB:0F.2", bdf, sizeof(bdf), &func), 0);
-    EXPECT_STREQ(bdf, "0000:ab:0f");
+    std::string bdf;
+    DeviceFunction func;
+    ASSERT_EQ(hotplugParseBdf("0000:AB:0F.2", bdf, func), 0);
+    EXPECT_EQ(bdf, "0000:ab:0f");
 }
 
 TEST(HotplugParseBdf, MissingFunctionRejected)
 {
-    char bdf[EMU_BDF_LEN];
-    emu_device_function func;
+    std::string bdf;
+    DeviceFunction func;
     // No function suffix at all.
-    EXPECT_EQ(emu_hotplug_parse_bdf("0000:61:00", bdf, sizeof(bdf), &func),
-              -EINVAL);
+    EXPECT_EQ(hotplugParseBdf("0000:61:00", bdf, func), -EINVAL);
     // Trailing dot with no digit.
-    EXPECT_EQ(emu_hotplug_parse_bdf("0000:61:00.", bdf, sizeof(bdf), &func),
-              -EINVAL);
+    EXPECT_EQ(hotplugParseBdf("0000:61:00.", bdf, func), -EINVAL);
 }
 
 TEST(HotplugParseBdf, MalformedFunctionRejected)
 {
-    char bdf[EMU_BDF_LEN];
-    emu_device_function func;
+    std::string bdf;
+    DeviceFunction func;
     // Multi-char / non-digit function fields.
-    EXPECT_EQ(emu_hotplug_parse_bdf("0000:61:00.12", bdf, sizeof(bdf), &func),
-              -EINVAL);
-    EXPECT_EQ(emu_hotplug_parse_bdf("0000:61:00.x", bdf, sizeof(bdf), &func),
-              -EINVAL);
+    EXPECT_EQ(hotplugParseBdf("0000:61:00.12", bdf, func), -EINVAL);
+    EXPECT_EQ(hotplugParseBdf("0000:61:00.x", bdf, func), -EINVAL);
 }
 
 TEST(HotplugParseBdf, UnknownFunctionUnsupported)
 {
-    char bdf[EMU_BDF_LEN];
-    emu_device_function func;
+    std::string bdf;
+    DeviceFunction func;
     // Syntactically valid but not a removable function (only 1 and 2 are).
-    EXPECT_EQ(emu_hotplug_parse_bdf("0000:61:00.0", bdf, sizeof(bdf), &func),
-              -EOPNOTSUPP);
-    EXPECT_EQ(emu_hotplug_parse_bdf("0000:61:00.3", bdf, sizeof(bdf), &func),
-              -EOPNOTSUPP);
+    EXPECT_EQ(hotplugParseBdf("0000:61:00.0", bdf, func), -EOPNOTSUPP);
+    EXPECT_EQ(hotplugParseBdf("0000:61:00.3", bdf, func), -EOPNOTSUPP);
 }
 
 TEST(HotplugParseBdf, MalformedBoardRejected)
 {
-    char bdf[EMU_BDF_LEN];
-    emu_device_function func;
-    EXPECT_EQ(emu_hotplug_parse_bdf("not-a-bdf.1", bdf, sizeof(bdf), &func),
-              -EINVAL);
-    EXPECT_EQ(emu_hotplug_parse_bdf(".1", bdf, sizeof(bdf), &func), -EINVAL);
+    std::string bdf;
+    DeviceFunction func;
+    EXPECT_EQ(hotplugParseBdf("not-a-bdf.1", bdf, func), -EINVAL);
+    EXPECT_EQ(hotplugParseBdf(".1", bdf, func), -EINVAL);
 }
 
 // ===========================================================================
@@ -165,83 +176,68 @@ struct ReloadState {
     int rc{0};
 };
 
-int stub_reload(void *ctx)
-{
-    auto *s = static_cast<ReloadState *>(ctx);
-    s->calls++;
-    return s->rc;
-}
-
 // Model-shutdown seam counter, keyed per device via the dev pointer.
 struct ShutdownState {
     std::atomic<int> calls{0};
-    emu_device *last{nullptr};
+    Device *last{nullptr};
 };
-
-void stub_model_shutdown(emu_device *dev, void *ctx)
-{
-    auto *s = static_cast<ShutdownState *>(ctx);
-    s->calls++;
-    s->last = dev;
-}
 
 // A tree owning helper; builds the root + the /hotplug file.
 class HotplugTree {
 public:
-    explicit HotplugTree(emu_hotplug_reload_fn reload = nullptr,
-                         void *ctx = nullptr)
+    explicit HotplugTree(ReloadFn reload = {})
+        : tree_()
     {
-        EXPECT_EQ(emu_node_tree_new(&tree_, nullptr), 0);
-        EXPECT_EQ(emu_hotplug_attach(tree_, reload, ctx), 0);
+        EXPECT_EQ(hotplugAttach(tree_, std::move(reload)), 0);
     }
-    ~HotplugTree() { cleanup_node_tree(tree_); }
-    emu_node_tree *get() { return tree_; }
+    NodeTree &get() { return tree_; }
 
     // Add a fully-attached device (info + bars + qdma + model-shutdown seam).
-    emu_device *add_device(const char *bdf, emu_model_shutdown_fn sd = nullptr,
-                           void *sd_ctx = nullptr)
+    Device *addDevice(const std::string &bdf,
+                      ModelShutdownFn sd = {})
     {
-        emu_device *dev = nullptr;
-        EXPECT_EQ(emu_node_tree_add_device(tree_, bdf, &dev), 0);
+        Device *dev = tree_.addDevice(bdf);
         EXPECT_NE(dev, nullptr);
-        EXPECT_EQ(emu_info_attach(dev), 0);
-        EXPECT_EQ(emu_bars_attach(dev), 0);
-        EXPECT_EQ(emu_qdma_attach(dev), 0);
-        if (sd != nullptr) {
-            EXPECT_EQ(emu_device_set_model_shutdown(tree_, bdf, sd, sd_ctx), 0);
+        if (dev == nullptr) {
+            return nullptr;
+        }
+        EXPECT_EQ(infoAttach(*dev), 0);
+        EXPECT_EQ(barsAttach(*dev), 0);
+        EXPECT_EQ(qdmaAttach(*dev), 0);
+        if (sd) {
+            EXPECT_EQ(tree_.setModelShutdown(bdf, std::move(sd)), 0);
         }
         return dev;
     }
 
     // Resolve the /hotplug file inode at the root.
-    emu_ino_t hotplug_ino()
+    Ino hotplugIno()
     {
-        emu_node *child = nullptr;
-        EXPECT_EQ(emu_node_lookup_child(tree_, EMU_ROOT_INO, "hotplug", &child),
-                  0);
+        Node *child = nullptr;
+        EXPECT_EQ(tree_.lookupChild(kRootIno, "hotplug", &child), 0);
         return child != nullptr ? child->ino : 0;
     }
 
 private:
-    emu_node_tree *tree_ = nullptr;
+    NodeTree tree_;
 };
 
 // Issue a device-request ioctl (REMOVE/SBR/HOTPLUG) on the hotplug file.
-int hotplug_dev_ioctl(emu_node_tree *tree, emu_ino_t ino, unsigned int cmd,
-                      const char *bdf_with_func)
+int hotplugDevIoctl(NodeTree &tree, Ino ino, unsigned int cmd,
+                    const char *bdf_with_func)
 {
     struct slash_abi_hotplug_device_request req {};
     req.size = sizeof(req);
     std::snprintf(req.bdf, sizeof(req.bdf), "%s", bdf_with_func);
     // No out payload for any hotplug command.
-    return emu_node_ioctl(tree, ino, cmd, &req, sizeof(req), &req, sizeof(req));
+    return tree.ioctl(ino, cmd, &req, sizeof(req), &req, sizeof(req));
 }
 
 // True if a directory name resolves live under a parent inode.
-bool resolves(emu_node_tree *tree, emu_ino_t parent, const char *name)
+bool resolves(NodeTree &tree, Ino parent, const char *name)
 {
-    emu_node *child = nullptr;
-    int rc = emu_node_lookup_child(tree, parent, name, &child);
+    Node *child = nullptr;
+    int rc = tree.lookupChild(parent, name, &child);
     return rc == 0 && child != nullptr;
 }
 
@@ -252,16 +248,16 @@ bool resolves(emu_node_tree *tree, emu_ino_t parent, const char *name)
 TEST(HotplugRemove, Function1RemovesOnlyQdma)
 {
     HotplugTree t;
-    emu_device *dev = t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
+    Device *dev = t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
     ASSERT_NE(hp, 0u);
 
     // Both subtrees resolve before removal.
     ASSERT_TRUE(resolves(t.get(), dev->dir->ino, "qdma"));
     ASSERT_TRUE(resolves(t.get(), dev->dir->ino, "bars"));
 
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.1"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.1"),
               0);
 
     // qdma/ is gone (new lookup -> not found); bars/ survives.
@@ -274,11 +270,11 @@ TEST(HotplugRemove, Function1RemovesOnlyQdma)
 TEST(HotplugRemove, Function2RemovesOnlyBars)
 {
     HotplugTree t;
-    emu_device *dev = t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
+    Device *dev = t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
 
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.2"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.2"),
               0);
 
     EXPECT_FALSE(resolves(t.get(), dev->dir->ino, "bars"))
@@ -290,28 +286,28 @@ TEST(HotplugRemove, Function2RemovesOnlyBars)
 TEST(HotplugRemove, RemovedFunctionIsIdempotent)
 {
     HotplugTree t;
-    t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
+    t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
 
-    EXPECT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.1"),
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.1"),
               0);
     // Second REMOVE of the same function: no-op success.
-    EXPECT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.1"),
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.1"),
               0);
 }
 
 TEST(HotplugRemove, UnknownDeviceIsNoopSuccess)
 {
     HotplugTree t;
-    t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
+    t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
 
     // REMOVE of a device that does not exist: the postcondition (endpoint gone)
     // already holds, so this is a no-op success, not an error.
-    EXPECT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:99:00.1"),
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:99:00.1"),
               0);
 }
 
@@ -322,41 +318,38 @@ TEST(HotplugRemove, UnknownDeviceIsNoopSuccess)
 TEST(HotplugRevocation, EnodevOnOpenHandleEnoentOnReopen)
 {
     HotplugTree t;
-    emu_device *dev = t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
+    Device *dev = t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
 
-    // "Open" the info file (a per-device endpoint under <BDF>/) and the bars/
-    // dir's bar0.  Use lookup to model an open (bumps lookup_count so the node
-    // survives revocation as a dead orphan).
-    emu_node *bar0 = nullptr;
-    ASSERT_EQ(emu_node_lookup_child(t.get(), dev->bars->ino, "bar0", &bar0), 0);
+    // "Open" bar0 (bumps lookup_count so the node survives as a dead orphan).
+    Node *bar0 = nullptr;
+    ASSERT_EQ(t.get().lookupChild(dev->bars->ino, "bar0", &bar0), 0);
     ASSERT_NE(bar0, nullptr);
-    emu_ino_t bar0_ino = bar0->ino;
+    Ino bar0_ino = bar0->ino;
 
     // The open handle works before removal.
-    char buf[8] = {};
-    EXPECT_EQ(emu_node_is_live(t.get(), bar0_ino), 0);
+    EXPECT_EQ(t.get().isLive(bar0_ino), 0);
 
     // Remove function 2 (the bars subtree).
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.2"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.2"),
               0);
 
     // Any op on the already-open handle now returns -ENODEV.
-    EXPECT_EQ(emu_node_is_live(t.get(), bar0_ino), -ENODEV);
-    EXPECT_EQ(emu_node_pread(t.get(), bar0_ino, buf, sizeof(buf), 0), -ENODEV);
+    EXPECT_EQ(t.get().isLive(bar0_ino), -ENODEV);
+    char buf[8] = {};
+    EXPECT_EQ(t.get().pread(bar0_ino, buf, sizeof(buf), 0), -ENODEV);
 
     // A fresh lookup of the removed endpoint misses (-ENOENT at the FS layer).
-    emu_node *gone = nullptr;
-    EXPECT_EQ(emu_node_lookup_child(t.get(), dev->dir->ino, "bars", &gone),
-              -ENOENT);
+    Node *gone = nullptr;
+    EXPECT_EQ(t.get().lookupChild(dev->dir->ino, "bars", &gone), -ENOENT);
 }
 
 TEST(HotplugRevocation, QpairHandleEnodevAfterFunction1Remove)
 {
     HotplugTree t;
-    emu_device *dev = t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
+    Device *dev = t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
 
     // Create a qpair and "open" it.
     struct slash_abi_qdma_qpair_add qreq {};
@@ -364,31 +357,31 @@ TEST(HotplugRevocation, QpairHandleEnodevAfterFunction1Remove)
     qreq.mode = 0;       // MM
     qreq.dir_mask = 0x1; // H2C
     struct slash_abi_qdma_qpair_add qout = qreq;
-    ASSERT_EQ(emu_node_ioctl(t.get(), dev->qdma->ino,
-                             SLASH_ABI_QDMA_IOCTL_QPAIR_ADD, &qreq, sizeof(qreq),
-                             &qout, sizeof(qout)),
+    ASSERT_EQ(t.get().ioctl(dev->qdma->ino, SLASH_ABI_QDMA_IOCTL_QPAIR_ADD,
+                            &qreq, sizeof(qreq), &qout, sizeof(qout)),
               0);
-    emu_node *qp = nullptr;
+    Node *qp = nullptr;
     char qname[32];
     std::snprintf(qname, sizeof(qname), "qpair%u", qout.qid);
-    ASSERT_EQ(emu_node_lookup_child(t.get(), dev->qdma->ino, qname, &qp), 0);
-    emu_ino_t qp_ino = qp->ino;
+    ASSERT_EQ(t.get().lookupChild(dev->qdma->ino, qname, &qp), 0);
+    Ino qp_ino = qp->ino;
 
     // The qpair works before removal.
     std::vector<uint8_t> data(16, 0xab);
-    ASSERT_EQ(emu_node_pwrite(t.get(), qp_ino,
-                              reinterpret_cast<const char *>(data.data()),
-                              data.size(), static_cast<off_t>(SLASH_HBM_BASE)),
+    ASSERT_EQ(t.get().pwrite(qp_ino,
+                             reinterpret_cast<const char *>(data.data()),
+                             data.size(), static_cast<off_t>(SLASH_HBM_BASE)),
               static_cast<ssize_t>(data.size()));
 
     // Remove function 1 (qdma): the qpair resource is eagerly revoked.
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.1"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.1"),
               0);
 
     // The open qpair handle now returns -ENODEV; bars survive.
-    EXPECT_EQ(emu_node_pread(t.get(), qp_ino, reinterpret_cast<char *>(data.data()),
-                             data.size(), static_cast<off_t>(SLASH_HBM_BASE)),
+    EXPECT_EQ(t.get().pread(qp_ino,
+                            reinterpret_cast<char *>(data.data()), data.size(),
+                            static_cast<off_t>(SLASH_HBM_BASE)),
               -ENODEV);
     EXPECT_TRUE(resolves(t.get(), dev->dir->ino, "bars"));
 }
@@ -401,25 +394,28 @@ TEST(HotplugModelShutdown, FiresOnceWhenBothFunctionsRemovedViaTwoRemoves)
 {
     ShutdownState sd;
     HotplugTree t;
-    emu_device *dev = t.add_device("0000:61:00", stub_model_shutdown, &sd);
-    emu_ino_t hp = t.hotplug_ino();
+    Device *dev = t.addDevice("0000:61:00", [&sd](Device &d) {
+        sd.calls++;
+        sd.last = &d;
+    });
+    Ino hp = t.hotplugIno();
 
     // Remove function 1: model still running (only one function gone).
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.1"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.1"),
               0);
     EXPECT_EQ(sd.calls.load(), 0) << "model must keep running after one function";
 
     // Remove function 2: now both gone -> seam fires exactly once.
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.2"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.2"),
               0);
     EXPECT_EQ(sd.calls.load(), 1) << "model shutdown must fire once both gone";
     EXPECT_EQ(sd.last, dev);
 
     // A redundant REMOVE does not re-fire it.
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.1"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.1"),
               0);
     EXPECT_EQ(sd.calls.load(), 1) << "model shutdown must fire exactly once";
 }
@@ -428,16 +424,19 @@ TEST(HotplugModelShutdown, OrderIndependent)
 {
     ShutdownState sd;
     HotplugTree t;
-    t.add_device("0000:61:00", stub_model_shutdown, &sd);
-    emu_ino_t hp = t.hotplug_ino();
+    t.addDevice("0000:61:00", [&sd](Device &d) {
+        sd.calls++;
+        sd.last = &d;
+    });
+    Ino hp = t.hotplugIno();
 
     // Remove function 2 first, then function 1.
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.2"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.2"),
               0);
     EXPECT_EQ(sd.calls.load(), 0);
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.1"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.1"),
               0);
     EXPECT_EQ(sd.calls.load(), 1);
 }
@@ -446,12 +445,14 @@ TEST(HotplugModelShutdown, WholeDeviceRevokeFiresSeamOnce)
 {
     ShutdownState sd;
     HotplugTree t;
-    t.add_device("0000:61:00", stub_model_shutdown, &sd);
+    t.addDevice("0000:61:00", [&sd](Device &d) {
+        sd.calls++;
+        sd.last = &d;
+    });
 
     // A whole-device revoke (the TOGGLE_SBR/HOTPLUG path) removes both functions
-    // at once: the seam fires exactly once even with no prior per-function
-    // REMOVE.
-    ASSERT_EQ(emu_device_revoke(t.get(), "0000:61:00"), 0);
+    // at once: the seam fires exactly once even with no prior per-function REMOVE.
+    ASSERT_EQ(t.get().revokeDevice("0000:61:00"), 0);
     EXPECT_EQ(sd.calls.load(), 1);
 }
 
@@ -462,12 +463,15 @@ TEST(HotplugModelShutdown, WholeDeviceRevokeFiresSeamOnce)
 TEST(HotplugRescan, InvokesReloadOnce)
 {
     ReloadState rs;
-    HotplugTree t(stub_reload, &rs);
-    emu_ino_t hp = t.hotplug_ino();
+    HotplugTree t([&rs]() -> int {
+        rs.calls++;
+        return rs.rc;
+    });
+    Ino hp = t.hotplugIno();
 
     // RESCAN takes no argument (_IO).
-    ASSERT_EQ(emu_node_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_RESCAN,
-                             nullptr, 0, nullptr, 0),
+    ASSERT_EQ(t.get().ioctl(hp, SLASH_ABI_HOTPLUG_IOCTL_RESCAN, nullptr, 0,
+                            nullptr, 0),
               0);
     EXPECT_EQ(rs.calls.load(), 1);
 }
@@ -476,51 +480,57 @@ TEST(HotplugRescan, ReloadFailureSurfacesEio)
 {
     ReloadState rs;
     rs.rc = -1; // make the reload callback fail
-    HotplugTree t(stub_reload, &rs);
-    emu_ino_t hp = t.hotplug_ino();
+    HotplugTree t([&rs]() -> int {
+        rs.calls++;
+        return rs.rc;
+    });
+    Ino hp = t.hotplugIno();
 
-    EXPECT_EQ(emu_node_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_RESCAN,
-                             nullptr, 0, nullptr, 0),
+    EXPECT_EQ(t.get().ioctl(hp, SLASH_ABI_HOTPLUG_IOCTL_RESCAN, nullptr, 0,
+                            nullptr, 0),
               -EIO);
 }
 
 TEST(HotplugSbr, RemovesDeviceAndReloads)
 {
     ReloadState rs;
-    HotplugTree t(stub_reload, &rs);
-    emu_device *dev = t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
-    emu_ino_t devdir = dev->dir->ino;
+    HotplugTree t([&rs]() -> int {
+        rs.calls++;
+        return rs.rc;
+    });
+    Device *dev = t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
+    Ino devdir_ino = dev->dir->ino;
 
     // Short-circuit the emulated sleep so the single-threaded daemon is not
     // blocked for a real second.
-    ASSERT_EQ(emu_hotplug_set_sbr_sleep_us(t.get(), 0), 0);
+    ASSERT_EQ(hotplugSetSbrSleepUs(t.get(), 0), 0);
 
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_TOGGLE_SBR,
-                                "0000:61:00.1"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_TOGGLE_SBR,
+                              "0000:61:00.1"),
               0);
 
     // The whole device is removed (its <BDF>/ dir no longer resolves) and reload
-    // ran once.  The device dir node itself is gone, so a lookup UNDER it now
-    // finds no live parent (-ESTALE), distinct from a per-function REMOVE where
-    // the <BDF>/ dir survives and the missing child is -ENOENT.
-    (void) devdir;
-    EXPECT_FALSE(resolves(t.get(), EMU_ROOT_INO, "0000:61:00"));
+    // ran once.
+    EXPECT_FALSE(resolves(t.get(), kRootIno, "0000:61:00"));
     EXPECT_EQ(rs.calls.load(), 1);
-    EXPECT_EQ(emu_node_lookup_child(t.get(), devdir, "bars", nullptr), -ESTALE);
+    EXPECT_EQ(t.get().lookupChild(devdir_ino, "bars", nullptr), -ESTALE);
 }
 
 TEST(HotplugHotplugCmd, RemovesDeviceAndReloadsNoSleep)
 {
     ReloadState rs;
-    HotplugTree t(stub_reload, &rs);
-    t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
+    HotplugTree t([&rs]() -> int {
+        rs.calls++;
+        return rs.rc;
+    });
+    t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
 
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_HOTPLUG,
-                                "0000:61:00.2"),
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_HOTPLUG,
+                              "0000:61:00.2"),
               0);
-    EXPECT_FALSE(resolves(t.get(), EMU_ROOT_INO, "0000:61:00"));
+    EXPECT_FALSE(resolves(t.get(), kRootIno, "0000:61:00"));
     EXPECT_EQ(rs.calls.load(), 1);
 }
 
@@ -531,61 +541,58 @@ TEST(HotplugHotplugCmd, RemovesDeviceAndReloadsNoSleep)
 TEST(HotplugIoctl, UnknownCommandIsEnotty)
 {
     HotplugTree t;
-    emu_ino_t hp = t.hotplug_ino();
+    Ino hp = t.hotplugIno();
     char buf[64] = {};
-    EXPECT_EQ(emu_node_ioctl(t.get(), hp, 0xdeadbeef, buf, sizeof(buf), buf,
-                             sizeof(buf)),
+    EXPECT_EQ(t.get().ioctl(hp, 0xdeadbeef, buf, sizeof(buf), buf, sizeof(buf)),
               -ENOTTY);
 }
 
 TEST(HotplugIoctl, ShortDeviceRequestRejected)
 {
     HotplugTree t;
-    t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
+    t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
 
     struct slash_abi_hotplug_device_request req {};
     req.size = sizeof(req);
     std::snprintf(req.bdf, sizeof(req.bdf), "0000:61:00.1");
     // in_size too small to hold the struct.
-    EXPECT_EQ(emu_node_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE, &req, 4,
-                             &req, sizeof(req)),
+    EXPECT_EQ(t.get().ioctl(hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE, &req, 4, &req,
+                            sizeof(req)),
               -EINVAL);
 }
 
 TEST(HotplugIoctl, NonTerminatedBdfRejected)
 {
     HotplugTree t;
-    t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
+    t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
 
     struct slash_abi_hotplug_device_request req {};
     req.size = sizeof(req);
     // Fill the whole bdf array with non-NUL bytes (no terminator).
     std::memset(req.bdf, 'a', sizeof(req.bdf));
-    EXPECT_EQ(emu_node_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE, &req,
-                             sizeof(req), &req, sizeof(req)),
+    EXPECT_EQ(t.get().ioctl(hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE, &req,
+                            sizeof(req), &req, sizeof(req)),
               -EINVAL);
 }
 
 TEST(HotplugIoctl, UnknownFunctionInRequestUnsupported)
 {
     HotplugTree t;
-    t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
+    t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
     // Function 0 is syntactically valid but not removable.
-    EXPECT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.0"),
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.0"),
               -EOPNOTSUPP);
 }
 
 TEST(HotplugIoctl, SetSbrSleepWithoutAttachFails)
 {
     // A bare tree with no hotplug file: the injection seam reports failure.
-    emu_node_tree *tree = nullptr;
-    ASSERT_EQ(emu_node_tree_new(&tree, nullptr), 0);
-    EXPECT_EQ(emu_hotplug_set_sbr_sleep_us(tree, 0), -1);
-    cleanup_node_tree(tree);
+    NodeTree tree;
+    EXPECT_EQ(hotplugSetSbrSleepUs(tree, 0), -1);
 }
 
 // ===========================================================================
@@ -595,43 +602,42 @@ TEST(HotplugIoctl, SetSbrSleepWithoutAttachFails)
 TEST(HotplugMaterializeSeed, CollectLiveBdfsSeedsRunningSet)
 {
     HotplugTree t;
-    t.add_device("0000:61:00");
-    t.add_device("0000:62:00");
+    t.addDevice("0000:61:00");
+    t.addDevice("0000:62:00");
 
-    str_array live = str_array_init();
-    ASSERT_EQ(emu_node_tree_collect_live_bdfs(t.get(), &live), 0);
-    ASSERT_EQ(live.len, 2u);
+    std::vector<std::string> live = t.get().collectLiveBdfs();
+    ASSERT_EQ(live.size(), 2u);
 
-    // Seed a running-set from the live devices; a config that re-lists both must
-    // then select NEITHER (collision-skip), so a re-invocation never re-attaches.
-    emu_running_set *running = nullptr;
-    ASSERT_EQ(emu_running_set_new(&running), 0);
-    for (size_t i = 0; i < live.len; i++) {
-        ASSERT_EQ(emu_running_set_add(running, live.d[i]), 0);
+    // Both BDFs are present in the live set (exact values, any order).
+    bool has61 = false, has62 = false;
+    for (const auto &bdf : live) {
+        if (bdf == "0000:61:00") { has61 = true; }
+        if (bdf == "0000:62:00") { has62 = true; }
     }
-    EXPECT_TRUE(emu_running_set_contains(running, "0000:61:00"));
-    EXPECT_TRUE(emu_running_set_contains(running, "0000:62:00"));
+    EXPECT_TRUE(has61) << "0000:61:00 must be in the live set";
+    EXPECT_TRUE(has62) << "0000:62:00 must be in the live set";
 
-    cleanup_running_set(running);
-    str_array_free(&live);
+    // Seed a Config::selectNew call: a config that re-lists both must select
+    // NEITHER (collision-skip), so a re-invocation never re-attaches.
+    std::vector<const slash::emu::Accelerator *> sel =
+        Config{}.selectNew(live);
+    EXPECT_TRUE(sel.empty()) << "all live BDFs must be skipped by selectNew";
 }
 
 TEST(HotplugMaterializeSeed, RemovedFunctionDeviceStillCollectedUntilBothGone)
 {
     // A device with only one function removed is still LIVE (the spine does not
-    // mark it dead), so RESCAN must still skip it -- collect_live_bdfs reports it.
+    // mark it dead), so RESCAN must still skip it -- collectLiveBdfs reports it.
     HotplugTree t;
-    t.add_device("0000:61:00");
-    emu_ino_t hp = t.hotplug_ino();
-    ASSERT_EQ(hotplug_dev_ioctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
-                                "0000:61:00.1"),
+    t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.1"),
               0);
 
-    str_array live = str_array_init();
-    ASSERT_EQ(emu_node_tree_collect_live_bdfs(t.get(), &live), 0);
-    ASSERT_EQ(live.len, 1u);
-    EXPECT_STREQ(live.d[0], "0000:61:00");
-    str_array_free(&live);
+    std::vector<std::string> live = t.get().collectLiveBdfs();
+    ASSERT_EQ(live.size(), 1u);
+    EXPECT_EQ(live[0], "0000:61:00");
 }
 
 // ===========================================================================

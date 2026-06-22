@@ -59,9 +59,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-extern "C" {
 #include "slash/uapi/slash_abi.h"
-}
 
 namespace {
 

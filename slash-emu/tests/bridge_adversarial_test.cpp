@@ -277,12 +277,12 @@ pid_t spawn_stub(const std::string &endpoint,
         return -1;
     }
     if (pid == 0) {
-        ::setenv("SLASH_EMU_ENDPOINT", endpoint.c_str(), 1);
         for (const auto &kv : extra_env) {
             auto eq = kv.find('=');
             ::setenv(kv.substr(0, eq).c_str(), kv.substr(eq + 1).c_str(), 1);
         }
-        ::execl(SLASH_EMU_STUB_MODEL_PATH, "stub_model", (char *) nullptr);
+        ::execl(SLASH_EMU_STUB_MODEL_PATH, "stub_model", endpoint.c_str(),
+                (char *) nullptr);
         ::_exit(127);
     }
     return pid;

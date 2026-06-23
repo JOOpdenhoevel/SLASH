@@ -252,13 +252,12 @@ daemon does **not** own the address-space map (see §4).
   = AF_UNIX). Per-accelerator path ⇒ multiple models coexist (fixes the
   single-5555 limitation).
 - **Who binds:** the **model binds** (it owns the REP socket today). The
-  **daemon connects** as REQ. To make this work the model source must take
-  the endpoint from an env var / argv instead of the hard-coded literal —
-  this is a **one-line change** in both `sw_emu_tb.cpp:113` and
-  `sim.cpp:530` (template-time, so it lands in newly linked VBINs). GAP
-  G5: existing pre-linked VBINs hard-code 5555; for those the daemon must
-  fall back to a private network namespace or a `tcp` loopback port it
-  allocates per model. Recommend env var `SLASH_EMU_ENDPOINT`.
+  **daemon connects** as REQ. The model takes the endpoint as its sole CLI
+  argument (`argv[1]`) instead of the old hard-coded literal — landed in both
+  `sw_emu_tb.cpp` and `sim.cpp` (template-time, so it ships in newly linked
+  VBINs). The daemon passes `ipc://…/model.sock` on `argv[1]` when it spawns
+  the model. GAP G5 (resolved): existing pre-linked VBINs that still hard-code
+  5555 would need re-linking; no env-var fallback is provided.
 - **Endpoint location:** under the daemon's scratch dir, **not** under the
   FUSE mount (architecture: "model never sees the FUSE mount"). E.g.
   `/run/slash_emu/.scratch/<bdf>/model.sock`, dir mode 0700 owned by the
@@ -342,11 +341,12 @@ Ordered by severity.
   writes map onto 32-bit `reg`/shadow slots, and reject or split as
   appropriate. Underspecified by the architecture.
 
-- **G5 — Endpoint is hard-coded in already-built VBINs.** `tcp://*:5555`
-  is compiled into the model. New VBINs can read an env var (1-line
-  template change), but the daemon cannot assume that. Need a fallback
-  (per-model loopback port or netns) and a way to detect which dialect a
-  VBIN's model speaks. Feedback to linker (template) + daemon config.
+- **G5 (resolved) — Endpoint is hard-coded in already-built VBINs.**
+  `tcp://*:5555` used to be compiled into the model. The templates
+  (`sw_emu_tb.cpp`, `sim.cpp`) now bind the endpoint passed on `argv[1]`, and
+  the daemon passes a per-device `ipc://` path there. VBINs linked before this
+  change still hard-code 5555 and must be re-linked; the daemon provides no
+  env-var/loopback fallback for them.
 
 - **G6 — emu_manifest schema drift.** The real emu model requires
   `manifest_schema.version>=1` + `required_sections` + per-kernel
@@ -387,10 +387,10 @@ Ordered by severity.
 Ordered, with the CI stub strategy.
 
 1. **T10 first — model lifecycle + transport.** Implement VBIN unpack →
-   spawn model with `SLASH_EMU_ENDPOINT=ipc://.../model.sock` → connect
+   spawn model with `ipc://.../model.sock` passed on `argv[1]` → connect
    REQ → readiness handshake → `exit`/reap. Per-model serialized I/O
-   thread. Land the **1-line template change** in `sw_emu_tb.cpp` and
-   `sim.cpp` to honor the env var (coordinate with linker owners).
+   thread. Land the **template change** in `sw_emu_tb.cpp` and
+   `sim.cpp` to honor the CLI argument (coordinate with linker owners).
 
 2. **T8 — QDMA bridge (do before BAR; it's the clean one).** Map
    `qpair<Q>` `pwrite/pread@addr` to `populate{addr}` / `fetch
@@ -410,7 +410,7 @@ Ordered, with the CI stub strategy.
 
 4. **CI stub model.** A real synthesized `vpp_emu`/`vpp_sim` cannot run in
    CI. Ship a **stub model** modeled on `vrt_stub_server.py` but:
-   - binds `SLASH_EMU_ENDPOINT` (unix socket), not tcp:5555;
+   - binds the endpoint given on `argv[1]` (unix socket), not tcp:5555;
    - implements **both dialects** the daemon emits, so the same stub
      validates SIM-style (`reg`/`fetch scalar{addr}`/`populate{addr}`) and
      EMU-style (`call`/`read_register`/`populate{name}`) bridging;

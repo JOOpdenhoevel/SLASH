@@ -85,7 +85,7 @@ public:
      * non-contiguous reconfig write resets and is rejected with @c -EINVAL).  When
      * the archive is @c Complete the VBIN is applied: any running model is torn
      * down, the archive is unpacked to a fresh scratch dir, @c vpp_sim is forked/
-     * exec'd unsandboxed with @c SLASH_EMU_ENDPOINT set, the client connects + runs
+     * exec'd unsandboxed with the endpoint passed as @c argv[1], the client connects + runs
      * @c start, and the bar+qdma backends are attached.  The accumulation is
      * bounded; an over-cap stream is rejected with @c -EFBIG.
      *

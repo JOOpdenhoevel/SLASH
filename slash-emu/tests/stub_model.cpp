@@ -25,8 +25,8 @@
  * A real synthesized vpp_sim cannot run in CI, so this stub is the single source
  * of truth the daemon's SIM bridge is tested against.  It implements the same
  * wire protocol as sim.cpp (docs/bridge-protocol.md §2) -- byte-exact replies --
- * over a ZMQ_REP socket bound to the endpoint named in SLASH_EMU_ENDPOINT
- * (honouring G5, unlike the real model which hard-codes a fixed tcp port).
+ * over a ZMQ_REP socket bound to the endpoint passed as argv[1] (the same CLI
+ * contract the real model honours: `./vpp_sim <ZMQ URL>`).
  *
  * State: a sparse register map (addr -> u32) and a sparse byte memory map, both
  * answering reads of never-written locations as zero -- so an end-to-end
@@ -115,13 +115,14 @@ static bool parseJson(const std::string &frame, Json::Value &out)
 
 /* ---- main ---------------------------------------------------------------- */
 
-int main()
+int main(int argc, char **argv)
 {
-    const char *endpoint = std::getenv("SLASH_EMU_ENDPOINT");
-    if (endpoint == nullptr || endpoint[0] == '\0') {
-        std::fprintf(stderr, "stub_model: SLASH_EMU_ENDPOINT not set\n");
+    if (argc != 2 || argv[1][0] == '\0') {
+        std::fprintf(stderr, "Usage: %s <ZMQ URL>\n",
+                     argc > 0 ? argv[0] : "stub_model");
         return 2;
     }
+    const char *endpoint = argv[1];
 
     if (std::getenv("SLASH_EMU_STUB_NO_BIND") != nullptr) {
         /* Model that never comes up: sleep so the daemon's handshake times out,

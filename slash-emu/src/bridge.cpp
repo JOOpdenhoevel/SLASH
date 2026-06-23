@@ -274,9 +274,10 @@ struct Bridge::Impl {
     }
 
     /**
-     * fork/exec the model executable UNSANDBOXED with SLASH_EMU_ENDPOINT set and
-     * cwd at the executable's directory (the real vpp_sim loads sibling .so's by
-     * relative path).  Returns 0 on success (im.pid set), a negative errno on failure.
+     * fork/exec the model executable UNSANDBOXED with the ZMQ endpoint passed as
+     * argv[1] and cwd at the executable's directory (the real vpp_sim loads sibling
+     * .so's by relative path).  Returns 0 on success (im.pid set), a negative errno
+     * on failure.
      */
     static int spawnModel(Impl &im, const std::string &execPath)
     {
@@ -290,16 +291,14 @@ struct Bridge::Impl {
         }
         if (pid == 0) {
             /* Child: detach into its own session so a stray SIGINT/SIGHUP to the
-             * daemon's tty does not reach the model.  Then set the endpoint env,
-             * cd into the exec dir, and exec.  Any failure exits with 127. */
+             * daemon's tty does not reach the model.  Then cd into the exec dir and
+             * exec, passing the endpoint as argv[1].  Any failure exits with 127. */
             (void) ::setsid();
             if (!dir.empty() && ::chdir(dir.c_str()) != 0) {
                 ::_exit(127);
             }
-            if (::setenv("SLASH_EMU_ENDPOINT", im.endpoint.c_str(), 1) != 0) {
-                ::_exit(127);
-            }
-            char *const argv[] = { const_cast<char *>(file.c_str()), nullptr };
+            char *const argv[] = { const_cast<char *>(file.c_str()),
+                                   const_cast<char *>(im.endpoint.c_str()), nullptr };
             ::execv(file.c_str(), argv);
             ::_exit(127);
         }

@@ -22,14 +22,14 @@ under the privileged daemon (the hardened systemd transient unit is step 5).
   `vpp_sim` (`sim.cpp` binds `ZMQ_REP`) and VRT's `ZmqServer` (`ZMQ_REQ`).
 * **Endpoint:** a per-device `ipc://` unix socket under the daemon's runtime
   scratch dir, **never** under the FUSE mount (architecture: "the model never
-  sees the FUSE mount").  The path is passed to the model in the environment
-  variable **`SLASH_EMU_ENDPOINT`**.  Per `bridge-design.md` §3 / G5:
+  sees the FUSE mount").  The path is passed to the model as its sole command
+  line argument: **`./vpp_sim <ZMQ URL>`** (`argv[1]`).  Per `bridge-design.md`
+  §3 / G5:
     * **The model binds; the daemon connects.**  (`vpp_sim` owns the `REP`
       socket today.)
-    * Real pre-built `vpp_sim` hard-codes `tcp://*:5555` and ignores the env
-      var; making it honour `SLASH_EMU_ENDPOINT` is a one-line linker template
-      change tracked as G5 and is **out of T10 scope**.  The **CI stub model
-      honours `SLASH_EMU_ENDPOINT`**, which is what T10's tests drive.
+    * Both the real `vpp_sim`/`vpp_emu` (`sim.cpp` / `sw_emu_tb.cpp`) and the CI
+      stub model bind the endpoint given on `argv[1]`, so the daemon drives them
+      identically.
 * **Who waits for whom:** the daemon spawns the model, then **connects** its
   `REQ` socket.  `zmq_connect` to an `ipc://` endpoint succeeds even before the
   peer has `bind`ed (ZMQ queues the connection), so the daemon does a bounded
@@ -178,8 +178,8 @@ arrives in one chunk that classifies `COMPLETE` immediately.
   1. Tear down any model already running (a new VBIN replaces it; idempotent).
   2. Unpack the VBIN to a fresh per-device runtime scratch dir.
   3. Locate the `vpp_sim` executable inside the unpacked tree.
-  4. `fork`/`exec` it **unsandboxed**, with `SLASH_EMU_ENDPOINT=ipc://…` in the
-     environment and the cwd set to the executable's directory (the real model
+  4. `fork`/`exec` it **unsandboxed**, passing the `ipc://…` endpoint as
+     `argv[1]` and with the cwd set to the executable's directory (the real model
      loads sibling `.so`s by relative path — `device.cpp` does the same `cd`).
   5. Connect the `REQ` client and run the readiness handshake (`start`).
   6. Attach the **bar** and **qdma** backends so subsequent register/memory ops

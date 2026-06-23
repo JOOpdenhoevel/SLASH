@@ -56,8 +56,12 @@ struct slash_info {
     * Registers the qpair in a per-device registry so removal can reach it after the path is unlinked
     * The qpair object is reference-counted by both the registry and the inode, freed when both refs drop
 * `/dev/slash/<BDF>/qdma/qpair<Q>`
-  * pread, pwrite only
+  * read, write, llseek, pread, pwrite
     * Memory transfers, more or less like it has been done before
+    * No buffering, no page caching
+      * Each syscall has to reach the kernel driver/system emulation daemon directly
+    * llseek supports SEEK_SET/SEEK_CUR, but SEEK_END and st_size are unspecified
+      * the qpair is an address window, not a sized file
   * The hardware queue is a reference-counted object; its lifetime is decoupled from the inode
   * Two teardown triggers stop the queue and free the QID:
     * Cooperative: inode eviction (last close of an undisturbed qpair)
@@ -68,11 +72,12 @@ struct slash_info {
   * User (VRT) requests FD to read and/or write accelerator memory
   * VRTD issues "QPAIR_ADD" ioctl, yields queue ID `Q`
   * Opens the newly created file `/dev/slash/<BDF>/qdma/qpair<Q>`
-  * Removes the file `/dev/slash/<BDF>/qdma/qpair<Q>`
+  * Unlinks `/dev/slash/<BDF>/qdma/qpair<Q>`
   * Passes the qpair FD to the user (VRT)
   * Effect: Maintains "delete-on-last-close" AND automatic resource freeing
-  * Because the qpair is unlinked while open, it is nameless for its whole life
-  * Live qpairs thus cannot be found by walking `qdma/`; they must be tracked in a per-device registry (see above)
+  * Because the qpair is unlinked while open, it is nameless for its most of its life
+  * Each user's request for a QDMA FD creates a new queue and file
+    * The users/VRT may therefore assume that they are the only process with an FD to that file
 * VRTD prunes QDMA pairs that it finds during startup
   * Thus frees artifacts from a previous crash
 * Memory ranges (HBM banks, DDR, reconfiguration target)
@@ -97,16 +102,29 @@ struct slash_info {
 * `/dev/slash/<BDF>/bars/`
   * Directory
 * `/dev/slash/<BDF>/bars/bar<M>`
-  * File, only pread and pwrite
+  * File
     * Reads and writes the BAR M of the physical function 2
     * Only meant for register access
-    * `pread`/`pwrite` only
-    * no buffering
+    * Supports read, write, llseek, pread, pwrite
+    * no buffering, no page caching
+      * Each syscall has to reach the kernel driver/system emulation daemon directly
+      * Should therefore always be opened with `O_SYNC | O_DIRECT`
     * width == transfer size
-    * reject operations with size not in {1, 2, 4, 8} or incorrect alignment
+      * reject operations with size not in {1, 2, 4, 8} or incorrect alignment
   * Explicitly no Mmap'ing to enable kernel-side checks and easier emulation
     * Also keeps revocation cheap: every access is a file op, so removal needs only a liveness check, no PTE zapping
     * Note: The higher latency of one system call per BAR access is a cost we're willing to take
+  * Example usage pattern:
+    * Scenario: Kernel at offset 0x10000. 
+      * All registers 32 bits wide
+      * Control register at 0x10000
+      * Input parameter registers starting at 0x10004
+    * Pattern:
+      * `llseek` to 0x10004
+      * one 4-byte `write` per register
+        * Advancing the file position with each write
+      * finally, one `pwrite` to 0x10000 to start the kernel
+    * Necessitates proper synchronization within the user, of course
   * Like qpairs, BAR fds survive device removal as orphans returning `-ENODEV` until closed (see Hotplugging/Resets)
   * Size of the BAR encoded as the size of the file
 * Side note: The start address attribute has been dropped and is not reported anymore

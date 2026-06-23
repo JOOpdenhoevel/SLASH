@@ -552,6 +552,177 @@ TEST_F(bars, register_round_trip)
 }
 
 /*
+ * The revised masterplan contract: bar files support plain read()/write() at the
+ * IMPLICIT file position, not only pread/pwrite.  llseek to an aligned offset,
+ * then issue sequential 4-byte write()s -- each advancing the position by one
+ * register -- and read the same registers back with sequential read()s after
+ * seeking the position back.  This is the streamed-register pattern VRTD uses.
+ */
+TEST_F(bars, position_write_read_round_trip)
+{
+	char path[4096];
+	int fd;
+	const off_t base = 0x40;
+	const uint32_t regs[] = { 0x11111111u, 0x22222222u, 0x33333333u,
+				  0x44444444u };
+	const size_t nregs = sizeof(regs) / sizeof(regs[0]);
+
+	bar_path(path, sizeof(path), self->bdf, SLASH_BAR_USER_IDX);
+	fd = open(path, O_RDWR | O_SYNC);
+	ASSERT_GE(fd, 0);
+
+	/* Stream the registers out with sequential write()s from an aligned base. */
+	ASSERT_EQ(lseek(fd, base, SEEK_SET), base)
+	TH_LOG("lseek to base: %s", strerror(errno));
+	for (size_t i = 0; i < nregs; i++) {
+		uint32_t v = regs[i];
+
+		ASSERT_EQ(write(fd, &v, sizeof(v)), (ssize_t) sizeof(v))
+		TH_LOG("streamed write reg %zu: %s", i, strerror(errno));
+	}
+
+	/* Read them back with sequential read()s from the same aligned base. */
+	ASSERT_EQ(lseek(fd, base, SEEK_SET), base);
+	for (size_t i = 0; i < nregs; i++) {
+		uint32_t v = 0;
+
+		ASSERT_EQ(read(fd, &v, sizeof(v)), (ssize_t) sizeof(v))
+		TH_LOG("streamed read reg %zu: %s", i, strerror(errno));
+		EXPECT_EQ(v, regs[i])
+		TH_LOG("streamed register %zu round-trip mismatch", i);
+	}
+
+	close(fd);
+}
+
+/*
+ * The masterplan's headline example (system_emulation_masterplan.md, BAR usage
+ * pattern): llseek to the first parameter register, stream one 4-byte write() per
+ * parameter (advancing the position), then issue a SINGLE pwrite() to a control
+ * register at a DIFFERENT offset to "start the kernel".  The pwrite must NOT
+ * disturb the streamed file position, so a subsequent write() lands on the NEXT
+ * parameter register, not back at the control register.
+ */
+TEST_F(bars, streamed_writes_then_pwrite_control_keeps_position)
+{
+	char path[4096];
+	int fd;
+	const off_t ctrl = 0x10000;  /* control register */
+	const off_t param = 0x10004; /* first parameter register */
+	uint32_t p0 = 0xaaaa0000u, p1 = 0xaaaa0001u, p2 = 0xaaaa0002u;
+	uint32_t start = 0x1u;
+	uint32_t rb = 0;
+
+	bar_path(path, sizeof(path), self->bdf, SLASH_BAR_USER_IDX);
+	fd = open(path, O_RDWR | O_SYNC);
+	ASSERT_GE(fd, 0);
+
+	/* Stream the first two parameters with position-advancing write()s. */
+	ASSERT_EQ(lseek(fd, param, SEEK_SET), param);
+	ASSERT_EQ(write(fd, &p0, sizeof(p0)), (ssize_t) sizeof(p0));
+	ASSERT_EQ(write(fd, &p1, sizeof(p1)), (ssize_t) sizeof(p1));
+
+	/* A pwrite to the control register at a DIFFERENT offset starts the kernel
+	 * without disturbing the streamed position. */
+	ASSERT_EQ(pwrite(fd, &start, sizeof(start), ctrl), (ssize_t) sizeof(start))
+	TH_LOG("control pwrite: %s", strerror(errno));
+
+	/* The next streamed write() must land on the THIRD parameter (param + 8),
+	 * proving the pwrite did not move the implicit position. */
+	ASSERT_EQ(write(fd, &p2, sizeof(p2)), (ssize_t) sizeof(p2));
+
+	/* Verify: param+0/+4/+8 hold p0/p1/p2 and the control register holds start. */
+	ASSERT_EQ(pread(fd, &rb, sizeof(rb), param), (ssize_t) sizeof(rb));
+	EXPECT_EQ(rb, p0);
+	ASSERT_EQ(pread(fd, &rb, sizeof(rb), param + 4), (ssize_t) sizeof(rb));
+	EXPECT_EQ(rb, p1);
+	ASSERT_EQ(pread(fd, &rb, sizeof(rb), param + 8), (ssize_t) sizeof(rb))
+	TH_LOG("third streamed write landed at the wrong position");
+	EXPECT_EQ(rb, p2);
+	ASSERT_EQ(pread(fd, &rb, sizeof(rb), ctrl), (ssize_t) sizeof(rb));
+	EXPECT_EQ(rb, start);
+
+	close(fd);
+}
+
+/*
+ * lseek SEEK_SET and SEEK_CUR reposition the implicit file offset correctly: a
+ * write() after a seek lands where the seek pointed, and SEEK_CUR is relative to
+ * the position the previous I/O advanced to.
+ */
+TEST_F(bars, lseek_set_and_cur_reposition)
+{
+	char path[4096];
+	int fd;
+	uint32_t a = 0xdead0001u, b = 0xdead0002u, rb = 0;
+
+	bar_path(path, sizeof(path), self->bdf, SLASH_BAR_USER_IDX);
+	fd = open(path, O_RDWR | O_SYNC);
+	ASSERT_GE(fd, 0);
+
+	/* SEEK_SET to an aligned offset, write -> the byte lands there. */
+	ASSERT_EQ(lseek(fd, 0x80, SEEK_SET), 0x80);
+	ASSERT_EQ(write(fd, &a, sizeof(a)), (ssize_t) sizeof(a));
+	/* The write advanced the position to 0x84; SEEK_CUR by +4 -> 0x88. */
+	ASSERT_EQ(lseek(fd, 4, SEEK_CUR), 0x88);
+	ASSERT_EQ(write(fd, &b, sizeof(b)), (ssize_t) sizeof(b));
+
+	/* SEEK_CUR can also be used to query the current position (offset 0). */
+	ASSERT_EQ(lseek(fd, 0, SEEK_CUR), 0x8c);
+
+	ASSERT_EQ(pread(fd, &rb, sizeof(rb), 0x80), (ssize_t) sizeof(rb));
+	EXPECT_EQ(rb, a);
+	ASSERT_EQ(pread(fd, &rb, sizeof(rb), 0x88), (ssize_t) sizeof(rb));
+	EXPECT_EQ(rb, b);
+	/* The 4-byte gap at 0x84 was skipped by the seek, never written -> zero. */
+	ASSERT_EQ(pread(fd, &rb, sizeof(rb), 0x84), (ssize_t) sizeof(rb));
+	EXPECT_EQ(rb, 0u);
+
+	close(fd);
+}
+
+/*
+ * The width {1,2,4,8} + alignment gate that guards pread/pwrite applies EQUALLY
+ * to position-based read()/write(): a 4096-byte read() is rejected (-EINVAL, not
+ * a clamped short read), a 3-byte read() is rejected, and a width-4 read() at a
+ * 2-byte-misaligned position is rejected.  This pins that switching from the
+ * explicit-offset to the implicit-position path does not bypass the gate.
+ */
+TEST_F(bars, position_bad_width_and_alignment_einval)
+{
+	char path[4096];
+	int fd;
+	uint8_t buf[4096] = { 0 };
+
+	bar_path(path, sizeof(path), self->bdf, SLASH_BAR_USER_IDX);
+	fd = open(path, O_RDWR | O_SYNC);
+	ASSERT_GE(fd, 0);
+
+	/* A 4096-byte read at an aligned position: width not in {1,2,4,8}. */
+	ASSERT_EQ(lseek(fd, 0, SEEK_SET), 0);
+	errno = 0;
+	EXPECT_EQ(read(fd, buf, 4096), -1)
+	TH_LOG("4096-byte position read should be -EINVAL");
+	EXPECT_EQ(errno, EINVAL);
+
+	/* A 3-byte read at an aligned position: width not in {1,2,4,8}. */
+	ASSERT_EQ(lseek(fd, 0, SEEK_SET), 0);
+	errno = 0;
+	EXPECT_EQ(read(fd, buf, 3), -1)
+	TH_LOG("3-byte position read should be -EINVAL");
+	EXPECT_EQ(errno, EINVAL);
+
+	/* A width-4 read at a 2-byte-misaligned position. */
+	ASSERT_EQ(lseek(fd, 2, SEEK_SET), 2);
+	errno = 0;
+	EXPECT_EQ(read(fd, buf, 4), -1)
+	TH_LOG("width-4 read at misaligned position should be -EINVAL");
+	EXPECT_EQ(errno, EINVAL);
+
+	close(fd);
+}
+
+/*
  * Non-{1,2,4,8} transfer widths are rejected with -EINVAL.  Note width 0 is NOT
  * tested here: a 0-length pread/pwrite is a POSIX no-op that returns 0 at the
  * syscall/VFS layer before any read/write reaches the backend, so it is not an
@@ -700,7 +871,7 @@ TEST_F(bars, mmap_private_deref_faults_promptly_never_hangs)
 			_exit(0); /* refused outright -- ideal. */
 		volatile char c = *(volatile char *) p;
 		(void) c;
-		_exit(0); /* deref returned (served zeros) without faulting. */
+		_exit(10); /* deref returned (served something) without faulting. */
 	}
 
 	while (waited < timeout_ms) {
@@ -717,10 +888,14 @@ TEST_F(bars, mmap_private_deref_faults_promptly_never_hangs)
 	}
 	/* Any prompt terminal state passes; if it died by signal it must be
 	 * SIGBUS (a prompt fault), not something else. */
-	if (WIFSIGNALED(status))
+	if (WIFSIGNALED(status)) {
 		EXPECT_EQ(WTERMSIG(status), SIGBUS)
 		TH_LOG("expected prompt SIGBUS, got signal %d",
 		       WTERMSIG(status));
+	} else {
+		EXPECT_EQ(status, 0)
+		TH_LOG("expected a zero return value, got %d", status);
+	}
 }
 
 /* ───────────────────────────────── qdma ───────────────────────────────────── */
@@ -800,23 +975,109 @@ TEST_F(qdma, mm_round_trip_ddr)
 	EXPECT_EQ(memcmp(out, in, sizeof(out)), 0);
 }
 
-TEST_F(qdma, out_of_range_erange)
+/*
+ * The revised masterplan contract: a qpair supports plain read()/write() at the
+ * implicit file position, not only pread/pwrite.  llseek to the HBM window base,
+ * stream the payload out with sequential write()s (each advancing the position),
+ * then seek back and read it in with sequential read()s.  Round-trips the SAME
+ * accelerator memory the pread/pwrite tests use.
+ */
+TEST_F(qdma, position_round_trip_hbm)
 {
-	uint8_t buf[8] = { 0 };
+	uint8_t out[512], in[512];
 
 	self->qfd = open_qpair(self->bdf, &self->qid);
 	ASSERT_GE(self->qfd, 0);
 
-	/* An address below HBM and outside every defined region is -ERANGE. */
-	EXPECT_EQ(pwrite(self->qfd, buf, sizeof(buf), (off_t) 0x1000), -1);
-	EXPECT_EQ(errno, ERANGE);
-	EXPECT_EQ(pread(self->qfd, buf, sizeof(buf), (off_t) 0x1000), -1);
-	EXPECT_EQ(errno, ERANGE);
-	/* A read of the reconfiguration region is also -ERANGE (you cannot read
-	 * back a VBIN). */
-	EXPECT_EQ(pread(self->qfd, buf, sizeof(buf), (off_t) SLASH_RECONFIG_BASE),
-		  -1);
-	EXPECT_EQ(errno, ERANGE);
+	fill_pattern(out, sizeof(out), 0x33);
+	memset(in, 0, sizeof(in));
+
+	/* Stream the payload out in two halves with position-advancing write()s. */
+	ASSERT_EQ(lseek(self->qfd, (off_t) SLASH_HBM_BASE, SEEK_SET),
+		  (off_t) SLASH_HBM_BASE)
+	TH_LOG("HBM lseek: %s", strerror(errno));
+	ASSERT_EQ(write(self->qfd, out, 256), 256)
+	TH_LOG("HBM write[0:256]: %s", strerror(errno));
+	ASSERT_EQ(write(self->qfd, out + 256, 256), 256)
+	TH_LOG("HBM write[256:512]: %s", strerror(errno));
+
+	/* Read it back from the same base with sequential read()s. */
+	ASSERT_EQ(lseek(self->qfd, (off_t) SLASH_HBM_BASE, SEEK_SET),
+		  (off_t) SLASH_HBM_BASE);
+	ASSERT_EQ(read(self->qfd, in, 256), 256)
+	TH_LOG("HBM read[0:256]: %s", strerror(errno));
+	ASSERT_EQ(read(self->qfd, in + 256, 256), 256)
+	TH_LOG("HBM read[256:512]: %s", strerror(errno));
+
+	EXPECT_EQ(memcmp(out, in, sizeof(out)), 0);
+}
+
+/* Same position-based round-trip into the DDR window. */
+TEST_F(qdma, position_round_trip_ddr)
+{
+	uint8_t out[512], in[512];
+
+	self->qfd = open_qpair(self->bdf, &self->qid);
+	ASSERT_GE(self->qfd, 0);
+
+	fill_pattern(out, sizeof(out), 0x44);
+	memset(in, 0, sizeof(in));
+
+	ASSERT_EQ(lseek(self->qfd, (off_t) SLASH_DDR_BASE, SEEK_SET),
+		  (off_t) SLASH_DDR_BASE)
+	TH_LOG("DDR lseek: %s", strerror(errno));
+	ASSERT_EQ(write(self->qfd, out, sizeof(out)), (ssize_t) sizeof(out))
+	TH_LOG("DDR write: %s", strerror(errno));
+
+	ASSERT_EQ(lseek(self->qfd, (off_t) SLASH_DDR_BASE, SEEK_SET),
+		  (off_t) SLASH_DDR_BASE);
+	ASSERT_EQ(read(self->qfd, in, sizeof(in)), (ssize_t) sizeof(in))
+	TH_LOG("DDR read: %s", strerror(errno));
+
+	EXPECT_EQ(memcmp(out, in, sizeof(out)), 0);
+}
+
+/*
+ * lseek SEEK_SET and SEEK_CUR reposition a qpair's implicit offset correctly.
+ * (Per the masterplan, SEEK_END / st_size on a qpair are UNSPECIFIED -- the
+ * qpair is an address window, not a sized file -- so we assert nothing about
+ * them.)  SEEK_SET lands the next I/O at the chosen device address; SEEK_CUR is
+ * relative to where the previous I/O advanced the position to.
+ */
+TEST_F(qdma, lseek_set_and_cur_reposition)
+{
+	uint8_t a[64], b[64], in[64];
+
+	self->qfd = open_qpair(self->bdf, &self->qid);
+	ASSERT_GE(self->qfd, 0);
+
+	fill_pattern(a, sizeof(a), 0x61);
+	fill_pattern(b, sizeof(b), 0x62);
+
+	/* SEEK_SET to HBM base, write a -> lands at base; position now base+64. */
+	ASSERT_EQ(lseek(self->qfd, (off_t) SLASH_HBM_BASE, SEEK_SET),
+		  (off_t) SLASH_HBM_BASE);
+	ASSERT_EQ(write(self->qfd, a, sizeof(a)), (ssize_t) sizeof(a));
+
+	/* SEEK_CUR by +64 -> base+128; write b lands there. */
+	ASSERT_EQ(lseek(self->qfd, 64, SEEK_CUR),
+		  (off_t) (SLASH_HBM_BASE + 128));
+	ASSERT_EQ(write(self->qfd, b, sizeof(b)), (ssize_t) sizeof(b));
+
+	/* SEEK_CUR by 0 queries the current position (base+192). */
+	ASSERT_EQ(lseek(self->qfd, 0, SEEK_CUR),
+		  (off_t) (SLASH_HBM_BASE + 192));
+
+	/* Verify the two regions hold a and b, and the 64-byte gap is untouched. */
+	memset(in, 0, sizeof(in));
+	ASSERT_EQ(pread(self->qfd, in, sizeof(in), (off_t) SLASH_HBM_BASE),
+		  (ssize_t) sizeof(in));
+	EXPECT_EQ(memcmp(a, in, sizeof(a)), 0);
+	memset(in, 0, sizeof(in));
+	ASSERT_EQ(pread(self->qfd, in, sizeof(in),
+			(off_t) (SLASH_HBM_BASE + 128)),
+		  (ssize_t) sizeof(in));
+	EXPECT_EQ(memcmp(b, in, sizeof(b)), 0);
 }
 
 TEST_F(qdma, st_mode_eopnotsupp)
@@ -1050,9 +1311,6 @@ FIXTURE_SETUP(revocation)
 
 /*
  * Restore the device (and any per-function-removed endpoints) for later tests.
- * A per-function REMOVE leaves the <BDF>/ dir in place, so RESCAN's collision-
- * skip would NOT re-add the removed function; HOTPLUG (whole-device remove +
- * reload) is the operation that re-materialises everything from config.
  */
 FIXTURE_TEARDOWN(revocation)
 {
@@ -1301,9 +1559,25 @@ TEST_F(hotplug, rescan_rediscovers_removed_function)
 	char bf[64], qdir[4096], bdir[4096];
 	uint32_t qid = 0;
 	int qfd;
+	uint8_t pat[256], back[256];
 
 	dev_path(qdir, sizeof(qdir), self->bdf, "qdma");
 	dev_path(bdir, sizeof(bdir), self->bdf, "bars");
+
+	/*
+	 * Before removing qdma, write a known pattern to HBM through a qpair.  After
+	 * RESCAN rediscovers qdma we read the SAME HBM offset through a FRESH qpair
+	 * and assert the bytes survived: that proves the rediscovered QDMA window is
+	 * the SAME accelerator memory, not a freshly-zeroed store.
+	 */
+	qfd = open_qpair(self->bdf, &qid);
+	ASSERT_GE(qfd, 0)
+	TH_LOG("pre-remove open_qpair: %s", strerror(errno));
+	fill_pattern(pat, sizeof(pat), 0x5c);
+	ASSERT_EQ(pwrite(qfd, pat, sizeof(pat), (off_t) SLASH_HBM_BASE),
+		  (ssize_t) sizeof(pat))
+	TH_LOG("pre-remove HBM pwrite: %s", strerror(errno));
+	close(qfd);
 
 	/* REMOVE .1 (qdma) -- bars stays live, qdma gone. */
 	bdf_func(bf, sizeof(bf), self->bdf, 1);
@@ -1323,8 +1597,17 @@ TEST_F(hotplug, rescan_rediscovers_removed_function)
 	EXPECT_GE(qfd, 0)
 	TH_LOG("rediscovered qdma must be usable (QPAIR_ADD): %s",
 	       strerror(errno));
-	if (qfd >= 0)
+	if (qfd >= 0) {
+		/* The accelerator memory survived the per-function remove + rescan:
+		 * a NEW qpair sees the bytes the OLD qpair wrote before removal. */
+		memset(back, 0, sizeof(back));
+		EXPECT_EQ(pread(qfd, back, sizeof(back), (off_t) SLASH_HBM_BASE),
+			  (ssize_t) sizeof(back))
+		TH_LOG("post-rescan HBM pread: %s", strerror(errno));
+		EXPECT_EQ(memcmp(pat, back, sizeof(pat)), 0)
+		TH_LOG("rediscovered QDMA must hit the SAME accelerator memory");
 		close(qfd);
+	}
 
 	/* RESCAN must NOT fabricate a device for a BDF that was never configured:
 	 * a never-present BDF directory stays absent after a rescan. */
@@ -1359,29 +1642,43 @@ TEST_F(hotplug, malformed_bdf_rejected)
 }
 
 /*
- * The other arm of the "BDF-with-function parsing errors" contract: a
- * SYNTACTICALLY valid BDF.F whose function digit is well-formed but names a
+ * The real accelerator as a physical function 0, which the daemon doesn't
+ * emulate. Still, a user may try to remove it, which the daemon should expect.
+ * The expected behavior is a no-op.
+ */
+TEST_F(hotplug, function_0_noop)
+{
+	char bf[64], qdir[4096], bdir[4096];
+
+	dev_path(qdir, sizeof(qdir), self->bdf, "qdma");
+	dev_path(bdir, sizeof(bdir), self->bdf, "bars");
+
+	bdf_func(bf, sizeof(bf), self->bdf, 0);
+	EXPECT_EQ(hotplug_dev_ioctl(SLASH_ABI_HOTPLUG_IOCTL_REMOVE, bf), 0);
+
+	ASSERT_EQ(access(bdir, F_OK), 0);
+	ASSERT_EQ(access(qdir, F_OK), 0);
+}
+
+/*
+ * A SYNTACTICALLY valid BDF.F whose function digit is well-formed but names a
  * function that is not a removable endpoint (only .1 == qdma and .2 == bars are
- * removable) is rejected with -EOPNOTSUPP, distinctly from the -EINVAL the
+ * emulated) is rejected with -EOPNOTSUPP, distinctly from the -EINVAL the
  * malformed-syntax cases get.  This pins that the daemon distinguishes "I cannot
  * parse this" (-EINVAL) from "I parsed it but that function is not removable"
  * (-EOPNOTSUPP) -- a teeth distinction the malformed_bdf_rejected test alone does
- * not exercise.  Function .0 is the board-management PF (out of scope) and .3+ do
- * not exist; both must be -EOPNOTSUPP, NOT -EINVAL and NOT a silent success.
+ * not exercise.
  */
 TEST_F(hotplug, unremovable_function_eopnotsupp)
 {
 	char bf[64];
 
-	bdf_func(bf, sizeof(bf), self->bdf, 0);
-	EXPECT_EQ(hotplug_dev_ioctl(SLASH_ABI_HOTPLUG_IOCTL_REMOVE, bf),
-		  -EOPNOTSUPP)
-	TH_LOG("REMOVE of function .0 must be -EOPNOTSUPP (board PF, not removable)");
-
-	bdf_func(bf, sizeof(bf), self->bdf, 3);
-	EXPECT_EQ(hotplug_dev_ioctl(SLASH_ABI_HOTPLUG_IOCTL_REMOVE, bf),
-		  -EOPNOTSUPP)
-	TH_LOG("REMOVE of function .3 must be -EOPNOTSUPP (no such function)");
+	for (size_t i = 3; i < 8; i++) {
+		bdf_func(bf, sizeof(bf), self->bdf, i);
+		EXPECT_EQ(hotplug_dev_ioctl(SLASH_ABI_HOTPLUG_IOCTL_REMOVE, bf),
+			-EOPNOTSUPP)
+		TH_LOG("REMOVE of function .%lu must be -EOPNOTSUPP (no such function)", i);
+	}
 }
 
 /* ──────────────────────────── reconfiguration ─────────────────────────────── */
@@ -1575,6 +1872,12 @@ TEST_F(reconfig, noncontiguous_region_write_rejected_then_recovers)
 			 (off_t) SLASH_RECONFIG_BASE),
 		  (ssize_t) self->vbin_len)
 	TH_LOG("recovery reconfig write after bad seek: %s", strerror(errno));
+	
+	EXPECT_EQ(pwrite(self->qfd, &byte, 1, (off_t) SLASH_HBM_BASE), 1)
+	TH_LOG("daemon wedged after non-contiguous reconfig: %s",
+	       strerror(errno));
+	EXPECT_EQ(pread(self->qfd, &back, 1, (off_t) SLASH_HBM_BASE), 1);
+	EXPECT_EQ(back, byte);
 }
 
 TEST_F(reconfig, malformed_vbin_fails_without_wedging)

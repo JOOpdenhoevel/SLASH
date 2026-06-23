@@ -153,9 +153,23 @@ TEST(HotplugParseBdf, UnknownFunctionUnsupported)
 {
     std::string bdf;
     DeviceFunction func;
-    // Syntactically valid but not a removable function (only 1 and 2 are).
-    EXPECT_EQ(hotplugParseBdf("0000:61:00.0", bdf, func), -EOPNOTSUPP);
+    // Syntactically valid but not an emulated/removable function. Function 0 is
+    // PF0 (board management, owned by the ami driver) and parses to the Pf0
+    // sentinel (handled as a no-op by REMOVE); see Function0ParsesAsPf0. Only
+    // functions 3..7 are genuinely unsupported.
     EXPECT_EQ(hotplugParseBdf("0000:61:00.3", bdf, func), -EOPNOTSUPP);
+    EXPECT_EQ(hotplugParseBdf("0000:61:00.7", bdf, func), -EOPNOTSUPP);
+}
+
+TEST(HotplugParseBdf, Function0ParsesAsPf0)
+{
+    std::string bdf;
+    DeviceFunction func;
+    // PF0 is syntactically valid and parses successfully to the Pf0 sentinel so
+    // REMOVE can tolerate it as a no-op (the daemon does not emulate PF0).
+    EXPECT_EQ(hotplugParseBdf("0000:61:00.0", bdf, func), 0);
+    EXPECT_EQ(func, DeviceFunction::Pf0);
+    EXPECT_EQ(bdf, "0000:61:00");
 }
 
 TEST(HotplugParseBdf, MalformedBoardRejected)
@@ -582,10 +596,27 @@ TEST(HotplugIoctl, UnknownFunctionInRequestUnsupported)
     HotplugTree t;
     t.addDevice("0000:61:00");
     Ino hp = t.hotplugIno();
-    // Function 0 is syntactically valid but not removable.
+    // Functions 3..7 are syntactically valid but not removable.
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.3"),
+              -EOPNOTSUPP);
+}
+
+TEST(HotplugIoctl, Function0RemoveIsNoopSuccess)
+{
+    HotplugTree t;
+    t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
+    // PF0 (board management) is not emulated: a REMOVE of <BDF>.0 is tolerated as
+    // a no-op success and must leave the device's endpoints intact.
     EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
                               "0000:61:00.0"),
-              -EOPNOTSUPP);
+              0);
+    // The qdma/ and bars/ functions are untouched: a function-1 REMOVE still
+    // succeeds afterwards (proving the device tree was not disturbed by the .0).
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.1"),
+              0);
 }
 
 TEST(HotplugIoctl, SetSbrSleepWithoutAttachFails)

@@ -636,12 +636,14 @@ int BridgeRegistry::reattachFunction(Device &dev, DeviceFunction func)
     Bridge::Impl &im = *b->impl_;
 
     if (func == DeviceFunction::Qdma) {
-        /* The rebuilt qdma store is brand new (old store + handler were freed
-         * when the function was revoked), so ALWAYS re-install the reconfig
-         * handler.  If a model is currently running (only this function had been
-         * removed, so the model never shut down), also re-point the store's mem
-         * backend at the live model so a post-restore QDMA transfer round-trips
-         * through it again. */
+        /* The device-scoped store survives a per-function QDMA remove (its HBM/DDR
+         * contents are preserved), but the rebuilt qdma/ node's QdmaDirOps is a
+         * fresh co-owner that re-exposes that same store; re-install the reconfig
+         * handler unconditionally so the rediscovered endpoint routes reconfig
+         * writes back here (the captured bridge survived because only the function,
+         * not the whole device, was removed).  If a model is currently running,
+         * also re-point the store's mem backend at the live model so a post-restore
+         * QDMA transfer round-trips through it again. */
         QdmaReconfigFn reconfigFn = [b](uint64_t addr, const void *data,
                                         size_t len) -> int {
             auto sp = std::span<const std::byte>(

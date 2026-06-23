@@ -117,6 +117,16 @@ static int doRemove(NodeTree &tree, const void *in, size_t in_size)
         return rc;
     }
 
+    /*
+     * PF0 (board management, owned by the ami driver) is not emulated: a REMOVE of
+     * a syntactically-valid <BDF>.0 is tolerated as a no-op success and must change
+     * nothing in the tree.  Short-circuit before the spine's per-function revoke,
+     * which accepts only the QDMA / BARS functions.
+     */
+    if (func == DeviceFunction::Pf0) {
+        return 0;
+    }
+
     if (tree.revokeFunction(bdf, func) == -1) {
         return -EINVAL;
     }
@@ -354,6 +364,12 @@ int hotplugParseBdf(const std::string &input, std::string &bdf_out,
     bdf_out = std::move(*normalized);
 
     switch (func_char) {
+    case '0':
+        /* PF0 is board management owned by the ami driver; the daemon does not
+         * emulate it.  A syntactically-valid <BDF>.0 parses to the Pf0 sentinel
+         * so REMOVE can treat it as a tolerated no-op (see doRemove). */
+        func_out = DeviceFunction::Pf0;
+        return 0;
     case '1':
         func_out = DeviceFunction::Qdma;
         return 0;
@@ -362,7 +378,7 @@ int hotplugParseBdf(const std::string &input, std::string &bdf_out,
         return 0;
     default:
         LOG(LOG_ERR,
-            "Hotplug BDF '%s' function %c is not removable (expect 1 or 2)",
+            "Hotplug BDF '%s' function %c is not removable (expect 0, 1 or 2)",
             input.c_str(), func_char);
         return -EOPNOTSUPP;
     }

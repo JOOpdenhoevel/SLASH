@@ -851,6 +851,14 @@ int NodeTree::revokeDevice(const std::string &bdf)
         dev->qdma = nullptr;
 
         /*
+         * The device-scoped QDMA memory store survives a per-function QDMA remove
+         * (so a REMOVE+RESCAN of function 1 preserves HBM/DDR), but a whole-device
+         * revoke is the real teardown: drop the device's reference here.  Any
+         * still-open qpair fd keeps its own co-owning copy until its last close.
+         */
+        dev->qdmaStore.reset();
+
+        /*
          * 3. A whole-device revoke removes both functions at once; mark them
          *    removed and fire the model-shutdown seam exactly once (TOGGLE_SBR /
          *    HOTPLUG / full teardown all funnel through here).

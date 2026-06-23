@@ -40,15 +40,25 @@
 
 #include "qdma.hpp"
 
-#include <array>
 #include <cstring>
 #include <memory>
-#include <unordered_map>
 
+#include "node.hpp"
+#include "qdma_store.hpp"
 #include "slash/uapi/slash_abi.h"
 #include "utils.hpp"
 
 namespace slash::emu {
+
+/* ================================================================== */
+/* Device destructor (defined here, where QdmaStore is complete)      */
+/* ================================================================== */
+
+/*
+ * Out-of-line so the device-scoped shared_ptr<QdmaStore> member (forward-declared
+ * in node.hpp) destructs against the complete type defined in qdma_store.hpp.
+ */
+Device::~Device() = default;
 
 namespace {
 
@@ -63,90 +73,6 @@ constexpr uint32_t kModeSt = 1u;
 constexpr uint32_t kDirH2c = 0x1u;
 constexpr uint32_t kDirC2h = 0x2u;
 constexpr uint32_t kDirCmpt = 0x4u;
-
-/*
- * Sparse memory store page size.  Device memory (32 GiB HBM + 32 GiB DDR) is far
- * too large to allocate, so the store is a paged, lazily-populated map: each
- * touched 64 KiB page is allocated on first write and zero-filled.  64 KiB keeps
- * the page table small while not wasting much on a single-byte poke.
- */
-constexpr size_t kPageSize = 64u * 1024u;
-
-/* ================================================================== */
-/* Per-device sparse memory store                                     */
-/* ================================================================== */
-
-/*
- * The per-device sparse store: the page table plus the optional SIM bridge seam.
- * Held by a std::shared_ptr co-owned by the qdma/ directory ops and every qpair
- * of the device (one store per device, shared by every qpair).  Mutated only from
- * the ioctl/read/write hooks, which the spine invokes with the tree lock held, so
- * it needs no locking of its own.
- *
- * A page is a lazily-allocated, zero-initialised 64 KiB block keyed by its
- * page-aligned device address; std::unordered_map both owns the pages (RAII, no
- * explicit free) and gives O(1) lookup, replacing the C linear-scan page array.
- */
-struct QdmaStore {
-    std::unordered_map<uint64_t, std::array<uint8_t, kPageSize>> pages;
-
-    /* SIM memory-bridge seam.  Null => in-memory sparse store only. */
-    QdmaMemBackend *backend = nullptr; /* borrowed, static */
-
-    /* Reconfiguration seam: a write into the reconfig region is a VBIN. */
-    QdmaReconfigFn reconfig; /* empty => no reconfig handler attached */
-
-    /* Copy `len` bytes out of the store starting at device address `addr` into
-     * `dst`, treating never-written pages as zero.  Range is pre-validated. */
-    void read(uint64_t addr, void *dst, size_t len) const
-    {
-        auto *out = static_cast<uint8_t *>(dst);
-        size_t done = 0;
-
-        while (done < len) {
-            uint64_t cur = addr + done;
-            uint64_t base = cur - (cur % kPageSize);
-            size_t in_page = static_cast<size_t>(cur - base);
-            size_t chunk = kPageSize - in_page;
-            if (chunk > len - done) {
-                chunk = len - done;
-            }
-
-            auto it = pages.find(base);
-            if (it == pages.end()) {
-                std::memset(out + done, 0, chunk); /* never written: zero */
-            } else {
-                std::memcpy(out + done, it->second.data() + in_page, chunk);
-            }
-
-            done += chunk;
-        }
-    }
-
-    /* Copy `len` bytes from `src` into the store starting at device address
-     * `addr`, allocating zero-filled pages on demand.  Range is pre-validated. */
-    void write(uint64_t addr, const void *src, size_t len)
-    {
-        const auto *in = static_cast<const uint8_t *>(src);
-        size_t done = 0;
-
-        while (done < len) {
-            uint64_t cur = addr + done;
-            uint64_t base = cur - (cur % kPageSize);
-            size_t in_page = static_cast<size_t>(cur - base);
-            size_t chunk = kPageSize - in_page;
-            if (chunk > len - done) {
-                chunk = len - done;
-            }
-
-            /* operator[] value-initialises (zero-fills) a fresh page. */
-            auto &page = pages[base];
-            std::memcpy(page.data() + in_page, in + done, chunk);
-
-            done += chunk;
-        }
-    }
-};
 
 } // namespace
 
@@ -394,10 +320,6 @@ public:
     {
     }
 
-    /* The store is reachable from the dir node's ops so qdmaSetMemBackend /
-     * qdmaSetReconfigHandler can wire the SIM seams after attach. */
-    QdmaStore &store() { return *store_; }
-
     /* QPAIR_ADD ioctl handler on the qdma/ directory node. */
     int ioctl(Node &, unsigned int cmd, const void *in, size_t in_size,
               void *out, size_t out_size) override
@@ -586,19 +508,9 @@ private:
     }
 
     Device &dev_;                      /* the owning device (non-owning ref) */
-    std::shared_ptr<QdmaStore> store_; /* co-owned (one per device) */
+    std::shared_ptr<QdmaStore> store_; /* co-owned (the device's per-device store) */
     uint32_t next_qid_ = 0;            /* monotonic allocation hint */
 };
-
-/* Reach the qdma/ dir node's QdmaDirOps for a device, or nullptr if the endpoint
- * is not attached (or already torn down -- dev.qdma NULLed by revokeFunction). */
-QdmaDirOps *dirOps(Device &dev)
-{
-    if (dev.qdma == nullptr || !dev.qdma->ops) {
-        return nullptr;
-    }
-    return dynamic_cast<QdmaDirOps *>(dev.qdma->ops.get());
-}
 
 } // namespace
 
@@ -612,14 +524,25 @@ int qdmaAttach(Device &dev)
         return -1;
     }
 
-    auto store = std::make_shared<QdmaStore>();
+    /*
+     * The sparse memory store lives at device scope so a per-function QDMA
+     * REMOVE+RESCAN preserves HBM/DDR: the first attach allocates it; a re-attach
+     * after a per-function remove (revokeFunction destroyed the qdma/ node and its
+     * QdmaDirOps co-owner, but left dev.qdmaStore intact) REUSES the same store, so
+     * the rediscovered endpoint sees the same memory.  A whole-device revoke clears
+     * dev.qdmaStore, so a fresh device after teardown starts with zeroed memory.
+     */
+    if (dev.qdmaStore == nullptr) {
+        dev.qdmaStore = std::make_shared<QdmaStore>();
+    }
 
-    /* Attach the ioctl vtable + the store onto the qdma/ dir node, which
-     * addDevice already created.  From here the node owns the ops (and, through
-     * it, the directory's shared_ptr to the store) and frees them when the node
-     * is destroyed. */
+    /* Attach the ioctl vtable onto the qdma/ dir node, which addDevice already
+     * created, co-owning the device's store.  From here the node owns the ops (and,
+     * through it, a co-owning shared_ptr to the store) and frees them when the node
+     * is destroyed; the device's reference is what keeps the store alive across a
+     * per-function remove. */
     if (dev.tree().setOps(dev.qdma,
-                          std::make_unique<QdmaDirOps>(dev, std::move(store))) ==
+                          std::make_unique<QdmaDirOps>(dev, dev.qdmaStore)) ==
         -1) {
         LOG(LOG_ERR, "Failed to attach qdma ops for '%s'", dev.bdf().c_str());
         return -1;
@@ -630,27 +553,27 @@ int qdmaAttach(Device &dev)
 
 int qdmaSetMemBackend(Device &dev, QdmaMemBackend *backend)
 {
-    /* The qdma/ dir node owns the store; reach it through the ops the endpoint
-     * attached.  NULL means the endpoint was not attached (or already torn down)
-     * -- nothing to wire a backend onto. */
-    QdmaDirOps *d = dirOps(dev);
-    if (d == nullptr) {
+    /* The SIM seams live on the device-scoped store (shared by the qdma/ dir ops
+     * and every qpair).  Target the store directly rather than the dir ops: it
+     * survives a per-function QDMA remove, so the bridge can still detach a backend
+     * (e.g. during model teardown) after the qdma/ node is gone.  A null store
+     * means the device was fully revoked -- nothing to wire onto. */
+    if (dev.qdmaStore == nullptr) {
         return -1;
     }
 
-    d->store().backend = backend;
+    dev.qdmaStore->backend = backend;
 
     return 0;
 }
 
 int qdmaSetReconfigHandler(Device &dev, QdmaReconfigFn handler)
 {
-    QdmaDirOps *d = dirOps(dev);
-    if (d == nullptr) {
+    if (dev.qdmaStore == nullptr) {
         return -1;
     }
 
-    d->store().reconfig = std::move(handler);
+    dev.qdmaStore->reconfig = std::move(handler);
 
     return 0;
 }

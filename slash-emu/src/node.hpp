@@ -130,6 +130,16 @@ class Resource;
 class NodeTree;
 
 /**
+ * @brief The per-device QDMA sparse memory store (defined in @ref qdma_store.hpp).
+ *
+ * Forward-declared here so a @ref Device can own one at device scope via a
+ * @c std::shared_ptr without the spine depending on the QDMA endpoint's internals.
+ * The store survives a single-function QDMA REMOVE+RESCAN (it is owned by the
+ * device, not the destroyed @c qdma/ node) and is freed on a whole-device revoke.
+ */
+struct QdmaStore;
+
+/**
  * @brief A removable PCI function of an accelerator (hotplug REMOVE granularity).
  *
  * The ABI maps PCI function 1 to the QDMA endpoint subtree (@c qdma/) and
@@ -139,6 +149,11 @@ class NodeTree;
  * (@ref NodeTree::revokeDevice).
  */
 enum class DeviceFunction : unsigned {
+    Pf0 = 0,  /**< PCI function 0: board management, owned by the @c ami driver.
+                   The daemon does not emulate it and exposes no subtree for it; a
+                   REMOVE of @c <BDF>.0 is tolerated as a no-op (it changes nothing
+                   in the tree).  Never passed to the spine's per-function revoke /
+                   restore, which accept only @ref Qdma / @ref Bars. */
     Qdma = 1, /**< PCI function 1: the @c qdma/ subtree. */
     Bars = 2, /**< PCI function 2: the @c bars/ subtree. */
 };
@@ -458,6 +473,11 @@ public:
      */
     Device(NodeTree &tree, std::string bdf);
 
+    /* Out-of-line (defined in qdma.cpp, where QdmaStore is complete) so the
+     * device-scoped shared_ptr<QdmaStore> member can destruct against a complete
+     * type despite QdmaStore being only forward-declared here. */
+    ~Device();
+
     Device(const Device &) = delete;
     Device &operator=(const Device &) = delete;
 
@@ -473,6 +493,21 @@ public:
     Node *bars = nullptr;
     /** @brief The @c <BDF>/qdma/ directory node (non-owning). */
     Node *qdma = nullptr;
+
+    /**
+     * @brief The per-device QDMA sparse memory store (HBM/DDR contents).
+     *
+     * Owned at @em device scope so it survives a single-function QDMA
+     * REMOVE+RESCAN: @ref NodeTree::revokeFunction tears down the @c qdma/ node
+     * (and its @ref QdmaDirOps co-owner) but leaves this reference intact, so the
+     * rediscovered endpoint (@ref qdmaAttach) reuses the same memory.  Allocated
+     * lazily by @ref qdmaAttach (the first attach creates it; a re-attach after a
+     * per-function remove reuses it).  Freed on a whole-device revoke
+     * (@ref NodeTree::revokeDevice clears it).  The @c qdma/ ops and every qpair
+     * also co-own it through their own @c shared_ptr copies, so it additionally
+     * outlives an open qpair fd across the remove.
+     */
+    std::shared_ptr<QdmaStore> qdmaStore;
 
     /** @brief False once the device has been revoked (forced removal). */
     bool live = true;

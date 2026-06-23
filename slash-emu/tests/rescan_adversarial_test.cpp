@@ -472,8 +472,9 @@ TEST(RescanAdvLifecycle, ManyQdmaCyclesNoLeakStaysUsable)
     Device *dev = t.addDevice("0000:61:00");
 
     for (int i = 0; i < 25; i++) {
-        // Add a qpair, then remove the function (tears down the qpair + store),
-        // then restore (fresh store) and round-trip on a brand-new qpair.
+        // Add a qpair, then remove the function (tears down the qpair; the
+        // device-scoped store SURVIVES, see QdmaMemorySurvivesFunctionRemove),
+        // then restore and round-trip on a brand-new qpair.
         (void) add_qpair(t.get(), dev);
         t.remove("0000:61:00", DeviceFunction::Qdma);
         EXPECT_FALSE(resolves(t.get(), dev->dir->ino, "qdma")) << "i=" << i;
@@ -501,6 +502,415 @@ TEST(RescanAdvLifecycle, ManyQdmaCyclesNoLeakStaysUsable)
             << "i=" << i;
         EXPECT_EQ(r, w) << "i=" << i;
     }
+}
+
+// GAP 2 regression: a single-function QDMA REMOVE + RESCAN must PRESERVE device
+// memory (HBM/DDR).  The masterplan: a single-function REMOVE leaves the model
+// running and only tears down once BOTH functions are gone, so device memory must
+// survive a .1 REMOVE+RESCAN.  Before the fix the store was co-owned only by the
+// qdma/ dir ops + qpairs, so revokeFunction(Qdma) dropped it and qdmaAttach
+// rebuilt a fresh zeroed store; this writes a pattern, removes only fn1, restores
+// it, and asserts a fresh qpair reads back the SAME bytes (would be zeros if the
+// store had been dropped).
+TEST(RescanAdvLifecycle, QdmaMemorySurvivesFunctionRemove)
+{
+    AdvTree t;
+    Device *dev = t.addDevice("0000:61:00");
+
+    // Write a recognisable pattern into HBM and DDR through a qpair, across page
+    // boundaries to exercise more than one sparse page.
+    uint32_t q1 = add_qpair(t.get(), dev);
+    Node *qp1 = nullptr;
+    {
+        char qname[32];
+        std::snprintf(qname, sizeof(qname), "qpair%u", q1);
+        ASSERT_EQ(t.get().lookupChild(dev->qdma->ino, qname, &qp1), 0);
+        ASSERT_NE(qp1, nullptr);
+    }
+
+    const off_t hbm_off = static_cast<off_t>(SLASH_HBM_BASE + 65536 - 16);
+    const off_t ddr_off = static_cast<off_t>(SLASH_DDR_BASE + 4096);
+    std::vector<uint8_t> hbm_w(64), ddr_w(48);
+    for (size_t i = 0; i < hbm_w.size(); i++) {
+        hbm_w[i] = static_cast<uint8_t>(0xA0 + i);
+    }
+    for (size_t i = 0; i < ddr_w.size(); i++) {
+        ddr_w[i] = static_cast<uint8_t>(i * 7 + 3);
+    }
+    ASSERT_EQ(t.get().pwrite(qp1->ino,
+                             reinterpret_cast<const char *>(hbm_w.data()),
+                             hbm_w.size(), hbm_off),
+              (ssize_t) hbm_w.size());
+    ASSERT_EQ(t.get().pwrite(qp1->ino,
+                             reinterpret_cast<const char *>(ddr_w.data()),
+                             ddr_w.size(), ddr_off),
+              (ssize_t) ddr_w.size());
+
+    // Remove ONLY function 1 (qdma): the qpair is torn down, but the device
+    // survives (function 2 is still live) and so must the memory store.
+    t.remove("0000:61:00", DeviceFunction::Qdma);
+    EXPECT_FALSE(resolves(t.get(), dev->dir->ino, "qdma"));
+    EXPECT_TRUE(resolves(t.get(), dev->dir->ino, "bars"))
+        << "fn2 must stay live -> device (and its memory) survives";
+
+    // RESCAN: restore fn1 and re-attach the endpoint (reuses the surviving store).
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma));
+    ASSERT_TRUE(resolves(t.get(), dev->dir->ino, "qdma"));
+
+    // A BRAND-NEW qpair on the rediscovered endpoint must see the SAME bytes.
+    uint32_t q2 = add_qpair(t.get(), dev);
+    Node *qp2 = nullptr;
+    {
+        char qname[32];
+        std::snprintf(qname, sizeof(qname), "qpair%u", q2);
+        ASSERT_EQ(t.get().lookupChild(dev->qdma->ino, qname, &qp2), 0);
+        ASSERT_NE(qp2, nullptr);
+    }
+
+    std::vector<uint8_t> hbm_r(hbm_w.size(), 0), ddr_r(ddr_w.size(), 0);
+    ASSERT_EQ(t.get().pread(qp2->ino, reinterpret_cast<char *>(hbm_r.data()),
+                            hbm_r.size(), hbm_off),
+              (ssize_t) hbm_r.size());
+    ASSERT_EQ(t.get().pread(qp2->ino, reinterpret_cast<char *>(ddr_r.data()),
+                            ddr_r.size(), ddr_off),
+              (ssize_t) ddr_r.size());
+    EXPECT_EQ(hbm_r, hbm_w) << "HBM contents must survive a per-function remove";
+    EXPECT_EQ(ddr_r, ddr_w) << "DDR contents must survive a per-function remove";
+}
+
+// Complement: a WHOLE-device teardown frees the store; a freshly re-materialized
+// device with the same BDF must start from ZEROED memory (no stale carry-over).
+TEST(RescanAdvLifecycle, QdmaMemoryClearedOnWholeDeviceRevoke)
+{
+    AdvTree t;
+    Device *dev = t.addDevice("0000:61:00");
+
+    uint32_t q1 = add_qpair(t.get(), dev);
+    Node *qp1 = nullptr;
+    {
+        char qname[32];
+        std::snprintf(qname, sizeof(qname), "qpair%u", q1);
+        ASSERT_EQ(t.get().lookupChild(dev->qdma->ino, qname, &qp1), 0);
+        ASSERT_NE(qp1, nullptr);
+    }
+    std::vector<uint8_t> w(32, 0x5A);
+    ASSERT_EQ(t.get().pwrite(qp1->ino, reinterpret_cast<const char *>(w.data()),
+                             w.size(), (off_t) SLASH_HBM_BASE),
+              (ssize_t) w.size());
+
+    // Whole-device revoke (both functions) frees the device-scoped store.
+    ASSERT_EQ(t.get().revokeDevice("0000:61:00"), 0);
+
+    // Re-materialize the same BDF: a fresh device + fresh (zeroed) store.
+    Device *dev2 = t.addDevice("0000:61:00");
+    ASSERT_NE(dev2, nullptr);
+    uint32_t q2 = add_qpair(t.get(), dev2);
+    Node *qp2 = nullptr;
+    {
+        char qname[32];
+        std::snprintf(qname, sizeof(qname), "qpair%u", q2);
+        ASSERT_EQ(t.get().lookupChild(dev2->qdma->ino, qname, &qp2), 0);
+        ASSERT_NE(qp2, nullptr);
+    }
+    std::vector<uint8_t> r(w.size(), 0xFF);
+    ASSERT_EQ(t.get().pread(qp2->ino, reinterpret_cast<char *>(r.data()),
+                            r.size(), (off_t) SLASH_HBM_BASE),
+              (ssize_t) r.size());
+    EXPECT_EQ(r, std::vector<uint8_t>(w.size(), 0))
+        << "whole-device revoke must drop the store -> fresh device reads zeros";
+}
+
+// ===========================================================================
+// ADVERSARY (device-scoped store): lifetime, seam re-wiring, isolation, detach.
+//
+// These attack the gaps the implementer's two regression tests did not cover:
+//   - the store outliving an OPEN qpair handle ACROSS a per-function remove
+//     (qpair co-ownership), and that surviving handle still reading the bytes;
+//   - the SIM mem-backend and reconfig handler being re-wired to the SAME
+//     surviving store after REMOVE+RESCAN (not a stale/wrong store);
+//   - detach (qdmaSetMemBackend(nullptr)) after the qdma node is gone;
+//   - two-device isolation (A's REMOVE+RESCAN must not touch B's store);
+//   - qdmaSetMemBackend/Reconfig return contract vs. store lifetime.
+// ===========================================================================
+
+namespace {
+
+// Resolve the qpair<qid> file node under a device's qdma/ dir (nullptr on miss).
+Node *qpair_node(NodeTree &tree, Device *dev, uint32_t qid)
+{
+    char qname[32];
+    std::snprintf(qname, sizeof(qname), "qpair%u", qid);
+    Node *n = nullptr;
+    if (dev->qdma == nullptr || tree.lookupChild(dev->qdma->ino, qname, &n) != 0) {
+        return nullptr;
+    }
+    return n;
+}
+
+// A recording mem-backend: every fetch falls through to the sparse store (rc>0)
+// and every populate succeeds, but both bump a per-instance counter so a test can
+// prove WHICH backend a transfer reached after a rescan.
+struct CountingBackend : slash::emu::QdmaMemBackend {
+    std::atomic<int> fetches{0};
+    std::atomic<int> populates{0};
+    int fetch(uint64_t, void *, size_t) override
+    {
+        fetches++;
+        return 1; // fall back to the sparse store (defined bytes)
+    }
+    int populate(uint64_t, const void *, size_t) override
+    {
+        populates++;
+        return 0;
+    }
+};
+
+} // namespace
+
+// GAP: the store must outlive an OPEN qpair handle across a per-function remove.
+// revokeFunction(Qdma) tears down the qdma/ node + its QdmaDirOps co-owner, but a
+// qpair captured a SECOND co-owning shared_ptr; the device reference also survives
+// (fn2 still live). Even after the node is gone the captured QpairOps still points
+// at live, un-freed store memory -- ASan would flag a UAF if the store had been
+// dropped. We hold the qpair Node* across the remove and read back the pattern.
+TEST(RescanAdvStore, StoreSurvivesOpenQpairAcrossFunctionRemove)
+{
+    AdvTree t;
+    Device *dev = t.addDevice("0000:61:00");
+
+    uint32_t q1 = add_qpair(t.get(), dev);
+    Node *qp1 = qpair_node(t.get(), dev, q1);
+    ASSERT_NE(qp1, nullptr);
+
+    std::vector<uint8_t> w(40);
+    for (size_t i = 0; i < w.size(); i++) {
+        w[i] = static_cast<uint8_t>(0x30 + i);
+    }
+    const off_t off = static_cast<off_t>(SLASH_HBM_BASE + 128);
+    ASSERT_EQ(t.get().pwrite(qp1->ino, reinterpret_cast<const char *>(w.data()),
+                             w.size(), off),
+              (ssize_t) w.size());
+
+    // Remove ONLY fn1: the qdma/ node + its dir-ops co-owner are destroyed. The
+    // qpair Node itself is unlinked/dead, so a read now must report -ENODEV (the
+    // handle was revoked) -- but the BACKING STORE must NOT have been freed (a
+    // double-free / UAF here is what ASan catches if device-scope regressed).
+    t.remove("0000:61:00", DeviceFunction::Qdma);
+    EXPECT_TRUE(resolves(t.get(), dev->dir->ino, "bars"))
+        << "fn2 keeps the device (and thus the store) alive";
+
+    std::vector<uint8_t> r(w.size(), 0xFF);
+    ssize_t rc = t.get().pread(qp1->ino, reinterpret_cast<char *>(r.data()),
+                               r.size(), off);
+    EXPECT_EQ(rc, -ENODEV) << "the revoked qpair handle must be -ENODEV";
+
+    // Restore + a fresh qpair: the SAME bytes must be there (store survived).
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma));
+    uint32_t q2 = add_qpair(t.get(), dev);
+    Node *qp2 = qpair_node(t.get(), dev, q2);
+    ASSERT_NE(qp2, nullptr);
+    std::fill(r.begin(), r.end(), 0xFF);
+    ASSERT_EQ(t.get().pread(qp2->ino, reinterpret_cast<char *>(r.data()),
+                            r.size(), off),
+              (ssize_t) w.size());
+    EXPECT_EQ(r, w) << "store must survive both the open handle and the rescan";
+}
+
+// GAP: after REMOVE + RESCAN the SIM mem-backend must be re-installable onto the
+// SURVIVING store and a transfer on a fresh qpair must reach THAT backend. Before
+// device-scope, qdmaSetMemBackend wired the (now-stale) dir-ops; here we prove it
+// targets the live store the new qpair actually uses.
+TEST(RescanAdvStore, MemBackendReWiredToSurvivingStoreAfterRescan)
+{
+    AdvTree t;
+    Device *dev = t.addDevice("0000:61:00");
+
+    CountingBackend be;
+    ASSERT_EQ(slash::emu::qdmaSetMemBackend(*dev, &be), 0);
+
+    // REMOVE fn1 then RESCAN: dir-ops co-owner is gone, store survives.
+    t.remove("0000:61:00", DeviceFunction::Qdma);
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma));
+
+    // The backend pointer lives on the store, which survived, so it is STILL
+    // attached after rescan with no re-install -- a transfer must reach it.
+    uint32_t q = add_qpair(t.get(), dev);
+    Node *qp = qpair_node(t.get(), dev, q);
+    ASSERT_NE(qp, nullptr);
+
+    uint8_t byte = 0x77;
+    const off_t off = static_cast<off_t>(SLASH_DDR_BASE + 256);
+    ASSERT_EQ(t.get().pwrite(qp->ino, reinterpret_cast<const char *>(&byte), 1,
+                             off),
+              1);
+    uint8_t rb = 0;
+    ASSERT_EQ(t.get().pread(qp->ino, reinterpret_cast<char *>(&rb), 1, off), 1);
+    EXPECT_GE(be.populates.load(), 1)
+        << "write must reach the surviving store's backend after rescan";
+    EXPECT_GE(be.fetches.load(), 1)
+        << "read must reach the surviving store's backend after rescan";
+    EXPECT_EQ(rb, byte) << "fall-through to the surviving sparse store";
+}
+
+// GAP: detach (qdmaSetMemBackend(nullptr)) AFTER a per-function qdma remove must
+// behave -- the store survives so the bridge can still clear a stale backend even
+// though the qdma/ node is gone. It must return 0 (store present) and leave the
+// store usable; a re-attach + rescan must observe the detached (null) backend.
+TEST(RescanAdvStore, MemBackendDetachAfterNodeGoneSucceeds)
+{
+    AdvTree t;
+    Device *dev = t.addDevice("0000:61:00");
+
+    CountingBackend be;
+    ASSERT_EQ(slash::emu::qdmaSetMemBackend(*dev, &be), 0);
+
+    // Node gone, store alive: detach must succeed against the device-scoped store.
+    t.remove("0000:61:00", DeviceFunction::Qdma);
+    EXPECT_EQ(slash::emu::qdmaSetMemBackend(*dev, nullptr), 0)
+        << "detach must target the surviving store, not the dead node";
+
+    // After rescan the backend stays detached: a transfer must NOT reach `be`.
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma));
+    uint32_t q = add_qpair(t.get(), dev);
+    Node *qp = qpair_node(t.get(), dev, q);
+    ASSERT_NE(qp, nullptr);
+    uint8_t byte = 0x5C;
+    const off_t off = static_cast<off_t>(SLASH_HBM_BASE + 64);
+    ASSERT_EQ(t.get().pwrite(qp->ino, reinterpret_cast<const char *>(&byte), 1,
+                             off),
+              1);
+    EXPECT_EQ(be.populates.load(), 0)
+        << "a detached backend must not see post-rescan transfers";
+}
+
+// GAP: store-lifetime return contract. qdmaSetMemBackend / qdmaSetReconfigHandler
+// return 0 as long as the device-scoped store exists (even after a per-function
+// remove), and -1 ONLY after a whole-device revoke drops the store.
+TEST(RescanAdvStore, SeamSettersReturnContractVsStoreLifetime)
+{
+    AdvTree t;
+    Device *dev = t.addDevice("0000:61:00");
+
+    CountingBackend be;
+    EXPECT_EQ(slash::emu::qdmaSetMemBackend(*dev, &be), 0) << "attached: store live";
+    EXPECT_EQ(slash::emu::qdmaSetReconfigHandler(
+                  *dev, [](uint64_t, const void *, size_t) { return 0; }),
+              0);
+
+    // Per-function remove keeps the store -> setters still succeed.
+    t.remove("0000:61:00", DeviceFunction::Qdma);
+    EXPECT_EQ(slash::emu::qdmaSetMemBackend(*dev, &be), 0)
+        << "store survives a per-function remove";
+    EXPECT_EQ(slash::emu::qdmaSetReconfigHandler(
+                  *dev, [](uint64_t, const void *, size_t) { return 0; }),
+              0);
+
+    // Whole-device revoke drops the store -> setters must report -1.
+    ASSERT_EQ(t.get().revokeDevice("0000:61:00"), 0);
+    EXPECT_EQ(slash::emu::qdmaSetMemBackend(*dev, &be), -1)
+        << "no store after whole-device revoke";
+    EXPECT_EQ(slash::emu::qdmaSetReconfigHandler(
+                  *dev, [](uint64_t, const void *, size_t) { return 0; }),
+              -1);
+}
+
+// GAP: the reconfig handler must be re-wired to the SURVIVING store after rescan.
+// A reconfig write (range wholly inside the reconfig region) routes to the store's
+// handler; after REMOVE+RESCAN, with no manual re-install, the handler must still
+// fire (and see the bytes) because it lives on the device-scoped store.
+TEST(RescanAdvStore, ReconfigHandlerReWiredToSurvivingStoreAfterRescan)
+{
+    AdvTree t;
+    Device *dev = t.addDevice("0000:61:00");
+
+    std::atomic<int> calls{0};
+    std::vector<uint8_t> seen;
+    ASSERT_EQ(slash::emu::qdmaSetReconfigHandler(
+                  *dev,
+                  [&](uint64_t, const void *p, size_t n) {
+                      calls++;
+                      const auto *b = static_cast<const uint8_t *>(p);
+                      seen.assign(b, b + n);
+                      return 0;
+                  }),
+              0);
+
+    t.remove("0000:61:00", DeviceFunction::Qdma);
+    ASSERT_TRUE(t.restore(dev, DeviceFunction::Qdma));
+
+    uint32_t q = add_qpair(t.get(), dev);
+    Node *qp = qpair_node(t.get(), dev, q);
+    ASSERT_NE(qp, nullptr);
+
+    std::vector<uint8_t> vbin{0xDE, 0xAD, 0xBE, 0xEF};
+    ASSERT_EQ(t.get().pwrite(qp->ino,
+                             reinterpret_cast<const char *>(vbin.data()),
+                             vbin.size(), (off_t) SLASH_RECONFIG_BASE),
+              (ssize_t) vbin.size());
+    EXPECT_EQ(calls.load(), 1)
+        << "reconfig handler must survive the rescan via the device store";
+    EXPECT_EQ(seen, vbin);
+}
+
+// GAP: two-device isolation. Device A's REMOVE+RESCAN must not touch device B's
+// store: distinct shared_ptrs, distinct page tables. We pattern both, churn A, and
+// require B's bytes (and A's, post-restore) to be exactly what each device wrote.
+TEST(RescanAdvStore, TwoDeviceStoreIsolationAcrossRescan)
+{
+    AdvTree t;
+    Device *a = t.addDevice("0000:61:00");
+    Device *b = t.addDevice("0000:62:00");
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    ASSERT_NE(a->qdmaStore.get(), b->qdmaStore.get())
+        << "each device owns a distinct store";
+
+    const off_t off = static_cast<off_t>(SLASH_HBM_BASE + 512);
+    std::vector<uint8_t> wa(24, 0xAA), wb(24, 0xBB);
+
+    uint32_t qa = add_qpair(t.get(), a);
+    uint32_t qb = add_qpair(t.get(), b);
+    Node *qpa = qpair_node(t.get(), a, qa);
+    Node *qpb = qpair_node(t.get(), b, qb);
+    ASSERT_NE(qpa, nullptr);
+    ASSERT_NE(qpb, nullptr);
+    ASSERT_EQ(t.get().pwrite(qpa->ino, reinterpret_cast<const char *>(wa.data()),
+                             wa.size(), off),
+              (ssize_t) wa.size());
+    ASSERT_EQ(t.get().pwrite(qpb->ino, reinterpret_cast<const char *>(wb.data()),
+                             wb.size(), off),
+              (ssize_t) wb.size());
+
+    // Churn A only: REMOVE+RESCAN fn1 several times.
+    for (int i = 0; i < 5; i++) {
+        t.remove("0000:61:00", DeviceFunction::Qdma);
+        ASSERT_TRUE(t.restore(a, DeviceFunction::Qdma)) << "i=" << i;
+    }
+
+    // B untouched -> its bytes intact; A restored -> its own bytes intact.
+    uint32_t qa2 = add_qpair(t.get(), a);
+    Node *qpa2 = qpair_node(t.get(), a, qa2);
+    ASSERT_NE(qpa2, nullptr);
+    std::vector<uint8_t> ra(wa.size(), 0), rb(wb.size(), 0);
+    ASSERT_EQ(t.get().pread(qpa2->ino, reinterpret_cast<char *>(ra.data()),
+                            ra.size(), off),
+              (ssize_t) ra.size());
+    ASSERT_EQ(t.get().pread(qpb->ino, reinterpret_cast<char *>(rb.data()),
+                            rb.size(), off),
+              (ssize_t) rb.size());
+    EXPECT_EQ(ra, wa) << "device A keeps its own bytes across churn";
+    EXPECT_EQ(rb, wb) << "device B must be untouched by A's REMOVE+RESCAN";
+
+    // And a whole-device revoke of A must not free or disturb B's store.
+    void *b_store_before = b->qdmaStore.get();
+    ASSERT_EQ(t.get().revokeDevice("0000:61:00"), 0);
+    EXPECT_EQ(b->qdmaStore.get(), b_store_before)
+        << "revoking A must not touch B's store reference";
+    std::fill(rb.begin(), rb.end(), 0);
+    ASSERT_EQ(t.get().pread(qpb->ino, reinterpret_cast<char *>(rb.data()),
+                            rb.size(), off),
+              (ssize_t) rb.size());
+    EXPECT_EQ(rb, wb) << "B's bytes survive A's whole-device teardown";
 }
 
 TEST(RescanAdvLifecycle, ManyBarsCyclesNoLeakStaysUsable)

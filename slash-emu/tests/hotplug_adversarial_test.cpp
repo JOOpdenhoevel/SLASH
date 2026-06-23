@@ -577,8 +577,9 @@ TEST(HotplugParseBdfAdversarial, FunctionWithTrailingGarbage)
     EXPECT_EQ(hotplugParseBdf("0000:61:00.1 ", bdf, func), -EINVAL);
 }
 
-// REMOVE/SBR with a syntactically valid but unsupported function (.0/.3) must be
-// -EOPNOTSUPP at the ioctl level too (parse error propagates).
+// REMOVE/SBR with a syntactically valid but unsupported function (.3..7) must be
+// -EOPNOTSUPP at the ioctl level too (parse error propagates).  PF0 (.0) is now a
+// distinct, supported sentinel and is covered separately (it is not -EOPNOTSUPP).
 TEST(HotplugParseBdfAdversarial, IoctlUnsupportedFunctionPropagates)
 {
     HotplugTree t;
@@ -588,8 +589,125 @@ TEST(HotplugParseBdfAdversarial, IoctlUnsupportedFunctionPropagates)
                               "0000:61:00.3"),
               -EOPNOTSUPP);
     EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_TOGGLE_SBR,
-                              "0000:61:00.0"),
+                              "0000:61:00.7"),
               -EOPNOTSUPP);
+}
+
+// TOGGLE_SBR / HOTPLUG validate the function suffix for syntax but operate on the
+// whole device (the func is ignored).  A syntactically valid PF0 (.0) suffix is
+// therefore accepted and the whole-device cycle succeeds -- it must NOT regress to
+// the parse-error path now that .0 parses to the Pf0 sentinel.
+TEST(HotplugParseBdfAdversarial, WholeDeviceWithPf0SuffixSucceeds)
+{
+    HotplugTree t;
+    t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
+    ASSERT_EQ(hotplugSetSbrSleepUs(t.get(), 0), 0); // no link-retrain sleep
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_TOGGLE_SBR,
+                              "0000:61:00.0"),
+              0);
+}
+
+// ADVERSARY (Pf0 no-op): a REMOVE of <BDF>.0 must leave BOTH functions not just
+// resolvable but USABLE -- the implementer's test only re-REMOVEs fn1. Prove the
+// tree was untouched by issuing a real qpair ioctl on qdma/ and a bar read/write
+// AFTER the .0 no-op, and that the .0 REMOVE is repeatable/idempotent.
+TEST(HotplugParseBdfAdversarial, Pf0RemoveLeavesBothFunctionsUsable)
+{
+    HotplugTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
+
+    // Two back-to-back .0 REMOVEs: both no-op success, tree undisturbed.
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.0"),
+              0);
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.0"),
+              0);
+    ASSERT_TRUE(resolves(t.get(), dev->dir->ino, "qdma"));
+    ASSERT_TRUE(resolves(t.get(), dev->dir->ino, "bars"));
+
+    // qdma/ is still functional: a QPAIR_ADD must still succeed.
+    struct slash_abi_qdma_qpair_add qreq {};
+    qreq.size = sizeof(qreq);
+    qreq.mode = 0;
+    qreq.dir_mask = 0x3;
+    struct slash_abi_qdma_qpair_add qout = qreq;
+    EXPECT_EQ(t.get().ioctl(dev->qdma->ino, SLASH_ABI_QDMA_IOCTL_QPAIR_ADD,
+                            &qreq, sizeof(qreq), &qout, sizeof(qout)),
+              0)
+        << "qdma/ must stay functional after a .0 no-op REMOVE";
+
+    // bars/ is still functional: a bar0 round-trip must work.
+    Node *bar0 = nullptr;
+    ASSERT_EQ(t.get().lookupChild(dev->bars->ino, "bar0", &bar0), 0);
+    ASSERT_NE(bar0, nullptr);
+    uint32_t v = 0xC0FFEEu, r = 0;
+    ASSERT_EQ(t.get().pwrite(bar0->ino, reinterpret_cast<const char *>(&v), 4,
+                             0x20),
+              4);
+    ASSERT_EQ(t.get().pread(bar0->ino, reinterpret_cast<char *>(&r), 4, 0x20),
+              4);
+    EXPECT_EQ(r, v) << "bars/ must stay functional after a .0 no-op REMOVE";
+}
+
+// ADVERSARY (Pf0 no-op interleaving): a .0 REMOVE issued AFTER fn1 has already
+// been removed must remain a pure no-op -- it must NOT resurrect qdma/, NOT
+// disturb the surviving fn2, and a subsequent fn2 REMOVE must still succeed.
+TEST(HotplugParseBdfAdversarial, Pf0RemoveDoesNotResurrectRemovedFunction)
+{
+    HotplugTree t;
+    Device *dev = t.addDevice("0000:61:00");
+    Ino hp = t.hotplugIno();
+
+    // Remove fn1 for real.
+    ASSERT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.1"),
+              0);
+    ASSERT_FALSE(resolves(t.get(), dev->dir->ino, "qdma"));
+
+    // A .0 no-op must not bring qdma/ back, and bars/ stays live.
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.0"),
+              0);
+    EXPECT_FALSE(resolves(t.get(), dev->dir->ino, "qdma"))
+        << ".0 no-op must NOT resurrect the already-removed qdma/";
+    EXPECT_TRUE(resolves(t.get(), dev->dir->ino, "bars"));
+
+    // The real fn2 REMOVE still works afterwards.
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.2"),
+              0);
+    EXPECT_FALSE(resolves(t.get(), dev->dir->ino, "bars"));
+}
+
+// ADVERSARY (Pf0 on absent device): a .0 REMOVE for a BDF that does not exist is
+// still a tolerated no-op success (the short-circuit precedes any device lookup),
+// not -EINVAL/-ENODEV.
+TEST(HotplugParseBdfAdversarial, Pf0RemoveOnAbsentDeviceIsNoopSuccess)
+{
+    HotplugTree t;
+    Ino hp = t.hotplugIno();
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:99:00.0"),
+              0);
+}
+
+// ADVERSARY (Pf0 malformed): a .0 suffix does NOT excuse a malformed board part.
+// The parse-level board validation must still reject it with -EINVAL before the
+// function suffix is even consulted, so REMOVE returns -EINVAL (not a no-op 0).
+TEST(HotplugParseBdfAdversarial, Pf0WithMalformedBoardRejected)
+{
+    HotplugTree t;
+    Ino hp = t.hotplugIno();
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "zzzz:zz:zz.0"),
+              -EINVAL);
+    // A trailing space after .0 is still malformed -> -EINVAL, not a no-op.
+    EXPECT_EQ(hotplugDevIoctl(t.get(), hp, SLASH_ABI_HOTPLUG_IOCTL_REMOVE,
+                              "0000:61:00.0 "),
+              -EINVAL);
 }
 
 // ===========================================================================

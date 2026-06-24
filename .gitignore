@@ -75,6 +75,7 @@ driver/kcompat/.scratch/
 # Output files for package
 /deb/
 /rpm/
+/docker-build/
 
 # VBIN build directories
 *.prj
@@ -84,4 +85,7 @@ driver/kcompat/.scratch/
 
 # Python test coverage
 .coverage
+
+# Project-local scratch space
 .tmp
+/tmp/

@@ -12,7 +12,7 @@ This refactor does not cover the board management via the primary function 0. Th
 
 What can be implemented thread-safe should be implemented thread-safe.
 
-## File endpoints
+## Emulation daemon ABI
 
 ### Per-device folders
 
@@ -22,62 +22,174 @@ What can be implemented thread-safe should be implemented thread-safe.
   * Represented with the folder `/dev/slash/0000:61:00`
 * Driver uses all physical functions to implement one folder of endpoints
 
-### Information file
+### QDMA / Memory transfers
 
-* Path `/dev/slash/<BDF>/info`
-* Read-only, returns binary information struct
-* Encodes all information that can't be expressed as file metadata
-* Uses the previous `size`-based versioning:
-  * New fields added in the future are always appended to the struct
-  * Old readers only read the fields they understand
-* Current state of the information struct:
+#### Managed resource hierarchy
 
-```C
-#define SLASH_PCI_BDF_LEN 32
+* Root QDMA subsystem
+  * Queue groups (exported as queue group files)
+    * Qpairs (only internally accessible, also only within the kernel module)
+    * Host buffers (exported as host buffer files)
 
-struct slash_info {
-    __u32 size;                   /* [out] ABI version (size populated; read(2) has no [in] channel) */
-    __u32 acc_type;               /* [out] Bitflags describing the accelerator type. Currently: 0x1: System-Emulated */
-    char  bdf[SLASH_PCI_BDF_LEN]; /* [out] PCI BDF string without function, NUL-terminated, e.g. "0000:61:00" */
-};
-```
+#### Resource management pattern
 
-### QDMA
+* The QDMA subsystem requires the management of different resources and permissions
+  * Queue groups
+    * Contain one or more queue pairs as internal components
+    * May only be created by a privileged user (i.e. VRTD)
+  * Host buffers
+    * Backed by a specific queue group
+    * Can be created by any process that has received permission to use a queue group
+    * Can be used to transfer data between card and host
+* These resources are exported as files
+  * with operations implemented with read, write, lseek, stat, ioctl, ...
+* One privileged process can thus create/open a resource file for an unprivileged process and pass them the FD via SCM_RIGHTS
+* Resources are allocated with ADD ioctls
+  * Thus require an open FD to the managing file
+  * On success, these ioctls return a path to the newly created resource file
+  * Created with UID/GID of the caller, mode 600
+  * Caller can immediately open the file, then unlinks them
+* Reason why the ADD ioctl does not open the file for the caller:
+  * Primiarily: A FUSE server can not return a FD that is meaningful to the client
+    * No problem for the kernel, but not possible with FUSE
+  * Also: Do one thing and do it well
+    * For example, ADD ioctls do not need file opening flags
+  * Con: Resources may leak if the user does not unlink resource files
+    * Accepted cost of the solution
+* Resources are referenced both by an inode and a device-wide registry
+  * Resources are released when the inode is released (i.e. file is unlinked and closed by all processes)
+  * But: Resources are released and the inode is invalidated if the hotplugging subsystem tears down the device
+    * Open FDs remain valid, but all operations on them fail.
+
+#### File endpoints
 
 * `/dev/slash/<BDF>/qdma/`
   * Directory
-  * "QPAIR_ADD" IOCTL
-    * Inputs: Mode, directions, H2C/C2H/CMPT ring sizes
-      * Same as current `SLASH_QDMA_IOCTL_QPAIR_ADD` IOCTL
-    * Output: QID
-      * Allocated by kernel/daemon
-      * Used to construct the queue pair path `/dev/slash/<BDF>/qdma/qpair<Q>`
-    * Also starts the queue
-    * Registers the qpair in a per-device registry so removal can reach it after the path is unlinked
-    * The qpair object is reference-counted by both the registry and the inode, freed when both refs drop
-* `/dev/slash/<BDF>/qdma/qpair<Q>`
-  * read, write, llseek, pread, pwrite
-    * Memory transfers, more or less like it has been done before
-    * No buffering, no page caching
-      * Each syscall has to reach the kernel driver/system emulation daemon directly
-    * llseek supports SEEK_SET/SEEK_CUR, but SEEK_END and st_size are unspecified
-      * the qpair is an address window, not a sized file
-  * The hardware queue is a reference-counted object; its lifetime is decoupled from the inode
-  * Two teardown triggers stop the queue and free the QID:
-    * Cooperative: inode eviction (last close of an undisturbed qpair)
-    * Forced: device removal (REMOVE/`.remove`), run eagerly regardless of who holds the fd
-  * Teardown is idempotent: the first trigger does the work, the second is a no-op
-  * After a forced teardown, every `pread`/`pwrite` on a still-open fd returns `-ENODEV` (see Hotplugging/Resets)
+  * "INFO" IOCTL (`#define SLASH_QDMA_IOCTL_INFO _IOWR('v', 0xXX, struct slash_qdma_info)`)
+    ``` C
+    struct slash_qdma_info {
+      __u32 size;          /**< Struct size for ABI versioning. */
+
+      /* Kernel to userspace */
+      __u32 qsets_max;     /**< [out] Maximum number of queue sets the hardware supports. */
+      __u32 msix_qvecs;    /**< [out] Number of MSI-X vectors available for queues. */
+      __u32 vf_max;        /**< [out] Maximum number of virtual functions. */
+      __u32 caps;          /**< [out] Capability bitmask. */
+      __u32 acc_type;      /**< [out] (NEW) Bitflags describing the accelerator type. Currently: 0x1: System-Emulated. */
+    };
+    ```
+    * Extension of the existing INFO ioctl, but now also including the accelerator type
+      * Used by libslash to choose the right code paths
+  * "QGROUP_ADD" IOCTL (`#define SLASH_QDMA_IOCTL_QGROUP_ADD _IOWR('v', 0xXX, struct slash_qdma_qgroup_add)`)
+    ``` C
+    /** Maximum length (including NUL) of a QDMA file path (e.g. "/dev/slash/0000:61:00/qdma/qgroup42"). */
+    #define SLASH_QDMA_MAX_PATH_LEN 128
+
+    struct slash_qdma_qgroup_add {
+      __u32 size;          /**< Struct size for ABI versioning. */
+
+      /* Userspace to kernel */
+      __u32 mode;          /**< [in]  Queue operating mode. */
+      __u32 dir_mask;      /**< [in]  Direction bitmask — which directions to enable. */
+      __u32 mm_channel;    /**< [in]  AXI-MM/NoC channel selection (enum slash_qdma_mm_channel). */
+
+      __u32 h2c_ring_sz;   /**< [in]  Host-to-card descriptor ring size. */
+      __u32 c2h_ring_sz;   /**< [in]  Card-to-host descriptor ring size. */
+      __u32 cmpt_ring_sz;  /**< [in]  Completion ring size. */
+      __u32 n_qpairs;      /**< [in]  No. of qpairs to allocate for the group. */
+
+      /* Kernel to userspace */
+      char queue_path[SLASH_QDMA_MAX_PATH_LEN]; /**< [out] Path to the newly created queue group file. */
+    };
+    ```
+    * Extension of the existing `SLASH_QDMA_IOCTL_QPAIR_ADD`
+      * Now allocates a desired number of queue pairs and associates them with a queue group file
+    * Output: Path to the newly created queue group file `/dev/slash/<BDF>/qdma/qgroup<QID>`
+      * Owner and group is the user and group of the ioctl-calling process
+      * In practise, this will be the VRTD daemon anyways
+      * Mode 700
+    * An open FD to a qgroup can be handed from VRTD to VRT to
+      * Allow users to manage their host buffers
+      * Transfer data
+* `/dev/slash/<BDF>/qdma/qgroup<Q>`
+  * Does not support any data path operations itself
+    * Just a handle for resources (qpairs, buffers) and the permission to create buffers and transfer data
+  * IOCTL `#define SLASH_QDMA_IOCTL_BUF_CREATE _IOWR('v', 0xXX, struct slash_qdma_buf_create)`
+    ``` C
+    struct slash_qdma_buf_create {
+      __u32 size;                             /**< Struct size for ABI versioning. */
+
+      /* Userspace to kernel */
+      __u32 pad;                              /**< [in]  Padding. */
+      __u64 length;                           /**< [in]  Buffer length in bytes (page multiple). */
+
+      /* Kernel to userspace */
+      __u64 granule;                          /**< [out] Bytes per SGL descriptor (host page size). */
+      char buf_path[SLASH_QDMA_MAX_PATH_LEN]; /**< [out] Path to the newly created buffer file. */
+    };
+    ```
+    * Allocates a host buffer, to be used for memory transfers
+    * Accessible as `/dev/slash/<BDF>/qdma/buffer<bid>`
+      * Owner and group is the user and group of the ioctl-calling process
+      * Mode 700
+      * Allows user processes that received a qgroup FD from VRTD to create new buffers on their own.
+    * Kernel behavior:
+      * allocates @length bytes of host memory as a set of 4 KiB base pages (not physically contiguous)
+      * builds the transfer scatter-gather list
+      * DMA-maps every page once.
+      * Installs new inode plus filesystem entry for the buffer file
+      * Returns path to buffer file
+    * System emulation daemon behavior:
+      * Create a new memory-backed FUSE file
+      * Installs new inode plus filesystem entry for the buffer file
+      * Returns path to buffer file
+* `/dev/slash/<BDF>/qdma/buffer<B>`
+  * File backed by host memory
+  * Associated with a qgroup
+  * Supports read, write, lseek, pread, pwrite, mmap
+    * Which only modify the underlying host buffer
+  * IOCTL `#define SLASH_QDMA_BUFFER_IOCTL_TRANSFER _IOWR('v', 0xXX, struct slash_qdma_transfer)`
+    ``` C
+    #define SLASH_QDMA_FD_MAX_QPAIRS 2u
+
+    struct slash_qdma_subxfer {
+      __u32 qpair_index; /**< [in] Index to the fd's bound qpair. */
+      __u32 direction;   /**< [in] enum slash_qdma_transfer_dir (H2C or C2H). */
+      __u32 pad0;        /**< Padding for natural alignment. */
+      __u64 buf_offset;  /**< [in] Byte offset within the buffer. */
+      __u64 dev_addr;    /**< [in] Device-side (endpoint) address. */
+      __u64 length;      /**< [in] Number of bytes to transfer. */
+    };
+    struct slash_qdma_transfer {
+      __u32 size;        /**< Struct size for ABI versioning. */
+      __u32 count;       /**< [in] Number of sub-transfers (1..SLASH_QDMA_FD_MAX_QPAIRS). */
+      struct slash_qdma_subxfer xfers[SLASH_QDMA_FD_MAX_QPAIRS]; /**< [in] Sub-transfers. */
+    };
+    ```
+    * Initiates one or more transfers, either from the host buffer to the accelerator or back
+    * Requires a flush, so that data has arrived at the host buffer in the FUSE server
+    * Kernel behavior:
+      * Each sub-transfer uses one of the indicated queue pairs out of those owned by the queue group
+      * If different queue pairs are used, transfers happen in parallel
+    * System emulation daemon behavior:
+      * The referenced data from the host buffer is sent to the model server via ZeroMQ
 * Expected usage pattern for VRTD:
-  * User (VRT) requests FD to read and/or write accelerator memory
-  * VRTD issues "QPAIR_ADD" ioctl, yields queue ID `Q`
-  * Opens the newly created file `/dev/slash/<BDF>/qdma/qpair<Q>`
-  * Unlinks `/dev/slash/<BDF>/qdma/qpair<Q>`
-  * Passes the qpair FD to the user (VRT)
-  * Effect: Maintains "delete-on-last-close" AND automatic resource freeing
-  * Because the qpair is unlinked while open, it is nameless for its most of its life
-  * Each user's request for a QDMA FD creates a new queue and file
-    * The users/VRT may therefore assume that they are the only process with an FD to that file
+  * User (VRT) requests a queue group
+    * With a given number of queue pairs
+  * VRTD issues "QGROUP_ADD" ioctl
+  * Opens the newly created file qgroup file, unlinks it
+  * Passes the qgroup FD to the user (VRT)
+  * Effect:
+    * Maintains "delete-on-last-close" AND automatic resource freeing
+    * Because the qgroup is unlinked while open, it is nameless for its most of its life
+    * Each user's request for a QDMA FD creates a new queue and file
+      * The users/VRT may therefore assume that they are the only process with an FD to that file
+  * VRT uses the qgroup FD to create host buffers
+    * Opens host buffer file, immediately unlinks it
+  * User application stages their data in the host buffer
+  * User/VRT initiates a transfer, potentially using multiple queues at once
+  * User application executes compute kernels via BARs (see below)
+  * User/VRT initiates transfers back, user fetches data from host buffers
 * VRTD prunes QDMA pairs that it finds during startup
   * Thus frees artifacts from a previous crash
 * Memory ranges (HBM banks, DDR, reconfiguration target)
@@ -101,6 +213,26 @@ struct slash_info {
     * Size: 512 KB
 * `/dev/slash/<BDF>/bars/`
   * Directory
+  * IOCTL `#define SLASH_CTLDEV_IOCTL_GET_DEVICE_INFO _IOWR('v', 0x32, struct slash_ioctl_device_info)`
+    ``` C
+      /** Maximum length (including NUL) of a PCI BDF string ("DDDD:BB:DD.F"). */
+      #define SLASH_PCI_BDF_LEN 32
+
+      struct slash_ioctl_device_info {
+        __u32 size;                       /**< Struct size for ABI versioning. */
+
+        /* Kernel to userspace */
+        char bdf[SLASH_PCI_BDF_LEN];      /**< [out] PCI Bus/Device/Function string, NUL-terminated. */
+        __u16 vendor_id;                  /**< [out] PCI vendor ID. */
+        __u16 device_id;                  /**< [out] PCI device ID. */
+        __u16 subsystem_vendor_id;        /**< [out] PCI subsystem vendor ID. */
+        __u16 subsystem_device_id;        /**< [out] PCI subsystem device ID. */
+        __u32 acc_type;                   /**< [out] (NEW) Bitflags describing the accelerator type. Currently: 0x1: System-Emulated. */
+      };
+    ```
+    * Extension of the existing INFO ioctl, but now also including the accelerator type
+      * Used by libslash to choose the right code paths
+    * vendor_id=subsystem_vendor_id=0x10EE for AMD/Xilinx, device_id=0x50B6 for PF2, subsystem_device_id=0x000e
 * `/dev/slash/<BDF>/bars/bar<M>`
   * File
     * Reads and writes the BAR M of the physical function 2
@@ -125,7 +257,7 @@ struct slash_info {
         * Advancing the file position with each write
       * finally, one `pwrite` to 0x10000 to start the kernel
     * Necessitates proper synchronization within the user, of course
-  * Like qpairs, BAR fds survive device removal as orphans returning `-ENODEV` until closed (see Hotplugging/Resets)
+  * Like qgroups, BAR fds survive device removal as orphans returning `-ENODEV` until closed (see Hotplugging/Resets)
   * Size of the BAR encoded as the size of the file
 * Side note: The start address attribute has been dropped and is not reported anymore
 
@@ -317,3 +449,95 @@ struct slash_hotplug_device_request {
   * Wrap vpp_emu/vpp_sim in the hardened systemd transient unit (see "Reconfiguration" above)
   * Can now be tested through the entire stack
 6. Implement the kernel module, relying on the now built stack.
+
+## Open issues to resolve before refactoring (post perf-merge review)
+
+The QDMA section above was written against the pre-merge per-qpair model. The
+performance refactor (merge a3310595) made per-qpair channel pinning and the
+fd-returned-directly buffer load-bearing. The following must be resolved before
+commencing the refactor. Severity tags: **[BLOCK]** blocks current usage,
+**[PERF]** erases the perf win, **[SPEC]** under-specified gap.
+
+### Resolve the QDMA ABI mismatches
+
+* **[BLOCK] A single `mm_channel` per qgroup cannot express the dual-channel buffer.**
+  * The perf path backs one buffer with two qpairs on *different* channels:
+    `vrt/vrtd/src/buffer.c:78-86` pins `qpair[0]→MM_CHANNEL_0`, `qpair[1]→MM_CHANNEL_1`
+    and binds them into one transfer fd. A group whose `n_qpairs` qpairs all share
+    one `mm_channel` cannot reproduce this split.
+  * Fix: either make the channel per-qpair (`__u32 mm_channel[...]` in `qgroup_add`),
+    or define that qpair index `i` is deterministically pinned to channel `i % n_channels`
+    (and document `n_channels`).
+* **[BLOCK] The `qpair_index → NoC channel` mapping is load-bearing but unspecified.**
+  * The client placement policy (`vrt/vrtd/libvrtd/src/v80_policy.h`) picks `qpair_index`
+    purely from the device physical address, relying on index 0 = channel 0, index 1 = channel 1
+    (the contract documented at `buffer.c:67`).
+  * Specify that `qpair_index` indexes into the owning qgroup's qpairs, in a fixed,
+    client-discoverable channel order. Prerequisite for the fix above.
+* **[BLOCK] `SLASH_QDMA_FD_MAX_QPAIRS = 2` vs. arbitrary `n_qpairs`; stale name.**
+  * The TRANSFER struct caps `xfers[]` at 2, so a group with `n_qpairs > 2` is unusable
+    in one transfer. Decide: cap `n_qpairs` at the same constant, or raise the per-transfer cap.
+  * The name references the deleted "transfer fd binds qpairs" concept (transfers now ride
+    the *buffer* fd). Rename, e.g. `SLASH_QDMA_QGROUP_MAX_QPAIRS`.
+* **[BLOCK] `transfer_hint` was dropped from `buf_create`, but the shared client branches on it.**
+  * The same libvrtd code runs against kernel and FUSE; it reads `transfer_hint`
+    (`libvrtd/src/buffer.c:473`) to decide whether to run the V80 split.
+  * Either keep `transfer_hint` in the buffer-create output, or define a single source
+    (e.g. derive from `acc_type` + qgroup config). Do not just remove the field.
+* **[BLOCK] Buffers can only be created via a qgroup — give the design writer a home.**
+  * The design writer creates its DMA buffer on the device/control handle today
+    (`slash_qdma_buffer_create(writer->qdma, …)`, `design_writer.c:283`) with its own
+    single H2C qpair (ring idx 9) and aperture-wrapping loop. Under the new model it must
+    QGROUP_ADD its own group, then BUF_CREATE. State this migration explicitly.
+  * Also note as a deliberate constraint: buffers bound to a qgroup forecloses cross-group
+    buffer reuse (acceptable — each `vrtd_buffer` already owns its qpairs).
+* **[SPEC] Fix the stale `slash_qdma_subxfer.qpair_index` doc** ("Index to the fd's bound
+  qpair") — the ioctl now rides the buffer fd; redefine as "index into the owning qgroup's qpairs."
+
+### Address the path-based resource cost
+
+* **[PERF] The bounce-buffer hot path becomes ~6 syscalls + inode churn per partial sync.**
+  * Every sub-granule/unaligned sync creates and destroys a transient buffer
+    (`libvrtd/src/buffer.c:447`, `:535`). "ioctl returns a path, open+unlink" turns one
+    fd-returning ioctl into BUF_CREATE→open→unlink→mmap→TRANSFER→munmap→close + a real
+    inode create/teardown (multi-message round trip on FUSE), on a path that fires on
+    every unaligned transfer.
+  * Decide: per-qgroup bounce-buffer pool, a pointer-based small-transfer ioctl, or
+    explicitly document the accepted cost.
+* **[PERF] FUSE buffer mmap is hand-waved by "requires a flush".**
+  * MAP_SHARED writeback so the daemon sees client writes (H2C) and page invalidation
+    after the daemon fills them (C2H) is nontrivial in FUSE.
+  * It forces an `msync`/invalidate into the *shared* client path the hardware path
+    doesn't need — a third hw/sysemu divergence beyond the two allowed. Make it uniform
+    (always `msync`, cheap on kernel) rather than branching.
+  * Validate FUSE shared-mmap writeback as a spike *before* step 2; fallback is
+    `pwrite`/`pread` on the buffer file. Pin the contract now: client always mmaps +
+    `msync` (H2C before transfer) + `msync(MS_INVALIDATE)`/re-read (C2H after transfer).
+
+### Close the permission and behavior gaps
+
+* **[SPEC] Specify who opens buffer files and the directory traversal permissions.**
+  * Clients creating buffers via the qgroup fd must open the returned buffer path, which
+    needs `+x` on `/dev/slash/<BDF>/` and `.../qdma/`. Resource-file modes (700) are
+    specified; directory modes are not. Specify dirs `0755`, resource files `0700` — or
+    decide VRTD brokers every open and passes fds (contradicts "create buffers on their own").
+  * State that the ioctl returns the backend-correct absolute path
+    (`/dev/slash/...` vs `/run/slash_emu/...`).
+* **[SPEC] Define mmap behavior under revocation/hotplug for buffers.**
+  * BARs forbid mmap to keep revocation cheap; buffers allow it. Sane rule for
+    host-RAM-backed buffers: mapping stays valid, only TRANSFER returns `-ENODEV`.
+    Add conformance coverage for "removal with a buffer still mmapped".
+* **[SPEC] State that concurrent TRANSFER on distinct buffer fds sharing a qgroup is supported**
+  (serialized per qpair, parallel across qpairs). VRT carves many buffers from one
+  superblock → one qgroup, and syncs them concurrently.
+
+### Forward-looking (deferred, but acknowledge now)
+
+* **[SPEC] Streaming (ST mode) does not fit qgroup/buffer/transfer.**
+  * `vrt/src/qdma/qdma_intf.cpp` uses a single ST-mode qpair with direct transfers; the
+    new model exports no `read`/`write`/`poll`-able qpair fd. Streaming is deferred, but
+    the "qpairs are internal-only, never exported" decision will need revisiting.
+* **[SPEC] The libvrtdpp `QdmaQpair` escape hatch must be reframed.**
+  * `VRTD_REQ_QDMA_QPAIR_ADD/OP/GET_FD` (libvrtdpp `qdma_qpair.cpp`) lets clients manage
+    raw qpairs by qid. With qpairs internal-only this becomes qgroup management — call it
+    out in steps 3/4.
